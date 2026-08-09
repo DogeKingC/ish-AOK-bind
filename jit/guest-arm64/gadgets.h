@@ -176,7 +176,12 @@ _addr   .req x7
 .irp type, read,write
 
 .macro \type\()_prep size, id
+    // TBI: AArch64 userspace ignores bits 56-63 on dereference. Bionic's
+    // Scudo tags heap pointers there, so the tag must be cleared before
+    // the page compare and TLB index or every tagged access faults.
+    and x7, x7, #0x00ffffffffffffff
     and w9, w7, #0xfff
+
     cmp x9, #(0x1000-(\size/8))
     // BOTH types branch to crosspage_load_\id -- this is i386's own design
     // (jit/gadgets-aarch64/gadgets.h line 48), deliberately: for a WRITE
