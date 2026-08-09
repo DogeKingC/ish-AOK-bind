@@ -4,8 +4,12 @@
 #include "kernel/fs.h"
 #include "fs/path.h"
 #include "fs/real.h"
+#include "kernel/binder.h"
 
-#define MAX_FILESYSTEMS 11
+// The table must have room for the entries below plus everything registered at
+// runtime (app/AppDelegate.m adds iosfs and iosfs_unsafe); fs_register fails
+// silently once it is full.
+#define MAX_FILESYSTEMS 12
 static const struct fs_ops *filesystems[MAX_FILESYSTEMS] = {
     &realfs,
     &procfs,
@@ -16,6 +20,7 @@ static const struct fs_ops *filesystems[MAX_FILESYSTEMS] = {
     &cgroupfs,
     &cgroup2fs,
     &fakefs,
+    &binderfs,
 };
 
 static bool mount_trace_elogind(void) {

@@ -46,6 +46,7 @@
 #include "kernel/task.h"
 #include "fs/dyndev.h"
 #include "fs/devices.h"
+#include "kernel/binder.h"
 #include "tools/fakefs.h"
 #include "fs/path.h"
 #include "fs/real.h"
@@ -2374,7 +2375,14 @@ static TerminalViewController *CreateTerminalViewController(void) {
     EnsureCharacterDevice("/dev/full", S_IFCHR|0666, dev_make(MEM_MAJOR, DEV_FULL_MINOR));
     EnsureCharacterDevice("/dev/random", S_IFCHR|0666, dev_make(MEM_MAJOR, DEV_RANDOM_MINOR));
     EnsureCharacterDevice("/dev/urandom", S_IFCHR|0666, dev_make(MEM_MAJOR, DEV_URANDOM_MINOR));
-    
+
+    // Android binder: /dev/binder, /dev/hwbinder, /dev/vndbinder. Each is a
+    // separate context with its own service registry, which is why they are
+    // three devices rather than one. binderfs (mount -t binder) can add more
+    // at runtime; these three exist up front the way a kernel built with
+    // CONFIG_ANDROID_BINDER_DEVICES provides them.
+    binder_create_device_nodes();
+
     generic_mkdirat(AT_PWD, "/dev/pts", 0755);
 
     // Linux ships /dev/shm as a (normally tmpfs-mounted) directory, mode 1777
