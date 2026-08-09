@@ -1,0 +1,195 @@
+name: Sync with upstream
+
+# Keeps this fork level with emkey1/ish-AOK without anyone having to ask.
+#
+# Upstream commits frequently, and every manual sync is the same four steps:
+# fetch, merge, check nothing broke, push. This does them daily.
+#
+# The merge direction is upstream -> working, so this fork's own commits (the
+# binder driver, the CI guards) are what is being merged *into* and are never
+# at risk of being replaced. A merge that would touch them shows up as a
+# conflict, which stops the run rather than resolving it blind.
+#
+# Nothing lands on `working` unless the merge was clean, this fork's own code
+# is still present afterwards, and the tree still builds and passes tests.
+# Anything else opens an issue and leaves `working` untouched.
+
+on:
+  schedule:
+    # 07:00 UTC daily. Cheap: ubuntu runners are the 1x billing tier, and the
+    # job exits in seconds on the (common) day when there is nothing new.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM: https://github.com/emkey1/ish-AOK.git
+  UPSTREAM_BRANCH: working
+
+jobs:
+  sync:
+    # Same reasoning as build-dev-ipa.yml: pinned to this repository so a fork
+    # of this fork does not start pushing to a repo it should not.
+    if: github.repository == 'DogeKingC/ish-AOK-bind'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: working
+          fetch-depth: 0
+          submodules: true
+
+      - name: Check whether upstream has anything new
+        id: check
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          BEHIND=$(git rev-list --count HEAD..upstream/$UPSTREAM_BRANCH)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "Already up to date with upstream."
+          else
+            echo "$BEHIND new upstream commit(s):"
+            git log --oneline "HEAD..upstream/$UPSTREAM_BRANCH"
+          fi
+
+      - name: Merge upstream
+        id: merge
+        if: steps.check.outputs.behind != '0'
+        run: |
+          set -uo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Record the range now: after a successful merge, HEAD has moved and
+          # the "what came in" list is no longer reachable the same way.
+          {
+            echo 'commits<<COMMITS_EOF'
+            git log --pretty='- `%h` %s' "HEAD..upstream/$UPSTREAM_BRANCH"
+            echo 'COMMITS_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          if git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflicted<<FILES_EOF" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U >> "$GITHUB_OUTPUT"
+            echo "FILES_EOF" >> "$GITHUB_OUTPUT"
+            git merge --abort
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+            # Fail the run: a conflict is the one outcome that needs a person,
+            # and a green checkmark on a sync that did not happen is worse than
+            # no automation at all.
+            exit 1
+          fi
+
+      # A clean merge is not by itself proof this fork's work survived: an
+      # upstream commit that deleted or rewrote one of the files the binder
+      # driver hooks into would merge without complaint. Check the hooks
+      # explicitly, since they are single lines in files upstream also edits.
+      - name: Verify this fork's own code survived the merge
+        if: steps.merge.outputs.clean == 'true'
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in kernel/binder.c kernel/binder.h fs/binderfs.c \
+                   tests/manual/binder_ipc.c docs/binder.md; do
+            if [ ! -f "$f" ]; then echo "MISSING: $f"; fail=1; fi
+          done
+          check_contains() {
+            if ! grep -q "$2" "$1"; then echo "MISSING in $1: $2"; fail=1; fi
+          }
+          check_contains app/AppDelegate.m binder_create_device_nodes
+          check_contains xX_main_Xx.h        binder_create_device_nodes
+          check_contains kernel/exit.c       binder_task_exit
+          check_contains fs/dev.c            BINDER_MAJOR
+          check_contains fs/mount.c          binderfs
+          check_contains meson.build         'kernel/binder.c'
+          exit $fail
+
+      - name: Install build dependencies
+        if: steps.merge.outputs.clean == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libarchive-dev libsqlite3-dev
+          pip3 install meson ninja
+
+      # Same build and tests as ci.yml's build-linux job, with one compiler
+      # rather than the clang/gcc matrix -- this is a gate on an automated
+      # push, not full CI coverage. CI still runs in full on your own pushes
+      # and on pull requests.
+      - name: Build and test the merged tree
+        if: steps.merge.outputs.clean == 'true'
+        run: |
+          set -euo pipefail
+          meson setup build -Dengine=jit
+          ninja -C build
+          meson test -C build float80 riscv64_decode --print-errorlogs
+          meson test -C build e2e --print-errorlogs
+        env:
+          CC: clang
+
+      - name: Push to working
+        if: steps.merge.outputs.clean == 'true'
+        run: git push origin working
+
+      # Pushing with GITHUB_TOKEN deliberately does not re-trigger other
+      # workflows, so a daily sync never kicks off the 90-minute macOS IPA
+      # build. Use build-dev-ipa's "Run workflow" button when you actually
+      # want an IPA.
+      # The commit list is passed through the environment, never interpolated
+      # into the script with ${{ }}: subjects come from upstream and routinely
+      # contain backticks and quotes, which the shell would otherwise execute.
+      - name: Report success
+        if: steps.merge.outputs.clean == 'true'
+        env:
+          COMMITS: ${{ steps.merge.outputs.commits }}
+        run: |
+          {
+            echo "### Synced with upstream"
+            echo ""
+            echo "$COMMITS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Conflicts and build failures both need a human, so say so somewhere
+      # that does not depend on anyone reading Actions logs. One open issue at
+      # a time: if the last sync is still unresolved, a new failure comments on
+      # it rather than filing a duplicate every morning.
+      - name: Open an issue if the sync needs a human
+        if: failure() || steps.merge.outputs.clean == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CONFLICTED: ${{ steps.merge.outputs.conflicted }}
+          COMMITS: ${{ steps.merge.outputs.commits }}
+          CLEAN: ${{ steps.merge.outputs.clean }}
+        run: |
+          set -euo pipefail
+          if [ "$CLEAN" = "false" ]; then
+            REASON="The merge hit conflicts, so it was aborted."
+            DETAIL=$'Conflicting files:\n\n```\n'"$CONFLICTED"$'\n```'
+          else
+            REASON="The merge was clean, but the merged tree failed its check."
+            DETAIL="That is either this fork's own code not surviving the merge, or the build/tests failing. The run log says which."
+          fi
+          BODY=$(printf '%s\n\n%s\n\n`working` was left untouched.\n\nUpstream commits involved:\n\n%s\n\nRun: %s\n' \
+            "$REASON" "$DETAIL" "${COMMITS:-(none recorded)}" "$RUN_URL")
+
+          EXISTING=$(gh issue list --label upstream-sync --state open \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh label create upstream-sync --color BFD4F2 \
+              --description "Automated upstream sync needs attention" 2>/dev/null || true
+            gh issue create --title "Upstream sync needs attention" \
+              --label upstream-sync --body "$BODY"
+          fi
