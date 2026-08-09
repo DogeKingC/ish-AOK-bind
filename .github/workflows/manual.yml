@@ -105,6 +105,12 @@ jobs:
           timeout 120 ./build/ish -f rootfs /bin/busybox echo control-ok
           echo "control exit=$?"
 
+      - name: Verify patch present
+        run: |
+          echo "commit: $(git rev-parse HEAD)"
+          grep -n "00ffffffffffffff" jit/guest-arm64/gadgets.h || { echo "PATCH NOT IN CHECKOUT"; exit 1; }
+
+
       - name: Run TBI probe under the emulator
         run: |
           set +e
