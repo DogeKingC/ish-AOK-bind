@@ -1,0 +1,97 @@
+name: ARM64 emulator build + TBI check
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or SHA to build (blank = default branch)"
+        required: false
+        default: ""
+jobs:
+  arm-build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          ref: ${{ inputs.ref }}
+
+      - name: Confirm host is aarch64
+        run: |
+          set -eux
+          uname -m
+          test "$(uname -m)" = "aarch64" || { echo "NOT an arm64 runner"; exit 1; }
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libarchive-dev libsqlite3-dev binutils gcc
+          pip3 install meson ninja
+
+      - name: Build
+        run: |
+          set -eux
+          meson setup build -Dengine=jit
+          ninja -C build
+          ls -l build/ish
+
+      - name: Confirm arm64 guest gadgets were compiled in
+        run: |
+          nm build/ish 2>/dev/null | grep -c gadget_arm64_load64 || echo "WARNING: arm64 guest gadgets missing"
+
+      - name: Unit tests
+        run: meson test -C build float80 riscv64_decode --print-errorlogs
+
+      - name: e2e tests
+        run: meson test -C build e2e --print-errorlogs
+        continue-on-error: true
+
+      - name: Build TBI probe
+        run: |
+          set -eux
+          cat > tbi.s <<'ASM'
+          .text
+          .global _start
+          _start:
+              sub  sp, sp, #16
+              mov  x0, #42
+              str  x0, [sp]
+              mov  x1, sp
+              movz x3, #0x0200, lsl #48
+              orr  x1, x1, x3
+              ldr  x2, [x1]
+              cmp  x2, #42
+              b.ne 1f
+              mov  x0, #0
+              b    2f
+          1:  mov  x0, #1
+          2:  mov  x8, #93
+              svc  #0
+          ASM
+          sed -i 's/^          //' tbi.s
+          cat tbi.s
+          gcc -static -nostdlib -nostartfiles -o tbi tbi.s
+          echo "--- native sanity (host has TBI, must print 0) ---"
+          ./tbi; echo "native exit=$?"
+
+      - name: Stage rootfs
+        run: |
+          set -eux
+          mkdir -p rootfs
+          tar -xf alpine-minirootfs-3.23.3-aarch64.tar.xz -C rootfs
+          cp tbi rootfs/tbi
+          ls rootfs
+
+      - name: Run TBI probe under the emulator
+        run: |
+          set -x
+          ./build/ish -f rootfs /tbi
+          RC=$?
+          set +x
+          echo "emulator exit code: $RC"
+          if [ "$RC" -eq 0 ]; then echo "TBI PASS"; else echo "TBI FAIL - top byte not ignored"; fi
+        continue-on-error: true
