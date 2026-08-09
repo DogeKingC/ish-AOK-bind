@@ -21,11 +21,14 @@ jobs:
     # (happened 2026-08-07: a 40 MB iSH-AOK IPA appeared as a public prerelease
     # on an unrelated project).
     #
-    # Matched on repository NAME, not owner/name, so a fork still builds its own
-    # dev IPAs. That is the whole point: the failure mode being prevented is the
-    # tree landing in a DIFFERENTLY NAMED repo, which a fork is not. The trailing
-    # slash matters, it stops `owner/not-ish-AOK` from matching.
-    if: endsWith(github.repository, '/ish-AOK')
+    # Upstream matches on repository NAME (endsWith '/ish-AOK') so that forks
+    # still build their own dev IPAs. That only holds for forks which kept the
+    # name: this one is `ish-AOK-bind`, so the name match skipped every run here
+    # and no dev IPA was ever produced. Pinned to this repository's full
+    # owner/name instead, which is strictly tighter than upstream's check -- it
+    # still cannot fire in a repo the tree was misplaced into, and it no longer
+    # depends on what this fork happens to be called.
+    if: github.repository == 'DogeKingC/ish-AOK-bind'
     runs-on: macos-15
     timeout-minutes: 90
     steps:
