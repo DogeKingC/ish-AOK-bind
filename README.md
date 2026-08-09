@@ -15,6 +15,9 @@ This fork is not just a rebrand. It carries fork-specific behavior, bundled root
   - `root.tar.gz` as `Devuan5(Debian12)` for `i386`
   - `alpine-minirootfs-3.23.3-x86.tar.gz` as `Alpine3.23.3`
   - `alpine-minirootfs-3.23.3-x86_64.tar.gz` as `Alpine3.23.3(x86_64)`
+- Android Binder IPC: `/dev/binder`, `/dev/hwbinder`, `/dev/vndbinder` and
+  binderfs, so `libbinder`-based Android userspace has a driver to talk to.
+  See [docs/binder.md](docs/binder.md).
 - File Provider support for exposing guest files through iOS.
 - Extra diagnostics and operational changes that are specific to this fork.
 - Ongoing amd64 interpreter, loader, and syscall work.
@@ -40,7 +43,7 @@ Relevant files:
 - `app/`: iOS app, UI, root selection, diagnostics, File Provider integration.
 - `emu/`: guest CPU emulation, including amd64 interpreter work.
 - `kernel/`: syscall translation, process model, exec, signals, memory management.
-- `fs/`: filesystem layer and fakefs integration.
+- `fs/`: filesystem layer and fakefs integration (including binderfs).
 - `jit/`: threaded-code JIT machinery inherited from iSH.
 - `tests/`: manual and automated test helpers.
 - `tools/`: developer tools and host-side helpers.

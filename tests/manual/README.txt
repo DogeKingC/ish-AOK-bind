@@ -84,6 +84,11 @@ Portable focused tests (all guest arches):
   futex_core.c         FUTEX_WAIT/FUTEX_WAKE timeout, wake, and signal coverage
   process_lifecycle.c  fork/exec/vfork/wait and signal inheritance coverage
   pthread_sync.c       mutex/condvar/rwlock/timed wait and pthread_once coverage
+  binder_ipc.c         Android Binder IPC (kernel/binder.c): BINDER_VERSION,
+                       mmap rules, context manager, a real cross-process
+                       transaction with reply, BINDER_TYPE_BINDER -> HANDLE
+                       translation, oneway, BR_DEAD_BINDER death notification,
+                       and binderfs BINDER_CTL_ADD
   amd64_regress.c      amd64 cross-page write, exec loader, fcntl race, and cc1 stress
   amd64_gas_probe.sh   host-side GNU as immediate/register encoding probe
 

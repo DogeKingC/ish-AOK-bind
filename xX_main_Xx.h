@@ -5,6 +5,7 @@
 #include "kernel/init.h"
 #include "kernel/fs.h"
 #include "fs/devices.h"
+#include "kernel/binder.h"
 #include "fs/real.h"
 #include "fs/sock.h"
 #ifdef __APPLE__
@@ -82,6 +83,10 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
     become_first_process();
     current->thread = pthread_self();
     netlink_link_watch_start();
+    // Create /dev/binder & friends if the root can hold device nodes. On a
+    // realfs root without CAP_MKNOD this quietly does nothing; binderfs
+    // (mount -t binder) supplies its own nodes and works either way.
+    binder_create_device_nodes();
     char cwd[MAX_PATH + 1];
     if (root == NULL && workdir == NULL) {
         getcwd(cwd, sizeof(cwd));

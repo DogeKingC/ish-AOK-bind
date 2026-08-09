@@ -6,6 +6,7 @@
 #include "kernel/mm.h"
 #include "kernel/futex.h"
 #include "kernel/ptrace.h"
+#include "kernel/binder.h"
 #include "kernel/task.h"
 #include "util/sync.h"
 #include "fs/fd.h"
@@ -302,6 +303,12 @@ noreturn void do_exit(struct task *task, int status) {
     while (exit_wait_needed(task)) { // Wait for now, task is in one or more critical sections, and/or has locks.
         exit_wait_backoff(&files_wait_pause);
     }
+    // Drop this task's binder threads before its fds go. Closing the binder fd
+    // only tears down the whole endpoint when the *last* thread sharing it
+    // exits, so without this a thread that died mid-transaction (i.e. without
+    // calling BINDER_THREAD_EXIT) would leave its transaction stack in place
+    // and whoever is waiting on its reply would wait forever.
+    binder_task_exit(task);
     fdtable_release(task->files);
     task->files = NULL;
 

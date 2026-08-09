@@ -5,6 +5,7 @@
 #include "fs/tty.h"
 #include "fs/dyndev.h"
 #include "fs/devices.h"
+#include "kernel/binder.h"
 #include "app/RTCDevice.h"
 
 struct dev_ops *block_devs[256] = {
@@ -18,6 +19,7 @@ struct dev_ops *char_devs[256] = {
     [TTY_PSEUDO_SLAVE_MAJOR] = &tty_dev,
     [DEV_RTC_MAJOR] = &rtc_dev,
     [DYN_DEV_MAJOR] = &dyn_dev_char,
+    [BINDER_MAJOR] = &binder_dev,
 };
 
 int dev_open(int major, int minor, int type, struct fd *fd) {

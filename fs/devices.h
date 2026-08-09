@@ -42,6 +42,22 @@
 #define DEV_RTC_MINOR 2
 
 
+// --- android binder ---
+// Linux allocates binder's major dynamically; we pick a fixed free one so the
+// device nodes can be created before any binder device is opened.
+#define BINDER_MAJOR 249
+// The three standard binder contexts. Each has its own name registry and its
+// own context manager, so they are separate devices rather than separate
+// minors of one shared namespace.
+#define DEV_BINDER_MINOR 0
+#define DEV_HWBINDER_MINOR 1
+#define DEV_VNDBINDER_MINOR 2
+// binderfs's control node (/dev/binderfs/binder-control).
+#define DEV_BINDER_CONTROL_MINOR 3
+// Minors from here up are handed out by binderfs's BINDER_CTL_ADD.
+#define BINDER_FIRST_DYNAMIC_MINOR 4
+#define BINDER_MAX_MINORS 64
+
 // /dev/clipboard
 #define DEV_CLIPBOARD_MINOR 0
 // /dev/gps

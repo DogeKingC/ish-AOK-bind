@@ -251,6 +251,7 @@ if get_option('kernel') == 'ish'
         'kernel/sysvmsg.c',
         'kernel/sysvsem.c',
         'kernel/memfd.c',
+        'kernel/binder.c',
         'kernel/ptrace.c',
 
         'kernel/fs.c',
@@ -277,6 +278,7 @@ if get_option('kernel') == 'ish'
         'fs/proc/pid.c',
 
         'fs/dyndev.c',
+        'fs/binderfs.c',
 
         'fs/adhoc.c',
         'fs/sock.c',
