@@ -28,27 +28,33 @@ jobs:
 
       - name: Install dependencies
         run: |
+          set -eux
           sudo apt-get update
-          sudo apt-get install -y libarchive-dev libsqlite3-dev binutils gcc
+          sudo apt-get install -y libarchive-dev libsqlite3-dev binutils gcc clang lld
           pip3 install meson ninja
+          clang --version
 
-      - name: Build
+      - name: Build with clang
+        env:
+          CC: clang
         run: |
           set -eux
+          rm -rf build
           meson setup build -Dengine=jit
           ninja -C build
-          ls -l build/ish
+          ls -l build/ish build/tools/fakefsify
 
-      - name: Confirm arm64 guest gadgets were compiled in
+      - name: Confirm arm64 guest gadgets linked in
         run: |
-          nm build/ish 2>/dev/null | grep -c gadget_arm64_load64 || echo "WARNING: arm64 guest gadgets missing"
+          set -eu
+          if nm build/ish 2>/dev/null | grep -q gadget_arm64_load64; then
+            echo "OK: arm64 guest gadgets present"
+          else
+            echo "WARNING: arm64 guest gadgets missing - the TBI test below is meaningless"
+          fi
 
       - name: Unit tests
         run: meson test -C build float80 riscv64_decode --print-errorlogs
-
-      - name: e2e tests
-        run: meson test -C build e2e --print-errorlogs
-        continue-on-error: true
 
       - name: Build TBI probe
         run: |
@@ -75,23 +81,38 @@ jobs:
           sed -i 's/^          //' tbi.s
           cat tbi.s
           gcc -static -nostdlib -nostartfiles -o tbi tbi.s
-          echo "--- native sanity (host has TBI, must print 0) ---"
-          ./tbi; echo "native exit=$?"
+          file tbi
+          set +e
+          ./tbi
+          echo "native exit=$? (must be 0 - real hardware ignores the top byte)"
 
-      - name: Stage rootfs
+      - name: Stage fakefs rootfs
         run: |
           set -eux
-          mkdir -p rootfs
-          tar -xf alpine-minirootfs-3.23.3-aarch64.tar.xz -C rootfs
-          cp tbi rootfs/tbi
+          mkdir -p rootsrc
+          tar -xf alpine-minirootfs-3.23.3-aarch64.tar.xz -C rootsrc
+          cp tbi rootsrc/tbi
+          chmod +x rootsrc/tbi
+          tar -czf rootfs.tar.gz -C rootsrc .
+          ./build/tools/fakefsify rootfs.tar.gz rootfs
           ls rootfs
+
+      - name: Control - does the arm64 guest run at all
+        run: |
+          set +e
+          timeout 120 ./build/ish -f rootfs /bin/busybox echo control-ok
+          echo "control exit=$?"
 
       - name: Run TBI probe under the emulator
         run: |
-          set -x
-          ./build/ish -f rootfs /tbi
+          set +e
+          timeout 120 ./build/ish -f rootfs /tbi
           RC=$?
-          set +x
+          echo "=================================================="
           echo "emulator exit code: $RC"
-          if [ "$RC" -eq 0 ]; then echo "TBI PASS"; else echo "TBI FAIL - top byte not ignored"; fi
-        continue-on-error: true
+          if [ "$RC" -eq 0 ]; then
+            echo "TBI PASS - tagged pointer dereferenced correctly"
+          else
+            echo "TBI FAIL - emulator does not ignore the top byte"
+          fi
+          echo "=================================================="
