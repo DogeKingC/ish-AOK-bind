@@ -1199,6 +1199,22 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
         basename++;
     strncpy(current->comm, basename, sizeof(current->comm));
     current->comm[sizeof(current->comm) - 1] = '\0';
+
+    // An exec consumes the context setexeccon() staged, the way a domain
+    // transition works under a real policy. Android's init labels every service
+    // it starts this way -- setexeccon("u:r:servicemanager:s0") then execve --
+    // and getprevcon() is how the new process learns who started it.
+    if (current->security.exec[0] != '\0') {
+        strcpy(current->security.prev, current->security.current);
+        strcpy(current->security.current, current->security.exec);
+        current->security.exec[0] = '\0';
+    }
+    // Linux clears these across execve whether or not a transition happened:
+    // they are staging slots for the next object created, and the new program
+    // never asked for them.
+    current->security.fscreate[0] = '\0';
+    current->security.keycreate[0] = '\0';
+    current->security.sockcreate[0] = '\0';
     unlock(&current->general_lock);
 
     bool force_safe_i386 = current->abi == GUEST_ABI_I386 &&
