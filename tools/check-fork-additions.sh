@@ -91,6 +91,16 @@ need_in kernel/exec.c  'security.exec'               "execve consumes the setexe
 need_in kernel/binder.c BR_TRANSACTION_SEC_CTX \
     "binder delivers the sender's context to a node that asked for one"
 
+# --- writable /dev/kmsg ---------------------------------------------------
+# Upstream's kmsg_write is a bare `return _EPERM`, so a sync that touches
+# fs/mem.c can restore it in a clean merge and nothing will fail -- Android
+# would just go back to dying silently, which is precisely the symptom that
+# took a whole session to diagnose the first time.
+need_file tests/manual/kmsg.c
+need_in kernel/log.c ish_log_write_record "guest /dev/kmsg records reach the log"
+need_in kernel/log.h ish_log_write_record
+need_in fs/mem.c     ish_log_write_record "kmsg_write is not EPERM any more"
+
 # --- shared ---------------------------------------------------------------
 need_file kernel/ioctl_abi.h
 
@@ -113,10 +123,12 @@ need_in fs/aok-tests.manifest             binder_ipc.c
 need_in fs/aok-tests.manifest             ashmem.c
 need_in fs/aok-tests.manifest             dma_heap.c
 need_in fs/aok-tests.manifest             selinuxfs.c
+need_in fs/aok-tests.manifest             kmsg.c
 need_in tests/manual/setup-regressions.sh binder_ipc
 need_in tests/manual/setup-regressions.sh ashmem
 need_in tests/manual/setup-regressions.sh dma_heap
 need_in tests/manual/setup-regressions.sh selinuxfs
+need_in tests/manual/setup-regressions.sh kmsg
 
 # --- CI -------------------------------------------------------------------
 # Upstream guards these on repository *name*, which this fork's name does not

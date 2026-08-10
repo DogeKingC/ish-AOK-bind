@@ -134,6 +134,50 @@ size_t sys_syslog_guest(int_t type, guest_addr_t buf_addr, int_t len) {
     return retval;
 }
 
+// One write() to /dev/kmsg is one record, which is how Linux treats it and how
+// every writer expects it to behave -- there is no partial record and no
+// reassembly across writes.
+//
+// This matters for Android: android::base's KernelLogger writes here, and it is
+// where a process that dies before logd is up says why. servicemanager's fatal
+// CHECKs land here and nowhere else.
+void ish_log_write_record(const char *msg, size_t len) {
+    // An optional "<N>" prefix carries facility*8+level. Linux parses it off
+    // and keeps the level beside the text; this buffer is plain lines with
+    // nowhere to put it, so it is parsed only so it does not get printed as
+    // part of the message.
+    size_t start = 0;
+    if (len >= 3 && msg[0] == '<') {
+        size_t i = 1;
+        while (i < len && i <= 3 && msg[i] >= '0' && msg[i] <= '9')
+            i++;
+        if (i > 1 && i < len && msg[i] == '>')
+            start = i + 1;
+    }
+
+    // Long enough for anything a logger emits; Linux truncates at a comparable
+    // size rather than growing a record without bound.
+    char line[1024];
+    size_t n = 0;
+    for (size_t i = start; i < len && n < sizeof(line) - 1; i++) {
+        unsigned char c = (unsigned char) msg[i];
+        // Control characters would break the one-record-per-line framing every
+        // reader of this buffer assumes. A trailing newline is the common case
+        // and falls out of the same rule, then gets trimmed below.
+        line[n++] = (c < 0x20 || c == 0x7f) ? ' ' : (char) c;
+    }
+    while (n > 0 && line[n - 1] == ' ')
+        n--;
+    line[n] = '\0';
+    if (n == 0)
+        return;
+
+    // Through printk, so a guest record is timestamped and reaches the log
+    // handler exactly like a kernel one -- the point is that `dmesg`, a read of
+    // /dev/kmsg, and the iOS-side log all show it.
+    ish_printk("%s\n", line);
+}
+
 static void log_buf_append(const char *msg) {
     fifo_write(&log_buf, msg, strlen(msg), FIFO_OVERWRITE);
     log_max_since_clear += strlen(msg);

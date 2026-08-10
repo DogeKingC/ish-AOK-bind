@@ -20,7 +20,7 @@ BUILD_DIR="${1:-build}"
 shift || true
 TESTS=("$@")
 if [ ${#TESTS[@]} -eq 0 ]; then
-    TESTS=(binder_ipc ashmem dma_heap selinuxfs)
+    TESTS=(binder_ipc ashmem dma_heap selinuxfs kmsg)
 fi
 
 ISH="$BUILD_DIR/ish"

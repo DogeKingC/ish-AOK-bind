@@ -151,8 +151,16 @@ static ssize_t kmsg_read(struct fd *fd, void *buf, size_t bufsize) {
     return res;
 }
 
-static ssize_t kmsg_write(struct fd *UNUSED(fd), const void *UNUSED(buf), size_t UNUSED(bufsize)) {
-    return _EPERM;
+static ssize_t kmsg_write(struct fd *UNUSED(fd), const void *buf, size_t bufsize) {
+    if (bufsize == 0)
+        return 0;
+    ish_log_write_record(buf, bufsize);
+    // Linux reports the whole write consumed even when it truncates the record,
+    // so a caller never retries a tail that would only be dropped again. This
+    // used to be EPERM, which meant a guest could read the kernel log but never
+    // add to it -- and Android's KernelLogger, the only thing that reports why
+    // a process died before logd exists, writes here.
+    return (ssize_t) bufsize;
 }
 
 static off_t_ kmsg_lseek(struct fd *fd, off_t_ off, int whence) {
