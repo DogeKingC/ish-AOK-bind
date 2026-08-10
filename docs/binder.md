@@ -143,7 +143,14 @@ Binder is necessary but not sufficient for running Android userspace.
 by an unlinked host temp file, so a descriptor passed between processes maps
 the same pages on both sides.
 
-Still missing, in the order a real stack asks for them: `dmabuf` (in practice
-the DMA-BUF heaps at `/dev/dma_heap/system`, which replaced ION), and then
-graphics. `/dev/dri` would need an actual DRM implementation rather than a
-stub, since iSH has no GPU passthrough for Mesa to use.
+DMA-BUF heaps are implemented as well -- `kernel/dma_heap.c`,
+`tests/manual/dma_heap.c`. `/dev/dma_heap/system` answers
+`DMA_HEAP_IOCTL_ALLOC` with a dma-buf descriptor that mmaps and can be passed
+to another process, and the buffer fd supports `DMA_BUF_IOCTL_SYNC` and
+`DMA_BUF_SET_NAME`. `DMA_BUF_IOCTL_SYNC` is a validated no-op: it exists for
+cache maintenance between a device and the CPU, and there is no device here.
+
+What is still missing is graphics. `/dev/dri` would need an actual DRM
+implementation rather than a stub, since iSH has no GPU passthrough for Mesa
+to use, and Android's graphics stack also wants sync fences
+(`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`), which are not implemented.

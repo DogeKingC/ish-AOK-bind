@@ -174,8 +174,8 @@ static int ashmem_query_pin_status(struct ashmem_state *state, size_t start, siz
 // ---------------------------------------------------------------------------
 
 static int ashmem_open(int UNUSED(major), int minor, struct fd *fd) {
-    // MISC_MAJOR is Linux's shared misc-device major, so this will grow a
-    // proper minor dispatcher once a second device lives here.
+    // fs/dev.c dispatches MISC_MAJOR by minor; this is a belt-and-braces
+    // check that we were handed our own.
     if (minor != DEV_ASHMEM_MINOR)
         return _ENXIO;
     struct ashmem_state *state = malloc(sizeof(*state));

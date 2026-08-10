@@ -6,6 +6,7 @@
 //
 
 #import "AppDelegate.h"
+#import "AppGroup.h"
 #import "Roots.h"
 #import "RootsTableViewController.h"
 #import "ProgressReportViewController.h"
@@ -757,10 +758,22 @@
 }
 
 - (void)browseFiles {
-    // The root now lives one level down, inside the single "iSH-AOK" domain.
-    NSURL *url = [[NSFileProviderManager.defaultManager.documentStorageURL
-                   URLByAppendingPathComponent:@"iSH-AOK"]
-                  URLByAppendingPathComponent:self.rootName];
+    NSURL *url;
+    if (ContainerIsAppGroup()) {
+        // The root now lives one level down, inside the single "iSH-AOK" domain.
+        url = [[NSFileProviderManager.defaultManager.documentStorageURL
+                URLByAppendingPathComponent:@"iSH-AOK"]
+               URLByAppendingPathComponent:self.rootName];
+    } else {
+        // No App Group means no File Provider extension, so that domain does
+        // not exist and browsing it opens nothing. On such a build the roots
+        // live in the app's own Documents directory instead, which Files shows
+        // under "On My iPhone" -> iSH-AOK.
+        url = [[ContainerURL() URLByAppendingPathComponent:@"roots"]
+               URLByAppendingPathComponent:self.rootName];
+    }
+    if (url == nil)
+        return;
     NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
     components.scheme = @"shareddocuments";
     [UIApplication openURL:components.string];
