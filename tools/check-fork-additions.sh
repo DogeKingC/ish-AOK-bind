@@ -80,6 +80,15 @@ need_in fs/sock.h    NETLINK_SELINUX_
 need_in fs/sock.c    NETLINK_SELINUX_ "selinux_status_open's netlink fallback is accepted"
 need_in meson.build  fs/selinuxfs.c
 
+# /proc/<pid>/attr/* -- getcon/setcon/setexeccon. Upstream edits fs/proc/pid.c
+# and kernel/exec.c regularly, and both hooks here are small enough to be lost
+# in a clean merge.
+need_in kernel/task.h  TASK_SECURITY_DEFAULT_CONTEXT "per-task SELinux contexts"
+need_in kernel/task.c  TASK_SECURITY_DEFAULT_CONTEXT "the initial task's context"
+need_in fs/proc/pid.c  proc_pid_attr_readdir         "/proc/<pid>/attr in the pid directory"
+need_in fs/proc/pid.c  '{"attr", S_IFDIR'            "attr listed among the pid children"
+need_in kernel/exec.c  'security.exec'               "execve consumes the setexeccon context"
+
 # --- shared ---------------------------------------------------------------
 need_file kernel/ioctl_abi.h
 

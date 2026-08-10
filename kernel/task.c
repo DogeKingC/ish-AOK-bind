@@ -377,6 +377,8 @@ struct task *task_create_(struct task *parent) {
         task->cap_effective[0] = task->cap_effective[1] = UINT32_MAX;
         task->cap_permitted[0] = task->cap_permitted[1] = UINT32_MAX;
         task->cap_inheritable[0] = task->cap_inheritable[1] = UINT32_MAX;
+        // Every other task inherits this through the struct copy above.
+        strcpy(task->security.current, TASK_SECURITY_DEFAULT_CONTEXT);
     }
     task->cpu_time_banked = false; // per-task, not inherited via the parent copy
     task->host_thread_started = false; // ditto; task_start sets it

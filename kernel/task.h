@@ -64,6 +64,37 @@ static inline void task_io_counters_add(struct task_io_counters *dst,
 }
 struct futex; // opaque; defined in kernel/futex.c (see futex_restart_futex below)
 
+// The SELinux context every task carries when no policy has ever been loaded.
+// A real kernel reports u:r:kernel:s0 in that state, but only until init
+// transitions; here there is no policy to transition on, and every process runs
+// with init's authority, so init's label is the one that describes what a
+// caller actually gets. It parses as user:role:type:range, which is all
+// libselinux's context_new() asks of it.
+#define TASK_SECURITY_DEFAULT_CONTEXT "u:r:init:s0"
+// Long enough for any Android context, including an app's category set
+// (u:r:untrusted_app_29:s0:c123,c256,c512,c768 and then some). Writes longer
+// than this are refused rather than truncated -- a silently shortened context
+// is a different context.
+#define TASK_SECURITY_CONTEXT_MAX 256
+
+struct task_security {
+    // getcon/setcon. Never empty.
+    char current[TASK_SECURITY_CONTEXT_MAX] __strncpy_safe;
+    // getprevcon: what `current` was before the last exec that transitioned it.
+    char prev[TASK_SECURITY_CONTEXT_MAX] __strncpy_safe;
+    // setexeccon: the context the next execve transitions into. Consumed by
+    // that exec, so it is empty except in the window between the two calls --
+    // which is exactly how init labels each service it starts.
+    char exec[TASK_SECURITY_CONTEXT_MAX] __strncpy_safe;
+    // setfscreatecon/setkeycreatecon/setsockcreatecon. Empty means "unset",
+    // i.e. inherit a label the ordinary way. Nothing consumes these; they are
+    // stored and read back so that libselinux's set/get round-trip works,
+    // which is all an unlabelled filesystem could honour anyway.
+    char fscreate[TASK_SECURITY_CONTEXT_MAX] __strncpy_safe;
+    char keycreate[TASK_SECURITY_CONTEXT_MAX] __strncpy_safe;
+    char sockcreate[TASK_SECURITY_CONTEXT_MAX] __strncpy_safe;
+};
+
 struct task {
     enum guest_abi abi;
     struct cpu_state cpu;
@@ -121,6 +152,18 @@ struct task {
     uid_t_ groups[MAX_GROUPS];
     char comm[16] __strncpy_safe; // locked by general_lock
     bool did_exec; // for that one annoying setsid edge case
+
+    // SELinux process attributes, as exposed by /proc/<pid>/attr/* (fs/proc/pid.c).
+    // Nothing here confines anything -- fs/selinuxfs.c is a permissive stub and
+    // there is no policy to evaluate -- but Android userspace is not willing to
+    // start without them: servicemanager's constructor is a fatal
+    // CHECK(getcon(&mThisProcessContext) == 0), and getcon() is a read of
+    // /proc/self/attr/current.
+    //
+    // Fixed-size arrays rather than pointers: copy_task's struct copy inherits
+    // them across fork for free, with no allocation to fail and no ownership to
+    // work out between threads sharing a task. Locked by general_lock, like comm.
+    struct task_security security;
 
     struct task_io_counters io;
 
