@@ -27,10 +27,23 @@ jit_ret_chain:
     mov CPU_poked_ptr(%_cpu), %r10
     cmpb $0, (%r10)
     jnz poke
+    # Per-entry chain budget (jit_frame.chain_budget, reset to 8192 by the
+    # frontend before every jit_enter). This is what makes BACKWARD edges safe
+    # to link: a chained loop returns to C every few thousand dispatches, so
+    # the cycle counter still fires and jetsam/quiesce write waiters cannot
+    # starve. Kept in lockstep with the aarch64 host's jit_ret_chain -- the
+    # frontend decision to link backward jumps is host-independent C, so an
+    # Intel host without this bound would get exactly that starvation bug.
+    decq LOCAL_chain_budget(%_cpu)
+    jle poke
     leaq -JIT_BLOCK_code(%_ip), %r10
     mov %r10, LOCAL_last_block(%_cpu)
     gret
 
+# .global so the ret gadget's return-cache path in control.S can branch here
+# on chain-budget expiry, the way the aarch64 host's poke already is. Without
+# it the Intel host fails to LINK, which an assemble-only check cannot catch.
+.global poke
 poke:
     mov -JIT_BLOCK_code+JIT_BLOCK_addr(%_ip), %_eip
     # fallthrough
