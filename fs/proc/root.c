@@ -563,6 +563,18 @@ static int proc_readlink_self(struct proc_entry *UNUSED(entry), char *buf) {
     return 0;
 }
 
+static int proc_readlink_thread_self(struct proc_entry *UNUSED(entry), char *buf) {
+    // Linux points this at "<tgid>/task/<tid>", and it exists because its
+    // /proc/self is the thread GROUP: a per-thread write to
+    // /proc/self/attr/current from a non-leader thread is EACCES there, so
+    // libselinux reaches for /proc/thread-self first and only then falls back
+    // to /proc/self/task/<tid>. Our /proc/self is already the thread, so both
+    // fallbacks resolve -- but a missing entry costs a failed lookup on a path
+    // Android userspace takes constantly.
+    snprintf(buf, MAX_PATH, "%d/task/%d", current->tgid, current->pid);
+    return 0;
+}
+
 static void proc_print_escaped(struct proc_data *buf, const char *str) {
     for (size_t i = 0; str[i]; i++) {
         switch (str[i]) {
@@ -676,6 +688,7 @@ struct proc_dir_entry proc_root_entries[] = {
     {"self", S_IFLNK, .readlink = proc_readlink_self},
     {"stat", .show = proc_show_stat},
     {"sys", S_IFDIR, .children = &proc_sys_children},
+    {"thread-self", S_IFLNK, .readlink = proc_readlink_thread_self},
     {"uptime", .show = proc_show_uptime},
     {"version", .show = proc_show_version},
     {"vmstat", .show = proc_show_vmstat},

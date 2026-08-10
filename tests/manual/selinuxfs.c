@@ -343,6 +343,38 @@ static void test_attr_exec_transition(const char *self) {
         test_logf("  child exit status %d\n", WEXITSTATUS(status));
 }
 
+static void test_attr_thread_self(void) {
+    // libselinux tries /proc/thread-self/attr/* before /proc/self, because on
+    // Linux /proc/self is the thread group and a per-thread write through it is
+    // EACCES. It has to name this thread specifically.
+    char buf[512];
+    ssize_t n = readlink("/proc/thread-self", buf, sizeof(buf) - 1);
+    check(n > 0, "/proc/thread-self is a symlink");
+    if (n > 0) {
+        buf[n] = '\0';
+        char want[64];
+        snprintf(want, sizeof(want), "%d/task/%d", (int) getpid(), (int) getpid());
+        check(strcmp(buf, want) == 0, "/proc/thread-self names <tgid>/task/<tid>");
+        if (strcmp(buf, want) != 0)
+            test_logf("  points at \"%s\", wanted \"%s\"\n", buf, want);
+    }
+
+    int fd = open("/proc/thread-self/attr/current", O_RDONLY);
+    check(fd >= 0, "attr is reachable through /proc/thread-self");
+    if (fd >= 0) {
+        check(read(fd, buf, sizeof(buf)) > 0, "and reads the same context");
+        close(fd);
+    }
+
+    // The fallback libselinux uses when thread-self is absent.
+    char path[256];
+    snprintf(path, sizeof(path), "/proc/self/task/%d/attr/current", (int) getpid());
+    fd = open(path, O_RDONLY);
+    check(fd >= 0, "attr is reachable through /proc/self/task/<tid>");
+    if (fd >= 0)
+        close(fd);
+}
+
 static void test_attr_other_task(void) {
     // getpidcon() on a peer -- servicemanager calls it for every caller it
     // decides about. Readable, but not writable: a process may only relabel
@@ -409,6 +441,7 @@ int main(int argc, char **argv) {
     test_attr_setcon();
     test_attr_staging_slots();
     test_attr_exec_transition(argv[0]);
+    test_attr_thread_self();
     test_attr_other_task();
 
     if (mount_selinuxfs() < 0) {

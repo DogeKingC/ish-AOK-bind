@@ -1423,8 +1423,11 @@ static int proc_pid_attr_show(struct proc_entry *entry, struct proc_data *buf) {
 }
 
 static int proc_pid_attr_update(struct proc_entry *entry, struct proc_data *data) {
-    // A context may not be set on another task; Linux allows only self.
-    if (entry->pid != current->pid && entry->pid != current->tgid)
+    // Linux allows only the calling task itself, and means the task, not the
+    // thread group: writing /proc/<tgid>/attr/current from a non-leader thread
+    // is EACCES there rather than a relabel of the leader. These attributes are
+    // per-thread, so targeting anything but the caller is always a mistake.
+    if (entry->pid != current->pid)
         return _EACCES;
 
     const struct proc_attr_type *type = &proc_attr_types[entry->fd];
