@@ -253,6 +253,7 @@ if get_option('kernel') == 'ish'
         'kernel/memfd.c',
         'kernel/binder.c',
         'kernel/ashmem.c',
+        'kernel/dma_heap.c',
         'kernel/ptrace.c',
 
         'kernel/fs.c',

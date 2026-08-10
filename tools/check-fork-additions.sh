@@ -61,6 +61,16 @@ need_in fs/dev.c          MISC_MAJOR                "ashmem char device registra
 need_in fs/devices.h      DEV_ASHMEM_MINOR
 need_in meson.build       kernel/ashmem.c
 
+# --- DMA-BUF heaps --------------------------------------------------------
+need_file kernel/dma_heap.c
+need_file kernel/dma_heap.h
+need_file tests/manual/dma_heap.c
+need_in app/AppDelegate.m dma_heap_create_device_nodes "creates /dev/dma_heap at boot"
+need_in xX_main_Xx.h      dma_heap_create_device_nodes "creates /dev/dma_heap at boot (CLI)"
+need_in fs/dev.c          dma_heap_dev                 "dma-heap minor dispatch"
+need_in fs/devices.h      DEV_DMA_HEAP_SYSTEM_MINOR
+need_in meson.build       kernel/dma_heap.c
+
 # --- shared ---------------------------------------------------------------
 need_file kernel/ioctl_abi.h
 
@@ -77,8 +87,10 @@ need_in app/Info.plist  UIFileSharingEnabled
 # mistake both this fork and upstream have made.
 need_in fs/aok-tests.manifest             binder_ipc.c
 need_in fs/aok-tests.manifest             ashmem.c
+need_in fs/aok-tests.manifest             dma_heap.c
 need_in tests/manual/setup-regressions.sh binder_ipc
 need_in tests/manual/setup-regressions.sh ashmem
+need_in tests/manual/setup-regressions.sh dma_heap
 
 # --- CI -------------------------------------------------------------------
 # Upstream guards these on repository *name*, which this fork's name does not

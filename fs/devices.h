@@ -46,6 +46,9 @@
 #define MISC_MAJOR 10
 // /dev/ashmem -- Android anonymous shared memory
 #define DEV_ASHMEM_MINOR 55
+// /dev/dma_heap/* -- DMA-BUF heaps (the allocator that replaced ION)
+#define DEV_DMA_HEAP_SYSTEM_MINOR 56
+#define DEV_DMA_HEAP_UNCACHED_MINOR 57
 
 // --- android binder ---
 // Linux allocates binder's major dynamically; we pick a fixed free one so the

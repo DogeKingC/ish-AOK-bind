@@ -48,6 +48,7 @@
 #include "fs/devices.h"
 #include "kernel/binder.h"
 #include "kernel/ashmem.h"
+#include "kernel/dma_heap.h"
 #include "tools/fakefs.h"
 #include "fs/path.h"
 #include "fs/real.h"
@@ -2430,6 +2431,7 @@ static TerminalViewController *CreateTerminalViewController(void) {
     // CONFIG_ANDROID_BINDER_DEVICES provides them.
     binder_create_device_nodes();
     ashmem_create_device_node();
+    dma_heap_create_device_nodes();
 
     generic_mkdirat(AT_PWD, "/dev/pts", 0755);
 
