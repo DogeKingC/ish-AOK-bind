@@ -87,12 +87,25 @@ jobs:
 
       - name: Build unsigned .app
         run: |
+          # ISH_ARM64_GRET picks the arm64-guest gadget dispatch sequence
+          # (jit/guest-arm64/gadgets.h). Upstream defaults it to dmb, which is
+          # correct for the ARMv8.0 iPad the engine is benchmarked on -- 1.73x
+          # there. It is the wrong side of the trade for the phones this fork
+          # is built for: on modern Apple cores ldar wins by ~6%, because they
+          # retire it nearly free while the dmb barrier still costs.
+          #
+          # Passed as an xcodebuild build setting, NOT a scheme environment
+          # variable: a scheme variable never reaches the build script phase
+          # that runs xcode-meson.sh (upstream 49750e57). Confirm which one a
+          # build actually got with `uname -v`, which appends " gret=dmb" when
+          # dmb is compiled in and nothing for ldar.
           xcodebuild build \
             -project iSH-AOK.xcodeproj \
             -scheme iSH \
             -configuration Release \
             -arch arm64 -sdk iphoneos \
             -derivedDataPath build \
+            ISH_ARM64_GRET=ldar \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
 
       - name: Package IPA

@@ -124,6 +124,14 @@ need_in tests/manual/setup-regressions.sh selinuxfs
 need_in .github/workflows/build-dev-ipa.yml     "DogeKingC/ish-AOK-bind"
 need_in .github/workflows/build-release-ipa.yml "DogeKingC/ish-AOK-bind"
 
+# Upstream's arm64-guest dispatch default (dmb) is tuned for the ARMv8.0 iPad
+# the engine is benchmarked on. This fork targets modern Apple cores, where
+# ldar wins. Upstream edits both the option default and xcode-meson.sh, so a
+# sync can silently move us back onto dmb -- and nothing would fail, it would
+# just be slower.
+need_in .github/workflows/build-dev-ipa.yml     "ISH_ARM64_GRET=ldar"
+need_in .github/workflows/build-release-ipa.yml "ISH_ARM64_GRET=ldar"
+
 if [ "$fail" -eq 0 ]; then
     echo "fork additions: all present"
 fi
