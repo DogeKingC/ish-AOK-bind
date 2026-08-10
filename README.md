@@ -18,6 +18,10 @@ This fork is not just a rebrand. It carries fork-specific behavior, bundled root
 - Android Binder IPC: `/dev/binder`, `/dev/hwbinder`, `/dev/vndbinder` and
   binderfs, so `libbinder`-based Android userspace has a driver to talk to.
   See [docs/binder.md](docs/binder.md).
+- `/mnt/iphone`: the app's Documents directory, mounted into the guest and
+  exposed in the iOS Files app under "On My iPhone" -> iSH-AOK. Needs no
+  entitlement, so it keeps working on sideloaded builds where the File
+  Provider extension does not.
 - File Provider support for exposing guest files through iOS.
 - Extra diagnostics and operational changes that are specific to this fork.
 - Ongoing amd64 interpreter, loader, and syscall work.

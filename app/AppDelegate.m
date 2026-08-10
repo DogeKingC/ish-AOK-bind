@@ -2553,6 +2553,44 @@ static TerminalViewController *CreateTerminalViewController(void) {
         }
     }
 
+    // The app's Documents directory is the one place iOS lets the user manage
+    // directly: UIFileSharingEnabled (Info.plist) puts it in the Files app
+    // under "On My iPhone" -> iSH-AOK, where folders and files can be created,
+    // added, renamed and deleted without going through the app at all. Mount
+    // it into the guest so that content is reachable from the shell, and so
+    // anything the guest writes there shows up in Files.
+    //
+    // Unlike the File Provider extension, this needs no entitlement at all --
+    // two Info.plist keys and a mount. That matters for sideloaded builds: a
+    // free Apple ID cannot provision the App Group the extension depends on,
+    // so on those builds this is the only working route between iOS and the
+    // guest filesystem.
+    NSURL *documentsURL = [NSFileManager.defaultManager
+                           URLsForDirectory:NSDocumentDirectory
+                           inDomains:NSUserDomainMask].firstObject;
+    if (documentsURL != nil) {
+        NSError *documentsError = nil;
+        if ([NSFileManager.defaultManager createDirectoryAtURL:documentsURL
+                                   withIntermediateDirectories:YES
+                                                    attributes:nil
+                                                         error:&documentsError]) {
+            // Same single-host-owner-shared-by-every-guest-uid situation as
+            // /AOK/persist above, and more acutely so: everything the user
+            // drops in from the Files app lands with host-default modes that
+            // no guest uid can write.
+            FixSharedDirectoryPermissions(documentsURL.fileSystemRepresentation);
+            // Bundled roots ship /mnt, but don't assume it.
+            generic_mkdirat(AT_PWD, "/mnt", 0755);
+            generic_mkdirat(AT_PWD, "/mnt/iphone", 0755);
+            int documentsMountErr = do_mount(&realfs, documentsURL.fileSystemRepresentation,
+                                             "/mnt/iphone", "", MOUNT_ISH_SHARED_);
+            if (documentsMountErr < 0)
+                NSLog(@"Could not mount /mnt/iphone: %d", documentsMountErr);
+        } else {
+            NSLog(@"Could not create the Documents directory: %@", documentsError);
+        }
+    }
+
     // Expose every other installed root read-write under /AOK/roots/<name>,
     // so the booted guest can `mount -t fake /AOK/roots/<name>/data <point>`
     // and chroot into it -- e.g. running an i686 root's toolchain from an
