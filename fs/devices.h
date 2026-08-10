@@ -42,6 +42,11 @@
 #define DEV_RTC_MINOR 2
 
 
+// --- misc devices (Linux major 10, dynamically assigned minors) ---
+#define MISC_MAJOR 10
+// /dev/ashmem -- Android anonymous shared memory
+#define DEV_ASHMEM_MINOR 55
+
 // --- android binder ---
 // Linux allocates binder's major dynamically; we pick a fixed free one so the
 // device nodes can be created before any binder device is opened.

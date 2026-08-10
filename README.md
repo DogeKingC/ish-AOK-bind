@@ -18,6 +18,9 @@ This fork is not just a rebrand. It carries fork-specific behavior, bundled root
 - Android Binder IPC: `/dev/binder`, `/dev/hwbinder`, `/dev/vndbinder` and
   binderfs, so `libbinder`-based Android userspace has a driver to talk to.
   See [docs/binder.md](docs/binder.md).
+- Android anonymous shared memory (`/dev/ashmem`): named, sized, mmappable
+  regions whose fd can be passed to another process, which maps the same
+  memory.
 - `/mnt/iphone`: the app's Documents directory, mounted into the guest and
   exposed in the iOS Files app under "On My iPhone" -> iSH-AOK. Needs no
   entitlement, so it keeps working on sideloaded builds where the File

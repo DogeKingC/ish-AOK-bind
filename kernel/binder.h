@@ -2,6 +2,7 @@
 #define KERNEL_BINDER_H
 
 #include "misc.h"
+#include "kernel/ioctl_abi.h"
 
 // Android Binder IPC driver.
 //
@@ -24,38 +25,14 @@ typedef uint64_t binder_uintptr_t;
 // ---------------------------------------------------------------------------
 // ioctl encoding
 // ---------------------------------------------------------------------------
-// Binder's ioctl numbers are _IOC-encoded, and the guest builds them from the
-// struct sizes above, so we have to reproduce the encoding rather than pick
-// arbitrary constants.
 
-#define BINDER_IOC_NRBITS 8
-#define BINDER_IOC_TYPEBITS 8
-#define BINDER_IOC_SIZEBITS 14
-#define BINDER_IOC_NRSHIFT 0
-#define BINDER_IOC_TYPESHIFT (BINDER_IOC_NRSHIFT + BINDER_IOC_NRBITS)
-#define BINDER_IOC_SIZESHIFT (BINDER_IOC_TYPESHIFT + BINDER_IOC_TYPEBITS)
-#define BINDER_IOC_DIRSHIFT (BINDER_IOC_SIZESHIFT + BINDER_IOC_SIZEBITS)
-#define BINDER_IOC_NONE 0U
-#define BINDER_IOC_WRITE 1U
-#define BINDER_IOC_READ 2U
-
-// The result is deliberately a 32-bit *signed* int. The guest passes the
-// command to ioctl(2) as a 32-bit value and struct fd_ops takes it as an int,
-// so codes with the read bit set (0x80000000) arrive negative. Without the
-// narrowing cast the sizeof() below would widen the whole expression to
-// size_t, and a negative `cmd` promoted to 64 bits would never compare equal
-// to the positive 64-bit constant -- every BR_-direction ioctl would silently
-// fall through to ENOTTY.
-#define BINDER_IOC(dir, type, nr, size) \
-    ((int) (uint32_t) (((uint32_t) (dir) << BINDER_IOC_DIRSHIFT) | \
-                       ((uint32_t) (type) << BINDER_IOC_TYPESHIFT) | \
-                       ((uint32_t) (nr) << BINDER_IOC_NRSHIFT) | \
-                       ((uint32_t) (size) << BINDER_IOC_SIZESHIFT)))
-#define BINDER_IO(type, nr) BINDER_IOC(BINDER_IOC_NONE, (type), (nr), 0)
-#define BINDER_IOR(type, nr, size) BINDER_IOC(BINDER_IOC_READ, (type), (nr), sizeof(size))
-#define BINDER_IOW(type, nr, size) BINDER_IOC(BINDER_IOC_WRITE, (type), (nr), sizeof(size))
-#define BINDER_IOWR(type, nr, size) \
-    BINDER_IOC(BINDER_IOC_READ | BINDER_IOC_WRITE, (type), (nr), sizeof(size))
+// Binder's ioctl numbers are _IOC-encoded (kernel/ioctl_abi.h), since the guest
+// builds them from the struct sizes above.
+#define BINDER_IOC(dir, type, nr, size) ISH_IOC(dir, type, nr, size)
+#define BINDER_IO(type, nr) ISH_IO(type, nr)
+#define BINDER_IOR(type, nr, size) ISH_IOR(type, nr, size)
+#define BINDER_IOW(type, nr, size) ISH_IOW(type, nr, size)
+#define BINDER_IOWR(type, nr, size) ISH_IOWR(type, nr, size)
 
 // ---------------------------------------------------------------------------
 // Object types carried inline in a transaction's data buffer
