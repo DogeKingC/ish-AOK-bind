@@ -33,13 +33,50 @@ _addr   .req x7
     NAME(gadget_riscv64_\()\name) :
 .endm
 
-// Same ldar dispatch as jit/guest-arm64/gadgets.h's gret (see the rationale
-// there); keep in sync if entry.S's contract changes.
+// Same dispatch as jit/guest-arm64/gadgets.h's gret, selected by the same
+// -Darm64_gret option; see the measurements and rationale there. Short version:
+// dmb is the default because ldar costs ~1.7x on ARMv8.0 while only buying ~6%
+// on Apple Silicon. Keep in sync if entry.S's contract changes.
+// ⚠ MEASURED on ARMv8.0 (A9 iPad), and the answer DEPENDS ON THE GUEST USERLAND,
+// which is the whole reason this comment is long. sh-loop 20k, the same two
+// builds throughout, each verified from `uname -v` and from the disassembled
+// dispatch tail of gadget_riscv64_addi:
+//
+//   root / shell              ldar      dmb      dmb win
+//   Devuan6-riscv64 / dash    9022 ms   5893 ms   1.53x
+//   Alpine3.23.3 / busybox   10065 ms   9998 ms   FLAT
+//   (arm64 Devuan / dash      5396 ms   3088 ms   1.75x)
+//
+// Same engine, same emulator builds, opposite conclusions. So riscv64 IS
+// dispatch-sensitive and dmb is a real win here, not merely harmless -- but a
+// workload can hide that completely. The busybox/musl loop evidently spends its
+// time somewhere other than gadget dispatch (HLE'd libc, helper gadgets, or
+// simply a different hot loop than dash's interpreter); that has not been
+// separated, and ISH_HLE_STATS would be the way to, except it is an
+// emulator-process env var and so unsettable from a guest ssh session on device.
+//
+// THIS CLAIM WAS WRONG TWICE BEFORE, both times from measuring too narrowly:
+//   1. First landed by inference alone ("verbatim copy of the arm64 dispatcher,
+//      so it must behave the same") with no riscv64 measurement at all.
+//   2. Then "corrected" to INSENSITIVE on the strength of the Alpine/busybox row
+//      only, which is the one row that shows no effect.
+// Both readings were confident and both were wrong. One row of one workload is
+// not a property of an engine.
+//
+// ⚠ MATCH THE USERLAND before quoting any cross-arch number. These roots differ
+// in libc (musl vs glibc) and in /bin/sh (busybox vs dash). A mismatched pair
+// once produced a "3.24x slower than arm64" figure that is really ~1.6-1.9x;
+// check `readlink -f /bin/sh` and the libc on both sides first.
 .macro gret pop=0
+#if defined(ISH_ARM64_GRET_LDAR)
 .if \pop != 0
     add _ip, _ip, \pop*8
 .endif
     ldar x9, [_ip]
+#else
+    ldr x9, [_ip, \pop*8]!
+    dmb ishld
+#endif
     add _ip, _ip, 8
     cbnz x9, 0f
     b jit_ret

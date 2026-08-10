@@ -25,6 +25,20 @@ char *copyBuildVersion(void);
 #else
 #define ISH_BUILD_OPT_SUFFIX " unoptimized"
 #endif
+
+// Same idea, same reason, for the gadget dispatch mode selected by -Darm64_gret
+// (see jit/guest-arm64/gadgets.h). A build whose dispatch instruction you cannot
+// see makes a dispatch A/B unfalsifiable: a flat result is then indistinguishable
+// from "the option never took effect", and that ambiguity really did produce a
+// bogus flat reading before this existed. Reports only the NON-default 'ldar',
+// so ordinary builds read unchanged, following ISH_BUILD_OPT_SUFFIX. Note the
+// default flipped to dmb once ARMv8.0 was measured, so the reported value
+// flipped with it: seeing nothing here means dmb.
+#if defined(ISH_ARM64_GRET_LDAR)
+#define ISH_BUILD_GRET_SUFFIX " gret=ldar"
+#else
+#define ISH_BUILD_GRET_SUFFIX ""
+#endif
 // The same build stamp copyBuildVersion() formats, as a time_t: the running
 // executable's own mtime, which moves on every relink. 0 if the host won't say.
 // aokfs uses it as the mtime of everything it synthesizes (see fs/aok.c), so
