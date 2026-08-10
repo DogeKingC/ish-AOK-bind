@@ -75,8 +75,12 @@ need_in meson.build       kernel/dma_heap.c
 need_file kernel/ioctl_abi.h
 
 # --- iOS integration ------------------------------------------------------
-need_in app/AppGroup.m  NSApplicationSupportDirectory \
-    "app group fallback, without which sideloaded builds cannot hold a root"
+need_in app/AppGroup.m  NSDocumentDirectory \
+    "app group fallback to Documents; without it sideloaded builds cannot hold a root"
+need_in app/AppGroup.m  ContainerIsAppGroup \
+    "lets callers tell a real App Group from the fallback"
+need_in app/RootsTableViewController.m ContainerIsAppGroup \
+    "Browse Files routes to Documents when there is no File Provider"
 need_in app/AppDelegate.m /mnt/iphone   "Documents mounted into the guest"
 need_in app/Info.plist  LSSupportsOpeningDocumentsInPlace
 need_in app/Info.plist  UIFileSharingEnabled

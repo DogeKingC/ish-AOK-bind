@@ -138,6 +138,16 @@ NSArray<NSString *> *CurrentAppGroups(void) {
     return AppEntitlements()[@"com.apple.security.application-groups"];
 }
 
+// True when the container is a real App Group -- which also means the File
+// Provider extension is present, since the two stand or fall together.
+bool ContainerIsAppGroup(void) {
+    NSString *appGroup = CurrentAppGroups().firstObject;
+    if (appGroup == nil)
+        return false;
+    return [NSFileManager.defaultManager
+            containerURLForSecurityApplicationGroupIdentifier:appGroup] != nil;
+}
+
 // Where guest roots, locks and the File Provider's shared state live.
 //
 // The app group container is the right home whenever it exists, because the
@@ -145,16 +155,12 @@ NSArray<NSString *> *CurrentAppGroups(void) {
 // files. But it does not always exist. A free Apple ID cannot provision App
 // Groups at all, so a sideloaded build (AltStore/SideStore/Sideloadly) comes
 // out with the entitlement stripped, and so does any build signed with
-// CODE_SIGNING_ALLOWED=NO. This function then returned nil, which surfaced as
-// "No filesystem storage available (the app group container is missing --
-// check the App Group entitlement)" and left the app unable to hold a root at
-// all -- it could not even import one.
+// CODE_SIGNING_ALLOWED=NO. This function used to return nil there, which left
+// the app unable to hold a root at all -- it could not even import one.
 //
-// Fall back to the app's own container in that case. Nothing is actually lost
-// by it: the same signing limitation that strips the App Group also strips the
-// File Provider extension, so there is no second process left to share with.
-// A properly provisioned build (App Store, TestFlight, or a paid developer
-// account) still gets the app group exactly as before.
+// The fallback is the app's own Documents directory. A properly provisioned
+// build (App Store, TestFlight, or a paid developer account) is unaffected and
+// still resolves the app group exactly as before.
 NSURL *ContainerURL(void) {
     static NSURL *containerURL;
     static dispatch_once_t token;
@@ -173,26 +179,51 @@ NSURL *ContainerURL(void) {
 
         NSLog(@"ContainerURL: no app group container (entitlement missing or "
               @"unprovisioned -- typical of a sideloaded build); falling back "
-              @"to this app's own container. The File Provider extension, if "
-              @"present, will not see these files.");
+              @"to this app's own Documents directory.");
 
-        NSURL *fallback = [NSFileManager.defaultManager
-                           URLsForDirectory:NSApplicationSupportDirectory
-                           inDomains:NSUserDomainMask].firstObject;
-        if (fallback == nil) {
-            NSLog(@"ContainerURL: no Application Support directory either");
+        // Documents specifically, not Application Support. Both are inside the
+        // app sandbox and either would work, but UIFileSharingEnabled exposes
+        // Documents -- and only Documents -- in the Files app under "On My
+        // iPhone". Putting the container there is what makes filesystems
+        // visible and manageable from iOS on a build whose File Provider
+        // extension was stripped along with the App Group.
+        //
+        // The tradeoff is real and deliberate: a filesystem can now be deleted
+        // from Files, with no undo. Application Support would hide them, but
+        // hiding them is exactly the problem being fixed.
+        NSFileManager *manager = NSFileManager.defaultManager;
+        NSURL *documents = [manager URLsForDirectory:NSDocumentDirectory
+                                           inDomains:NSUserDomainMask].firstObject;
+        if (documents == nil) {
+            NSLog(@"ContainerURL: no Documents directory either");
             return;
         }
-        // Application Support is not created for us the way Documents is.
-        NSError *error = nil;
-        if (![NSFileManager.defaultManager createDirectoryAtURL:fallback
-                                   withIntermediateDirectories:YES
-                                                    attributes:@{}
-                                                         error:&error]) {
-            NSLog(@"ContainerURL: couldn't create %@: %@", fallback, error);
-            return;
+
+        // Earlier builds of this fallback used Application Support. Anything
+        // already there has to come across, or the app would come up with an
+        // empty filesystem list and the old roots stranded where nothing looks
+        // for them. Same sandbox, so this is a rename rather than a copy.
+        NSURL *legacy = [manager URLsForDirectory:NSApplicationSupportDirectory
+                                        inDomains:NSUserDomainMask].firstObject;
+        if (legacy != nil) {
+            NSURL *legacyRoots = [legacy URLByAppendingPathComponent:@"roots"];
+            NSURL *newRoots = [documents URLByAppendingPathComponent:@"roots"];
+            if ([manager fileExistsAtPath:legacyRoots.path] &&
+                    ![manager fileExistsAtPath:newRoots.path]) {
+                NSError *moveError = nil;
+                if ([manager moveItemAtURL:legacyRoots toURL:newRoots error:&moveError]) {
+                    NSLog(@"ContainerURL: migrated roots from Application Support to Documents");
+                } else {
+                    // Leave the old copy alone and keep using it, rather than
+                    // starting empty with the user's filesystems orphaned.
+                    NSLog(@"ContainerURL: could not migrate roots (%@); staying on %@",
+                          moveError, legacy);
+                    containerURL = legacy;
+                    return;
+                }
+            }
         }
-        containerURL = fallback;
+        containerURL = documents;
     });
     return containerURL;
 }
