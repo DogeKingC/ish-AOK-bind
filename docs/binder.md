@@ -136,8 +136,14 @@ when a node's owner exits, and binderfs device creation.
 
 ## Beyond binder
 
-Binder is necessary but not sufficient for running Android userspace. The next
-things a real Android stack asks for are `ashmem` (or `memfd` with the Android
-sealing conventions) and `dmabuf`; graphics (`/dev/dri`) comes after those, and
-would need an actual DRM implementation rather than a stub, since iSH has no GPU
-passthrough for Mesa to use.
+Binder is necessary but not sufficient for running Android userspace.
+
+`ashmem` (`/dev/ashmem`) is now implemented too -- see `kernel/ashmem.c` and
+`tests/manual/ashmem.c`. It is backed the same way binder's receive region is,
+by an unlinked host temp file, so a descriptor passed between processes maps
+the same pages on both sides.
+
+Still missing, in the order a real stack asks for them: `dmabuf` (in practice
+the DMA-BUF heaps at `/dev/dma_heap/system`, which replaced ION), and then
+graphics. `/dev/dri` would need an actual DRM implementation rather than a
+stub, since iSH has no GPU passthrough for Mesa to use.

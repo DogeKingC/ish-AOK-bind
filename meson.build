@@ -252,6 +252,7 @@ if get_option('kernel') == 'ish'
         'kernel/sysvsem.c',
         'kernel/memfd.c',
         'kernel/binder.c',
+        'kernel/ashmem.c',
         'kernel/ptrace.c',
 
         'kernel/fs.c',
