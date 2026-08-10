@@ -138,9 +138,63 @@ NSArray<NSString *> *CurrentAppGroups(void) {
     return AppEntitlements()[@"com.apple.security.application-groups"];
 }
 
+// Where guest roots, locks and the File Provider's shared state live.
+//
+// The app group container is the right home whenever it exists, because the
+// File Provider extension is a separate process that has to see the same
+// files. But it does not always exist. A free Apple ID cannot provision App
+// Groups at all, so a sideloaded build (AltStore/SideStore/Sideloadly) comes
+// out with the entitlement stripped, and so does any build signed with
+// CODE_SIGNING_ALLOWED=NO. This function then returned nil, which surfaced as
+// "No filesystem storage available (the app group container is missing --
+// check the App Group entitlement)" and left the app unable to hold a root at
+// all -- it could not even import one.
+//
+// Fall back to the app's own container in that case. Nothing is actually lost
+// by it: the same signing limitation that strips the App Group also strips the
+// File Provider extension, so there is no second process left to share with.
+// A properly provisioned build (App Store, TestFlight, or a paid developer
+// account) still gets the app group exactly as before.
 NSURL *ContainerURL(void) {
-    NSString *appGroup = CurrentAppGroups()[0];
-    return [NSFileManager.defaultManager containerURLForSecurityApplicationGroupIdentifier:appGroup];
+    static NSURL *containerURL;
+    static dispatch_once_t token;
+    dispatch_once(&token, ^{
+        // firstObject, not [0]: CurrentAppGroups() reads the entitlements
+        // embedded in the signature, so it is nil when the key is absent and
+        // an *empty array* when the key is present but has no groups. The
+        // latter made this a raise-NSRangeException path rather than a nil.
+        NSString *appGroup = CurrentAppGroups().firstObject;
+        if (appGroup != nil) {
+            containerURL = [NSFileManager.defaultManager
+                            containerURLForSecurityApplicationGroupIdentifier:appGroup];
+        }
+        if (containerURL != nil)
+            return;
+
+        NSLog(@"ContainerURL: no app group container (entitlement missing or "
+              @"unprovisioned -- typical of a sideloaded build); falling back "
+              @"to this app's own container. The File Provider extension, if "
+              @"present, will not see these files.");
+
+        NSURL *fallback = [NSFileManager.defaultManager
+                           URLsForDirectory:NSApplicationSupportDirectory
+                           inDomains:NSUserDomainMask].firstObject;
+        if (fallback == nil) {
+            NSLog(@"ContainerURL: no Application Support directory either");
+            return;
+        }
+        // Application Support is not created for us the way Documents is.
+        NSError *error = nil;
+        if (![NSFileManager.defaultManager createDirectoryAtURL:fallback
+                                   withIntermediateDirectories:YES
+                                                    attributes:@{}
+                                                         error:&error]) {
+            NSLog(@"ContainerURL: couldn't create %@: %@", fallback, error);
+            return;
+        }
+        containerURL = fallback;
+    });
+    return containerURL;
 }
 
 static NSString *ISHAppGroupLockSafeComponent(NSString *value) {
