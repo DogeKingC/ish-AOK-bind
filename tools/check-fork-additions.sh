@@ -88,6 +88,8 @@ need_in kernel/task.c  TASK_SECURITY_DEFAULT_CONTEXT "the initial task's context
 need_in fs/proc/pid.c  proc_pid_attr_readdir         "/proc/<pid>/attr in the pid directory"
 need_in fs/proc/pid.c  '{"attr", S_IFDIR'            "attr listed among the pid children"
 need_in kernel/exec.c  'security.exec'               "execve consumes the setexeccon context"
+need_in kernel/binder.c BR_TRANSACTION_SEC_CTX \
+    "binder delivers the sender's context to a node that asked for one"
 
 # --- shared ---------------------------------------------------------------
 need_file kernel/ioctl_abi.h

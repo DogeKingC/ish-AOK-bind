@@ -122,13 +122,37 @@ asserts on the wire format. It covers the ioctl surface and mmap rules, claiming
 the context manager, a real cross-process transaction and reply (checking the
 payload arrives through the receiver's own mapping), `BINDER_TYPE_BINDER` being
 translated to a handle at the peer, oneway transactions, `BR_DEAD_BINDER` firing
-when a node's owner exits, and binderfs device creation.
+when a node's owner exits, the sender's security context arriving with a
+transaction, and binderfs device creation.
+
+## Security contexts
+
+A context manager claimed with `BINDER_SET_CONTEXT_MGR_EXT` and
+`FLAT_BINDER_FLAG_TXN_SECURITY_CTX` receives `BR_TRANSACTION_SEC_CTX` instead of
+`BR_TRANSACTION`. It carries the same transaction data plus a pointer to the
+*sender's* SELinux context, copied into the tail of the receiver's own buffer
+along with the payload:
+
+```c
+struct binder_transaction_data_secctx {
+    struct binder_transaction_data transaction_data;
+    binder_uintptr_t secctx;   /* NUL-terminated, inside the receive mapping */
+};
+```
+
+The context is the sender's `/proc/self/attr/current` (see `fs/proc/pid.c`).
+Nothing evaluates it -- `fs/selinuxfs.c` is a permissive stub with no policy --
+but delivering it matters anyway: servicemanager decides every `add`/`find`
+against the caller's context, and taking it from the transaction avoids the race
+in its `getpidcon()` fallback, where the caller can exit and have its pid reused
+before the lookup happens.
+
+The context sits past the scatter-gather area, and the buffer's recorded
+`extra_buffers_size` stays at what the sender declared, so a sender cannot grow
+its own sg buffers over the context the receiver is about to trust.
 
 ## Not implemented
 
-- **Security contexts.** `FLAT_BINDER_FLAG_TXN_SECURITY_CTX` is parsed and
-  stored but no SELinux context is attached, so `BR_TRANSACTION_SEC_CTX` is
-  never delivered. iSH has no LSM to source a context from.
 - **Scheduler policy inheritance.** `FLAT_BINDER_FLAG_INHERIT_RT` and the
   priority bits are accepted and ignored; binder priority inheritance has no
   meaning without a real scheduler underneath.

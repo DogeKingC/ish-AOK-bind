@@ -208,6 +208,10 @@ struct binder_transaction {
     uint32_t flags;
     pid_t_ sender_pid;
     uid_t_ sender_euid;
+    // Guest address, inside the target's own mapping, of the sender's SELinux
+    // context -- or 0 when the target node did not ask for one. Non-zero is
+    // what turns BR_TRANSACTION into BR_TRANSACTION_SEC_CTX at delivery.
+    binder_uintptr_t security_ctx;
     struct list fd_fixups;
     int debug_id;
 };
@@ -1181,14 +1185,39 @@ static void binder_transaction(struct binder_proc *proc, struct binder_thread *t
         goto err_bad_data;
     }
 
+    // A node registered with FLAT_BINDER_FLAG_TXN_SECURITY_CTX is asking to be
+    // told who is calling it. servicemanager is the reason this exists: it
+    // decides every add/find against the caller's context, and reading it here
+    // is race-free in a way its getpidcon() fallback is not -- by the time it
+    // could look up /proc/<pid>/attr/current, the caller may have exited and
+    // the pid been reused.
+    char secctx[TASK_SECURITY_CONTEXT_MAX];
+    size_t secctx_size = 0;
+    if (target_node != NULL && target_node->txn_security_ctx) {
+        lock(&current->general_lock, 0);
+        strcpy(secctx, current->security.current);
+        unlock(&current->general_lock);
+        if (secctx[0] == '\0')
+            strcpy(secctx, TASK_SECURITY_DEFAULT_CONTEXT);
+        secctx_size = strlen(secctx) + 1; // the receiver reads a C string
+    }
+
+    // The context lives past the scatter-gather area, at the very end of the
+    // buffer. Allocating for it here but leaving buffer->extra_buffers_size at
+    // the size the sender declared is deliberate: that field is the bound
+    // binder_translate_sg_buffer() allocates against, so a sender cannot grow
+    // its sg buffers into the context and overwrite it.
+    size_t secctx_padded = BINDER_ALIGN(secctx_size);
     struct binder_buffer *buffer = binder_alloc_buf(target_proc, (size_t) tr->data_size,
-                                                    (size_t) tr->offsets_size, extra_buffers_size,
+                                                    (size_t) tr->offsets_size,
+                                                    extra_buffers_size + secctx_padded,
                                                     is_async);
     if (buffer == NULL) {
         free(tcomplete);
         free(t);
         goto err_alloc;
     }
+    buffer->extra_buffers_size = extra_buffers_size;
     t->buffer = buffer;
     buffer->transaction = t;
     buffer->target_node = target_node;
@@ -1199,6 +1228,16 @@ static void binder_transaction(struct binder_proc *proc, struct binder_thread *t
     char *data = binder_buffer_kaddr(target_proc, buffer);
     size_t offsets_base = BINDER_ALIGN((size_t) tr->data_size);
     size_t sg_base = offsets_base + BINDER_ALIGN((size_t) tr->offsets_size);
+
+    if (secctx_size > 0) {
+        // Straight after the sg area, which ends at sg_base + the declared
+        // extra_buffers_size. binder_alloc_buf padded each region to
+        // BINDER_ALIGN, and secctx_padded is a multiple of it, so this lands
+        // inside the allocation.
+        size_t secctx_off = sg_base + BINDER_ALIGN(extra_buffers_size);
+        memcpy(data + secctx_off, secctx, secctx_size);
+        t->security_ctx = binder_buffer_uaddr(target_proc, buffer) + secctx_off;
+    }
 
     // The single copy: sender's guest memory straight into the target's region.
     if (tr->data_size > 0 &&
@@ -1773,14 +1812,19 @@ static int binder_thread_read(struct binder_proc *proc, struct binder_thread *th
                 if (target_node != NULL) {
                     tr.target.ptr = target_node->ptr;
                     tr.cookie = target_node->cookie;
-                    cmd = BR_TRANSACTION;
+                    // The sender's context, if the node asked to be told.
+                    // BR_TRANSACTION_SEC_CTX carries a wider struct, so the
+                    // command code is what tells the receiver how much to read.
+                    cmd = t->security_ctx != 0 ? BR_TRANSACTION_SEC_CTX : BR_TRANSACTION;
                 } else {
                     tr.target.ptr = 0;
                     tr.cookie = 0;
                     cmd = BR_REPLY;
                 }
 
-                if (binder_cursor_room(cursor) < sizeof(cmd) + sizeof(tr)) {
+                size_t tr_size = cmd == BR_TRANSACTION_SEC_CTX
+                    ? sizeof(struct binder_transaction_data_secctx) : sizeof(tr);
+                if (binder_cursor_room(cursor) < sizeof(cmd) + tr_size) {
                     binder_enqueue_thread_work(thread, work);
                     return 0;
                 }
@@ -1817,7 +1861,15 @@ static int binder_thread_read(struct binder_proc *proc, struct binder_thread *th
                 err = binder_cursor_put_cmd(cursor, cmd);
                 if (err < 0)
                     return err;
-                err = binder_cursor_put(cursor, &tr, sizeof(tr));
+                if (cmd == BR_TRANSACTION_SEC_CTX) {
+                    struct binder_transaction_data_secctx trs = {
+                        .transaction_data = tr,
+                        .secctx = t->security_ctx,
+                    };
+                    err = binder_cursor_put(cursor, &trs, sizeof(trs));
+                } else {
+                    err = binder_cursor_put(cursor, &tr, sizeof(tr));
+                }
                 if (err < 0)
                     return err;
 

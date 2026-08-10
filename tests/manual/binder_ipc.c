@@ -25,6 +25,10 @@
 //   death        BC_REQUEST_DEATH_NOTIFICATION on a handle fires BR_DEAD_BINDER
 //                when the owning process goes away. Run against /dev/vndbinder
 //                so it also covers contexts being independent of each other.
+//   secctx       A context manager claimed with BINDER_SET_CONTEXT_MGR_EXT and
+//                FLAT_BINDER_FLAG_TXN_SECURITY_CTX receives BR_TRANSACTION_SEC_CTX
+//                carrying the *sender's* SELinux context, in the receiver's own
+//                mapping. Run against /dev/hwbinder.
 //   binderfs     Mounting binderfs and creating a device with BINDER_CTL_ADD
 //                makes a new node appear in the directory. SKIPped when the
 //                mount is not permitted.
@@ -106,6 +110,11 @@ struct binder_transaction_data {
     } data;
 };
 
+struct binder_transaction_data_secctx {
+    struct binder_transaction_data transaction_data;
+    binder_uintptr_t secctx;
+};
+
 struct binder_ptr_cookie {
     binder_uintptr_t ptr;
     binder_uintptr_t cookie;
@@ -125,6 +134,7 @@ struct binderfs_device {
 #define BINDER_WRITE_READ       _IOWR('b', 1, struct binder_write_read)
 #define BINDER_SET_MAX_THREADS  _IOW('b', 5, uint32_t)
 #define BINDER_SET_CONTEXT_MGR  _IOW('b', 7, int32_t)
+#define BINDER_SET_CONTEXT_MGR_EXT _IOW('b', 13, struct flat_binder_object)
 #define BINDER_THREAD_EXIT      _IOW('b', 8, int32_t)
 #define BINDER_VERSION          _IOWR('b', 9, struct binder_version)
 #define BINDER_CTL_ADD          _IOWR('b', 1, struct binderfs_device)
@@ -133,6 +143,9 @@ enum {
     BR_ERROR = _IOR('r', 0, int32_t),
     BR_OK = _IO('r', 1),
     BR_TRANSACTION = _IOR('r', 2, struct binder_transaction_data),
+    // Same nr as BR_TRANSACTION; the size in the encoding is what tells them
+    // apart, so a receiver that asked for contexts gets a distinct code.
+    BR_TRANSACTION_SEC_CTX = _IOR('r', 2, struct binder_transaction_data_secctx),
     BR_REPLY = _IOR('r', 3, struct binder_transaction_data),
     BR_DEAD_REPLY = _IO('r', 5),
     BR_TRANSACTION_COMPLETE = _IO('r', 6),
@@ -167,6 +180,7 @@ enum {
 
 #define TF_ONE_WAY 0x01
 #define FLAT_BINDER_FLAG_ACCEPTS_FDS 0x100
+#define FLAT_BINDER_FLAG_TXN_SECURITY_CTX 0x1000
 
 #define SERVICE_CODE 0x2a
 #define SERVICE_MAGIC UINT64_C(0x1234567890abcdef)
@@ -243,6 +257,8 @@ static ssize_t br_payload_size(uint32_t cmd) {
         case BR_TRANSACTION:
         case BR_REPLY:
             return sizeof(struct binder_transaction_data);
+        case BR_TRANSACTION_SEC_CTX:
+            return sizeof(struct binder_transaction_data_secctx);
         case BR_INCREFS:
         case BR_ACQUIRE:
         case BR_RELEASE:
@@ -339,6 +355,7 @@ static int binder_setup_devices(void) {
     if (access("/dev/binder", F_OK) == 0)
         return 0;
     if (mknod("/dev/binder", S_IFCHR | 0666, makedev(BINDER_DEV_MAJOR, 0)) == 0) {
+        (void) mknod("/dev/hwbinder", S_IFCHR | 0666, makedev(BINDER_DEV_MAJOR, 1));
         (void) mknod("/dev/vndbinder", S_IFCHR | 0666, makedev(BINDER_DEV_MAJOR, 2));
         return 0;
     }
@@ -772,7 +789,173 @@ static void test_death_notification(const char *dev) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 4: binderfs
+// Phase 4: the caller's SELinux context (BR_TRANSACTION_SEC_CTX)
+// ---------------------------------------------------------------------------
+
+// A node registered with FLAT_BINDER_FLAG_TXN_SECURITY_CTX is told who is
+// calling it. servicemanager is why this exists: it decides every add/find
+// against the caller's context, and taking it from the transaction is
+// race-free in a way its getpidcon() fallback is not -- by the time it could
+// look up /proc/<pid>/attr/current, the caller may have exited and had its pid
+// reused by someone else.
+#define CLIENT_CONTEXT "u:r:untrusted_app:s0"
+
+struct secctx_ctx {
+    struct binder *b;
+    int saw;
+    char seen[256];
+};
+
+static int secctx_handler(uint32_t cmd, const void *payload, void *vctx) {
+    struct secctx_ctx *ctx = vctx;
+
+    if (cmd == BR_INCREFS || cmd == BR_ACQUIRE) {
+        ack_refs(ctx->b, cmd, payload);
+        return 0;
+    }
+    if (cmd == BR_TRANSACTION) {
+        // Silently downgrading would leave the receiver reading a secctx field
+        // that was never written.
+        check(0, "node asked for contexts but got a plain BR_TRANSACTION");
+        return 1;
+    }
+    if (cmd != BR_TRANSACTION_SEC_CTX)
+        return 0;
+
+    struct binder_transaction_data_secctx trs;
+    memcpy(&trs, payload, sizeof(trs));
+    ctx->saw = 1;
+
+    check(trs.secctx != 0, "the transaction carries a context pointer");
+    if (trs.secctx != 0) {
+        // It arrives through the same single copy as the payload, so it has to
+        // land inside the receiver's own mapping.
+        const char *p = (const char *) (uintptr_t) trs.secctx;
+        const char *base = ctx->b->map;
+        check(p >= base && p < base + BINDER_MAP_SIZE,
+              "the context lies inside the receiver's mapping");
+        if (p >= base && p < base + BINDER_MAP_SIZE)
+            snprintf(ctx->seen, sizeof(ctx->seen), "%s", p);
+    }
+
+    uint64_t magic = 0;
+    if (trs.transaction_data.data_size >= sizeof(magic))
+        memcpy(&magic, (void *) (uintptr_t) trs.transaction_data.data.ptr.buffer,
+               sizeof(magic));
+    check(magic == SERVICE_MAGIC, "the payload survives alongside the context");
+
+    struct {
+        uint32_t cmd;
+        binder_uintptr_t buffer;
+    } __attribute__((packed)) freebuf = {
+        BC_FREE_BUFFER, trs.transaction_data.data.ptr.buffer
+    };
+    (void) binder_wr(ctx->b, &freebuf, sizeof(freebuf), NULL, 0, NULL);
+    return 1;
+}
+
+static int set_own_context(const char *ctx) {
+    int fd = open("/proc/self/attr/current", O_WRONLY);
+    if (fd < 0)
+        return -1;
+    ssize_t n = write(fd, ctx, strlen(ctx) + 1);
+    close(fd);
+    return n > 0 ? 0 : -1;
+}
+
+static void test_security_context(const char *dev) {
+    if (access(dev, F_OK) != 0) {
+        printf("SKIP secctx: no %s\n", dev);
+        return;
+    }
+    if (access("/proc/self/attr/current", R_OK) != 0) {
+        printf("SKIP secctx: no /proc/self/attr/current\n");
+        return;
+    }
+
+    struct binder server = { .fd = -1 };
+    if (binder_open_dev(&server, dev) < 0) {
+        check(0, "secctx server open+mmap");
+        return;
+    }
+
+    // The ext form of claiming handle 0 is the only way to ask for contexts:
+    // it takes a flat_binder_object so the flags have somewhere to live.
+    struct flat_binder_object mgr = {
+        .type = BINDER_TYPE_BINDER,
+        .flags = FLAT_BINDER_FLAG_TXN_SECURITY_CTX | FLAT_BINDER_FLAG_ACCEPTS_FDS,
+    };
+    if (ioctl(server.fd, BINDER_SET_CONTEXT_MGR_EXT, &mgr) < 0) {
+        printf("SKIP secctx: context manager already claimed on %s (errno=%d)\n", dev, errno);
+        binder_close_dev(&server);
+        return;
+    }
+    check(1, "BINDER_SET_CONTEXT_MGR_EXT claims handle 0 asking for contexts");
+
+    int sync_pipe[2];
+    check(pipe(sync_pipe) == 0, "secctx sync pipe");
+
+    pid_t child = fork();
+    check(child >= 0, "fork secctx client");
+    if (child == 0) {
+        close(sync_pipe[1]);
+        char go;
+        (void) read(sync_pipe[0], &go, 1);
+        close(sync_pipe[0]);
+
+        // Relabel after the fork, so what the server sees can only have come
+        // from this process rather than being inherited by both ends.
+        if (set_own_context(CLIENT_CONTEXT) != 0) {
+            fflush(NULL);
+            _exit(73);
+        }
+
+        struct binder client = { .fd = -1 };
+        if (binder_open_dev(&client, dev) < 0) {
+            fflush(NULL);
+            _exit(70);
+        }
+        struct client_ctx cctx = { .b = &client };
+        client_call(&client, TF_ONE_WAY, &cctx);
+        binder_close_dev(&client);
+        fflush(NULL);
+        _exit(failures_total == 0 ? 0 : 71);
+    }
+
+    close(sync_pipe[0]);
+    (void) write(sync_pipe[1], "g", 1);
+    close(sync_pipe[1]);
+
+    struct secctx_ctx ctx = { .b = &server };
+    uint8_t readbuf[512];
+    for (int i = 0; i < 16 && !ctx.saw; i++) {
+        size_t consumed = 0;
+        if (binder_wr(&server, NULL, 0, readbuf, sizeof(readbuf), &consumed) < 0) {
+            if (errno == EINTR)
+                continue;
+            check(0, "secctx server BINDER_WRITE_READ");
+            break;
+        }
+        br_parse(readbuf, consumed, secctx_handler, &ctx);
+    }
+
+    check(ctx.saw, "the transaction arrived as BR_TRANSACTION_SEC_CTX");
+    check(strcmp(ctx.seen, CLIENT_CONTEXT) == 0,
+          "the context is the sender's, not the receiver's");
+    if (ctx.saw && strcmp(ctx.seen, CLIENT_CONTEXT) != 0)
+        printf("       saw \"%s\", wanted \"%s\"\n", ctx.seen, CLIENT_CONTEXT);
+
+    int status = 0;
+    check(waitpid(child, &status, 0) == child, "reap secctx client");
+    check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "secctx client completed");
+    if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+        printf("       client exit status %d\n", WEXITSTATUS(status));
+
+    binder_close_dev(&server);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: binderfs
 // ---------------------------------------------------------------------------
 
 static void test_binderfs(void) {
@@ -862,6 +1045,7 @@ int main(int argc, char **argv) {
     test_basics(binder_path);
     test_transaction(binder_path);
     test_death_notification(vndbinder_path);
+    test_security_context(binder_dev_named("hwbinder"));
     test_binderfs();
 
     return finish_suite("binder_ipc");
