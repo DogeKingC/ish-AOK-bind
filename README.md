@@ -23,6 +23,9 @@ This fork is not just a rebrand. It carries fork-specific behavior, bundled root
   memory.
 - DMA-BUF heaps (`/dev/dma_heap/system`), the allocator that replaced ION:
   `DMA_HEAP_IOCTL_ALLOC` hands back a shareable, mmappable dma-buf.
+- A **permissive** SELinux stub (`mount -t selinuxfs selinuxfs /sys/fs/selinux`).
+  It enforces nothing -- it exists because Android userspace refuses to start
+  without a security server to talk to. Not mounted by default.
 - `/mnt/iphone`: the app's Documents directory, mounted into the guest and
   exposed in the iOS Files app under "On My iPhone" -> iSH-AOK. Needs no
   entitlement, so it keeps working on sideloaded builds where the File

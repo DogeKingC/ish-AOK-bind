@@ -297,6 +297,10 @@ static inline int sock_flags_from_real(int real) {
 #define NETLINK_SOCK_DIAG_ 4
 #define NETLINK_ROUTE_ 0
 #define NETLINK_AUDIT_ 9
+// SELinux notifications. Accepted so libselinux's selinux_status_open()
+// fallback path can open it; no event is ever delivered, which is correct --
+// a permissive policy that never changes has nothing to notify about.
+#define NETLINK_SELINUX_ 7
 #define NETLINK_GENERIC_ 16
 #define NETLINK_ADD_MEMBERSHIP_ 1
 #define NETLINK_DROP_MEMBERSHIP_ 2

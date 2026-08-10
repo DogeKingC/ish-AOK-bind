@@ -89,6 +89,7 @@ memfd_mmap.c
 binder_ipc.c
 ashmem.c
 dma_heap.c
+selinuxfs.c
 mount_stdev.c
 mmap_truncate_sigbus.c
 null_page_fault.c
