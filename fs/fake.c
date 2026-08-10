@@ -36,6 +36,10 @@ static int fakefs_host_path(const char *path, host_path_t host) {
 
 // this exists only to override readdir to fix the returned inode numbers
 static struct fd_ops fakefs_fdops;
+
+// Defined below; used by open, stat and readdir alike.
+static ino_t fakefs_adopt_foreign(struct mount *mount, const char *path,
+                                  struct ish_stat *ishstat_out);
 static struct fd_ops initctl_fdops;
 
 #define INITCTL_MODE (S_IFIFO | 0666)
@@ -346,9 +350,14 @@ retry:
         if (fd->fake_inode == 0)
             fd->fake_inode = path_create(fs, path, &ishstat);
     }
+    if (fd->fake_inode == 0) {
+        // On disk but with no metadata: dropped into the data directory from
+        // outside iSH. Adopt it rather than reporting a file that is plainly
+        // there as missing.
+        fd->fake_inode = fakefs_adopt_foreign(mount, path, NULL);
+    }
     db_commit(fs);
     if (fd->fake_inode == 0) {
-        // File exists on the real FS but has no fakefs metadata (pre-existing inconsistency).
         fd_close(fd);
         return ERR_PTR(_ENOENT);
     }
@@ -550,6 +559,65 @@ static int fakefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev
     return err;
 }
 
+
+// Adopting files that appeared in the data directory from outside iSH.
+//
+// fakefs splits a filesystem in two: contents live in the data directory as a
+// real (name-escaped) mirror of the tree, and every path's metadata -- mode,
+// owner, inode -- lives in meta.db. Both halves are needed. A file that
+// appears in the data directory without a database row is invisible to the
+// guest: lookups miss, and fakefs_readdir skips it outright.
+//
+// That is exactly what happens when a file is dropped into a filesystem from
+// the iOS Files app (which reaches the data directory but knows nothing about
+// meta.db), and equally when a tree is restored from a backup made outside
+// iSH. The file is sitting in the right place, correctly named, and the guest
+// cannot see it -- which reads as data loss even though nothing was lost.
+//
+// So synthesise the metadata iSH would have written had the guest created it.
+// Deliberately narrow:
+//
+//   - only when something really is on disk at that path, so a genuine ENOENT
+//     stays an ENOENT and a typo does not conjure a file into existence;
+//   - only regular files and directories. A symlink, fifo or device node
+//     needs metadata that cannot be recovered from the host (iOS cannot store
+//     a Linux device's major/minor), and inventing it would be worse than
+//     leaving the entry alone;
+//   - owned by root, since the host owner is the app's uid and means nothing
+//     to the guest -- the same reasoning MOUNT_ISH_SHARED_ uses.
+//
+// Caller must hold the db write lock. Returns the new inode, or 0.
+static ino_t fakefs_adopt_foreign(struct mount *mount, const char *path,
+                                  struct ish_stat *ishstat_out) {
+    host_path_t host_path;
+    if (fakefs_host_path(path, host_path) < 0)
+        return 0;
+
+    struct statbuf host_stat;
+    if (realfs.stat(mount, host_path, &host_stat) < 0)
+        return 0;
+    if (!S_ISREG(host_stat.mode) && !S_ISDIR(host_stat.mode))
+        return 0;
+
+    struct ish_stat ishstat;
+    // Keep the host's type and its permission bits, so an executable dropped
+    // in stays executable -- forcing a flat 0644 here silently made every
+    // adopted binary unrunnable. Floor them so the owner can always reach the
+    // file even if the host recorded something unhelpful; adopted files are
+    // owned by root, which is who the guest normally runs as.
+    ishstat.mode = (host_stat.mode & S_IFMT) |
+                   (host_stat.mode & 07777) |
+                   (S_ISDIR(host_stat.mode) ? 0700 : 0600);
+    ishstat.uid = 0;
+    ishstat.gid = 0;
+    ishstat.rdev = 0;
+
+    ino_t inode = path_create(&mount->fakefs, path, &ishstat);
+    if (inode != 0 && ishstat_out != NULL)
+        *ishstat_out = ishstat;
+    return inode;
+}
+
 static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fake_stat) {
     ino_t initctl_inode;
     if (fakefs_initctl_info(path, NULL, &initctl_inode)) {
@@ -561,8 +629,13 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
     struct ish_stat ishstat;
     ino_t inode;
     if (!path_read_stat(fs, path, &ishstat, &inode)) {
-        sqlite3_mutex_leave(fs->lock);
-        return _ENOENT;
+        // No metadata. Either the path really does not exist, or it was put
+        // into the data directory from outside iSH; adopt it if so.
+        inode = fakefs_adopt_foreign(mount, path, &ishstat);
+        if (inode == 0) {
+            sqlite3_mutex_leave(fs->lock);
+            return _ENOENT;
+        }
     }
     sqlite3_mutex_leave(fs->lock);
 
@@ -771,9 +844,15 @@ retry:
     struct ish_stat ishstat;
     ino_t inode;
     bool found = path_read_stat(fs, entry_path, &ishstat, &inode);
+    if (!found || inode == 0) {
+        // The host directory has an entry the database does not know about.
+        // Usually that means it was dropped in from outside iSH, so adopt it;
+        // if it cannot be adopted (a type whose metadata we cannot invent)
+        // skip the entry rather than crashing, leaving room for recovery.
+        inode = fakefs_adopt_foreign(fd->mount, entry_path, &ishstat);
+        found = inode != 0;
+    }
     db_commit(fs);
-    // it's quite possible that due to some mishap there's no metadata for this file
-    // so just skip this entry, instead of crashing the program, so there's hope for recovery
     if (!found || inode == 0)
         goto retry;
     entry->inode = inode;
