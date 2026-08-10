@@ -92,28 +92,13 @@ jobs:
           fi
 
       # A clean merge is not by itself proof this fork's work survived: an
-      # upstream commit that deleted or rewrote one of the files the binder
-      # driver hooks into would merge without complaint. Check the hooks
-      # explicitly, since they are single lines in files upstream also edits.
+      # upstream commit that deleted or rewrote a file we hook into would merge
+      # without complaint, and most of those hooks are single lines in files
+      # upstream edits regularly. The list of what to check lives in the script
+      # so adding a subsystem means editing one place.
       - name: Verify this fork's own code survived the merge
         if: steps.merge.outputs.clean == 'true'
-        run: |
-          set -euo pipefail
-          fail=0
-          for f in kernel/binder.c kernel/binder.h fs/binderfs.c \
-                   tests/manual/binder_ipc.c docs/binder.md; do
-            if [ ! -f "$f" ]; then echo "MISSING: $f"; fail=1; fi
-          done
-          check_contains() {
-            if ! grep -q "$2" "$1"; then echo "MISSING in $1: $2"; fail=1; fi
-          }
-          check_contains app/AppDelegate.m binder_create_device_nodes
-          check_contains xX_main_Xx.h        binder_create_device_nodes
-          check_contains kernel/exit.c       binder_task_exit
-          check_contains fs/dev.c            BINDER_MAJOR
-          check_contains fs/mount.c          binderfs
-          check_contains meson.build         'kernel/binder.c'
-          exit $fail
+        run: sh tools/check-fork-additions.sh
 
       - name: Install build dependencies
         if: steps.merge.outputs.clean == 'true'
@@ -136,6 +121,16 @@ jobs:
           meson test -C build e2e --print-errorlogs
         env:
           CC: clang
+
+      # Building is not enough. binder and ashmem are drivers, so a
+      # regression in them is behavioural and only shows up when a guest
+      # process actually exercises the protocol -- exactly what these tests do,
+      # and the same way they are run during development.
+      - name: Run this fork's guest regression tests
+        if: steps.merge.outputs.clean == 'true'
+        run: |
+          sudo apt-get install -y gcc-multilib
+          bash tools/run-guest-tests.sh build
 
       - name: Push to working
         if: steps.merge.outputs.clean == 'true'
@@ -177,8 +172,8 @@ jobs:
             REASON="The merge hit conflicts, so it was aborted."
             DETAIL=$'Conflicting files:\n\n```\n'"$CONFLICTED"$'\n```'
           else
-            REASON="The merge was clean, but the merged tree failed its check."
-            DETAIL="That is either this fork's own code not surviving the merge, or the build/tests failing. The run log says which."
+            REASON="The merge was clean, but the merged tree failed its checks."
+            DETAIL="One of: this fork's own code did not survive the merge (tools/check-fork-additions.sh), the build failed, the unit/e2e tests failed, or this fork's guest regression tests failed (tools/run-guest-tests.sh -- binder/ashmem behaviour). The run log says which."
           fi
           BODY=$(printf '%s\n\n%s\n\n`working` was left untouched.\n\nUpstream commits involved:\n\n%s\n\nRun: %s\n' \
             "$REASON" "$DETAIL" "${COMMITS:-(none recorded)}" "$RUN_URL")
