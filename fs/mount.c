@@ -9,7 +9,7 @@
 // The table must have room for the entries below plus everything registered at
 // runtime (app/AppDelegate.m adds iosfs and iosfs_unsafe); fs_register fails
 // silently once it is full.
-#define MAX_FILESYSTEMS 12
+#define MAX_FILESYSTEMS 13
 static const struct fs_ops *filesystems[MAX_FILESYSTEMS] = {
     &realfs,
     &procfs,
@@ -21,6 +21,7 @@ static const struct fs_ops *filesystems[MAX_FILESYSTEMS] = {
     &cgroup2fs,
     &fakefs,
     &binderfs,
+    &selinuxfs,
 };
 
 static bool mount_trace_elogind(void) {

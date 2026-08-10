@@ -267,6 +267,10 @@ extern const struct fs_ops tmpfs;
 extern const struct fs_ops sysfs;
 extern const struct fs_ops cgroupfs;
 extern const struct fs_ops cgroup2fs;
+// Permissive SELinux stub (fs/selinuxfs.c). Enforces nothing; exists so
+// Android userspace, which refuses to start without a security server to
+// talk to, can find one.
+extern const struct fs_ops selinuxfs;
 void fs_register(const struct fs_ops *fs);
 char* get_filesystems(void); // For /proc/filesystems
 

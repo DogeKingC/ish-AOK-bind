@@ -281,6 +281,7 @@ if get_option('kernel') == 'ish'
 
         'fs/dyndev.c',
         'fs/binderfs.c',
+        'fs/selinuxfs.c',
 
         'fs/adhoc.c',
         'fs/sock.c',

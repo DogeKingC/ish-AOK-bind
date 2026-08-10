@@ -2435,6 +2435,7 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
                 protocol != NETLINK_SOCK_DIAG_ &&
                 protocol != NETLINK_KOBJECT_UEVENT_ &&
                 protocol != NETLINK_AUDIT_ &&
+                protocol != NETLINK_SELINUX_ &&
                 protocol != NETLINK_GENERIC_)
             return _EPROTONOSUPPORT;
         if (socket_type != SOCK_RAW_ && socket_type != SOCK_DGRAM_)

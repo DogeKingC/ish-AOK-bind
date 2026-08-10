@@ -71,6 +71,15 @@ need_in fs/dev.c          dma_heap_dev                 "dma-heap minor dispatch"
 need_in fs/devices.h      DEV_DMA_HEAP_SYSTEM_MINOR
 need_in meson.build       kernel/dma_heap.c
 
+# --- permissive SELinux stub ----------------------------------------------
+need_file fs/selinuxfs.c
+need_file tests/manual/selinuxfs.c
+need_in kernel/fs.h  selinuxfs        "selinuxfs declared alongside the other filesystems"
+need_in fs/mount.c   selinuxfs        "selinuxfs in the filesystems table"
+need_in fs/sock.h    NETLINK_SELINUX_
+need_in fs/sock.c    NETLINK_SELINUX_ "selinux_status_open's netlink fallback is accepted"
+need_in meson.build  fs/selinuxfs.c
+
 # --- shared ---------------------------------------------------------------
 need_file kernel/ioctl_abi.h
 
@@ -92,9 +101,11 @@ need_in app/Info.plist  UIFileSharingEnabled
 need_in fs/aok-tests.manifest             binder_ipc.c
 need_in fs/aok-tests.manifest             ashmem.c
 need_in fs/aok-tests.manifest             dma_heap.c
+need_in fs/aok-tests.manifest             selinuxfs.c
 need_in tests/manual/setup-regressions.sh binder_ipc
 need_in tests/manual/setup-regressions.sh ashmem
 need_in tests/manual/setup-regressions.sh dma_heap
+need_in tests/manual/setup-regressions.sh selinuxfs
 
 # --- CI -------------------------------------------------------------------
 # Upstream guards these on repository *name*, which this fork's name does not
