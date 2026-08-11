@@ -176,10 +176,14 @@ static int selinuxfs_entry_of(struct fd *fd) {
 // The classes and permissions Android's userspace object managers check,
 // with their real AOSP values so anything that reads them sees what a device
 // would. Anything NOT listed here still resolves -- see selinuxfs_class_index.
+#define SELINUXFS_PERMS_MAX 8
+
 struct selinuxfs_class {
     const char *name;
     unsigned index;
-    const char *perms[8]; // NULL-terminated; bit value is 1 << position
+    // NULL-terminated; bit value is 1 << position. Keep at least one slot free
+    // for the terminator -- see the bound check in selinuxfs_readdir.
+    const char *perms[SELINUXFS_PERMS_MAX];
 };
 
 static const struct selinuxfs_class selinuxfs_classes[] = {
@@ -228,7 +232,7 @@ static unsigned selinuxfs_class_index(const char *name) {
 static unsigned selinuxfs_perm_value(const char *class_name, const char *perm) {
     const struct selinuxfs_class *known = selinuxfs_known_class(class_name);
     if (known != NULL) {
-        for (int i = 0; known->perms[i] != NULL; i++)
+        for (int i = 0; i < SELINUXFS_PERMS_MAX && known->perms[i] != NULL; i++)
             if (strcmp(known->perms[i], perm) == 0)
                 return 1u << i;
     }
@@ -513,17 +517,21 @@ static int selinuxfs_poll(struct fd *UNUSED(fd)) {
 static int selinuxfs_readdir(struct fd *fd, struct dir_entry *entry) {
     struct selinuxfs_open *open_state = fd->data;
     int which = selinuxfs_entry_of(fd);
-    long index = (long) fd->offset;
+    // Unsigned throughout. fd->offset is unsigned and only ever advanced by
+    // this function (selinuxfs_fdops has no lseek, so a guest cannot move it),
+    // but narrowing it to a signed type would turn any large value into a
+    // negative index and a read before the start of a table.
+    unsigned long index = fd->offset;
 
     switch (which) {
         case SELINUXFS_ROOT: {
             index += 1; // entry 0 is the root itself
-            if (index >= SELINUXFS_COUNT)
+            if (index >= (unsigned long) SELINUXFS_COUNT)
                 return 0;
-            fd->offset = (unsigned long) index;
+            fd->offset = index;
             strcpy(entry->name, selinuxfs_names[index]);
             entry->inode = (unsigned) index + 1;
-            entry->type = index == SELINUXFS_CLASS ? DT_DIR : DT_REG;
+            entry->type = index == (unsigned long) SELINUXFS_CLASS ? DT_DIR : DT_REG;
             return 1;
         }
 
@@ -531,9 +539,9 @@ static int selinuxfs_readdir(struct fd *fd, struct dir_entry *entry) {
             // Only the classes we have a table entry for are listed. Any name
             // still resolves on lookup, but a directory listing has to be
             // finite, and these are the ones worth showing.
-            if (index >= (long) SELINUXFS_CLASSES_LEN)
+            if (index >= SELINUXFS_CLASSES_LEN)
                 return 0;
-            fd->offset = (unsigned long) index + 1;
+            fd->offset = index + 1;
             strcpy(entry->name, selinuxfs_classes[index].name);
             entry->inode = selinuxfs_classes[index].index + 1000;
             entry->type = DT_DIR;
@@ -542,9 +550,9 @@ static int selinuxfs_readdir(struct fd *fd, struct dir_entry *entry) {
 
         case SELINUXFS_CLASS_SUBDIR: {
             static const char *const children[] = {"index", "perms"};
-            if (index >= 2)
+            if (index >= sizeof(children) / sizeof(children[0]))
                 return 0;
-            fd->offset = (unsigned long) index + 1;
+            fd->offset = index + 1;
             strcpy(entry->name, children[index]);
             entry->inode = 2000 + (unsigned) index;
             entry->type = index == 0 ? DT_REG : DT_DIR;
@@ -559,9 +567,15 @@ static int selinuxfs_readdir(struct fd *fd, struct dir_entry *entry) {
             // An unknown class has no enumerable permissions -- every name
             // resolves, so there is no list to give. Empty is the honest
             // answer, and nothing scans this directory.
-            if (known == NULL || known->perms[index] == NULL)
+            //
+            // The array bound is checked as well as the NULL terminator: a
+            // class listing the full SELINUXFS_PERMS_MAX permissions would
+            // have no room left for the terminator, and the walk would run off
+            // the end of the table.
+            if (known == NULL || index >= SELINUXFS_PERMS_MAX ||
+                    known->perms[index] == NULL)
                 return 0;
-            fd->offset = (unsigned long) index + 1;
+            fd->offset = index + 1;
             strcpy(entry->name, known->perms[index]);
             entry->inode = 3000 + (unsigned) index;
             entry->type = DT_REG;

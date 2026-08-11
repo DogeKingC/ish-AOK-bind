@@ -300,23 +300,21 @@ static const char *pick_device(void) {
 }
 
 int main(int argc, char **argv) {
+    // test_init exits on an option it does not recognise, so ours are consumed
+    // here and only the rest is passed through. Compacting in place is safe:
+    // kept entries only ever move toward the front.
     int external = 0;
     const char *dev = NULL;
+    int kept = 1;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--external") == 0) {
+        if (strcmp(argv[i], "--external") == 0)
             external = 1;
-            argv[i] = argv[0]; // hide it from test_init
-        } else if (argv[i][0] == '/') {
+        else if (argv[i][0] == '/')
             dev = argv[i];
-            argv[i] = argv[0];
-        }
+        else
+            argv[kept++] = argv[i];
     }
-    // test_init rejects options it does not know; ours are removed above.
-    int filtered = 1;
-    for (int i = 1; i < argc; i++)
-        if (strcmp(argv[i], argv[0]) != 0)
-            argv[filtered++] = argv[i];
-    test_init(filtered, argv);
+    test_init(kept, argv);
     alarm(test_watchdog_secs(30));
 
     if (dev == NULL)
