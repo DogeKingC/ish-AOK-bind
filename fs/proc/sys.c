@@ -318,17 +318,31 @@ static int sys_show_kernel_random_uuid(struct proc_entry *UNUSED(entry), struct 
 // A single UUID generated once per iSH launch and reused for every read,
 // matching real Linux's "constant for this boot, changes across reboots"
 // contract (systemd and friends use it to detect a reboot happened).
+//
+// Generated under a lock because "constant" is the entire contract. Two guest
+// threads reaching the first-ever read together would otherwise both see the
+// flag clear, both generate, and hand out two different boot ids -- and a
+// caller that reads this once and caches it, as libbinder does, would carry the
+// loser's value for the rest of the run with nothing to reveal the
+// disagreement.
+static lock_t boot_id_lock = LOCK_INITIALIZER;
 static bool boot_id_generated = false;
 static unsigned char boot_id[16];
 
 static int sys_show_kernel_random_boot_id(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    unsigned char id[16];
+    lock(&boot_id_lock, 0);
     if (!boot_id_generated) {
         get_random((char *) boot_id, sizeof(boot_id));
         boot_id[6] = (boot_id[6] & 0x0f) | 0x40;
         boot_id[8] = (boot_id[8] & 0x3f) | 0x80;
         boot_id_generated = true;
     }
-    format_random_uuid(buf, boot_id);
+    memcpy(id, boot_id, sizeof(id));
+    unlock(&boot_id_lock);
+    // Formatted outside the lock: proc_printf grows the caller's buffer, and
+    // this lock has no business being held across an allocation.
+    format_random_uuid(buf, id);
     return 0;
 }
 

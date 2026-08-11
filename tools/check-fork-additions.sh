@@ -101,6 +101,13 @@ need_in kernel/log.c ish_log_write_record "guest /dev/kmsg records reach the log
 need_in kernel/log.h ish_log_write_record
 need_in fs/mem.c     ish_log_write_record "kmsg_write is not EPERM any more"
 
+# --- boot_id generated once ------------------------------------------------
+# Upstream generates it lazily with no lock. libbinder refuses to start on a
+# bad boot_id and caches the one it read, so the "one value" contract is the
+# whole point of the file.
+need_file tests/manual/proc_random.c
+need_in fs/proc/sys.c boot_id_lock "boot_id is generated under a lock"
+
 # --- shared ---------------------------------------------------------------
 need_file kernel/ioctl_abi.h
 
