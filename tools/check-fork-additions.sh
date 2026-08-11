@@ -41,6 +41,7 @@ need_file kernel/binder.c
 need_file kernel/binder.h
 need_file fs/binderfs.c
 need_file tests/manual/binder_ipc.c
+need_file tests/manual/binder_ping.c
 need_file docs/binder.md
 need_in app/AppDelegate.m binder_create_device_nodes "creates /dev/binder at boot"
 need_in xX_main_Xx.h      binder_create_device_nodes "creates /dev/binder at boot (CLI)"
