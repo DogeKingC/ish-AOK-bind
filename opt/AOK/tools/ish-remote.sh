@@ -2,7 +2,8 @@
 # ish-remote: run commands sent from elsewhere, so a debugging session does not
 # cost a round trip per command.
 #
-#     sh /AOK/tools/ish-remote.sh FLcKa          # listen, using the code FLcKa
+#     sh /AOK/tools/ish-remote.sh FLcKa               # listen, using the code FLcKa
+#     sh /AOK/tools/ish-remote.sh --keepalive FLcKa   # ...and survive backgrounding
 #     sh /AOK/tools/ish-remote.sh --send FLcKa 'uname -a'   # post one command
 #
 # The problem it solves: debugging iSH from a distance means someone tells you
@@ -17,6 +18,15 @@
 # topic; anything stamped with the matching code, it runs; the output goes to
 # the reply topic, split across several messages when it is large. ntfy.sh is a
 # public relay and needs no account.
+#
+# --keepalive addresses the thing that otherwise makes this useless on a phone:
+# iOS suspends the app the moment it stops being frontmost, so the listener only
+# polls while you are staring at it -- which is exactly when you are not reading
+# the results. iSH declares the "audio" background mode (app/Info.plist) and
+# exposes an OSS device at /dev/dsp, so playing silence keeps the app scheduled
+# with the screen off. That is a real cost: it holds an audio session and drains
+# battery, and iOS can still reclaim the app. Use it for a debugging session and
+# stop it afterwards; it is off by default for those reasons.
 #
 # It drains every pending command, oldest first, rather than only the newest.
 # That matters on iOS, where the app is suspended whenever it is not in the
@@ -39,19 +49,69 @@
 #   ISH_REMOTE_BASE      relay base URL           (default https://ntfy.sh)
 #   ISH_REMOTE_INTERVAL  seconds between polls     (default 4)
 #   ISH_REMOTE_MAX       stop after N polls        (default 900, ~1h at 4s)
+#   ISH_REMOTE_DSP       audio device for --keepalive (default /dev/dsp)
 #   ISH_REMOTE_INLINE    bytes per reply message, split above it (default 3000)
 
 set -u
 
 base="${ISH_REMOTE_BASE:-https://ntfy.sh}"
+dsp="${ISH_REMOTE_DSP:-/dev/dsp}"
 interval="${ISH_REMOTE_INTERVAL:-4}"
 max="${ISH_REMOTE_MAX:-900}"
 inline_max="${ISH_REMOTE_INLINE:-3000}"
 
 die() { echo "ish-remote: $*" >&2; exit 1; }
 
-command -v curl >/dev/null 2>&1 || die "needs curl (apk add curl)"
-command -v base64 >/dev/null 2>&1 || die "needs base64 (busybox provides it)"
+# Network calls retry, and -- the part that matters -- check the HTTP status.
+# curl -sS exits 0 on an HTTP error, so a rejected message looks exactly like a
+# delivered one. That is not hypothetical: ntfy.sh answered 429 "daily message
+# quota reached" and the listener cheerfully reported every reply as sent while
+# none arrived. Anything that reports success without checking the status is
+# lying by omission.
+#
+# Everything is sent from a FILE rather than a pipe, because a retry has to be
+# able to send the same bytes again and stdin is gone after the first attempt.
+net_fails=0
+net_error=""
+_netbody="${TMPDIR:-/tmp}/ish-remote.netbody.$$"
+
+# net_req <url> [extra curl args...] -- body on stdout, status checked.
+net_req() {
+    _url="$1"; shift
+    _try=0
+    while [ "$_try" -lt 3 ]; do
+        _try=$((_try + 1))
+        _code=$(curl -sS --max-time 25 -o "$_netbody" -w '%{http_code}' "$@" "$_url" 2>/dev/null)
+        case "$_code" in
+            2*) cat "$_netbody" 2>/dev/null; rm -f "$_netbody"; net_fails=0; net_error=""; return 0 ;;
+            429) net_error="relay refused: quota or rate limit (429). Wait, or set ISH_REMOTE_BASE to another relay." ;;
+            "" ) net_error="no response from $_url (offline?)" ;;
+            *  ) net_error="HTTP $_code from $_url" ;;
+        esac
+        sleep 2
+    done
+    rm -f "$_netbody"
+    net_fails=$((net_fails + 1))
+    return 1
+}
+
+net_get()  { net_req "$1"; }
+net_post_file() { net_req "$2" --data-binary @"$1"; }
+net_post_str()  {
+    _tmp="${TMPDIR:-/tmp}/ish-remote.send.$$"
+    printf '%s' "$1" > "$_tmp" || return 1
+    net_post_file "$_tmp" "$2"; _rc=$?
+    rm -f "$_tmp"
+    return $_rc
+}
+
+# Sending output is best-effort but never silent: the far end sees only an
+# absence, so a failure has to be visible HERE.
+say() {
+    if ! net_post_str "$1" "$base/$ot" >/dev/null; then
+        echo "!! reply not delivered: $net_error" >&2
+    fi
+}
 
 # Both sides derive the same two topics from the one shared code.
 cmd_topic() { echo "ishr-$1"; }
@@ -68,13 +128,21 @@ if [ "${1:-}" = "--send" ]; then
     [ "$#" -gt 0 ] || die "nothing to send"
     b64=$(printf '%s' "$*" | base64 | tr -d '\n')
     id=$(date +%s 2>/dev/null || echo 0)
-    printf 'ISH-REMOTE %s %s %s' "$code" "$id" "$b64" \
-        | curl -sS --data-binary @- "$base/$(cmd_topic "$code")" >/dev/null \
-        && echo "sent (id $id)" || die "send failed"
+    if net_post_str "ISH-REMOTE $code $id $b64" "$base/$(cmd_topic "$code")" >/dev/null; then
+        echo "sent (id $id)"
+    else
+        die "send failed: $net_error"
+    fi
     exit 0
 fi
 
 # ---- listener -------------------------------------------------------------
+keepalive=0
+if [ "${1:-}" = "--keepalive" ]; then
+    keepalive=1
+    shift
+fi
+
 code="${1:-${ISH_REMOTE_CODE:-}}"
 [ -n "$code" ] || die "no code. Usage: ish-remote.sh <code>   (a shared secret; without it this does nothing)"
 
@@ -95,10 +163,38 @@ echo "   WARNING: every command sent with this code runs here, as you."
 echo "   Ctrl-C to stop. Do not leave it running."
 echo "================================================================"
 
+ka_pid=""
+cleanup() {
+    [ -n "$ka_pid" ] && kill "$ka_pid" 2>/dev/null
+    rm -f "$stopflag" 2>/dev/null
+    exit 0
+}
+# Ctrl-C and ordinary termination both have to stop the silence, or the app is
+# left holding an audio session with nothing listening.
+trap cleanup INT TERM HUP EXIT
+
+if [ "$keepalive" -eq 1 ]; then
+    if [ -c "$dsp" ]; then
+        # Silence at the device's default format (48 kHz, S16LE): zeros are
+        # silence in any PCM encoding, so the format never has to be agreed.
+        # dd from /dev/zero rather than a loop of writes, so this costs
+        # essentially no CPU while it holds the audio session open.
+        ( while : ; do dd if=/dev/zero of="$dsp" bs=8192 count=64 2>/dev/null || sleep 1; done ) &
+        ka_pid=$!
+        echo "   keepalive: playing silence to $dsp (pid $ka_pid) so iOS does not suspend us"
+        echo "   this drains battery -- stop the listener when you are done"
+    else
+        echo "   keepalive: $dsp is not a character device; backgrounding will still suspend us" >&2
+        keepalive=0
+    fi
+fi
+
 # Announce readiness on the reply topic, so the far end knows the listener is
 # actually up before it starts sending into the void.
-curl -sS -d "ish-remote up on $(uname -m 2>/dev/null): waiting for commands" \
-    "$base/$ot" >/dev/null 2>&1 || true
+if ! net_post_str "ish-remote up on $(uname -m 2>/dev/null): waiting for commands" \
+        "$base/$ot" >/dev/null; then
+    die "cannot use the relay: $net_error"
+fi
 
 i=0
 while [ "$i" -lt "$max" ]; do
@@ -110,10 +206,20 @@ while [ "$i" -lt "$max" ]; do
     # meantime queues several commands and they all arrive at once on resume.
     # Taking only the latest silently dropped the rest, which looks from the
     # far end like commands vanishing.
-    batch=$(curl -sS "$base/$ct/json?poll=1&since=all" 2>/dev/null)
+    if ! batch=$(net_get "$base/$ct/json?poll=1&since=all"); then
+        # Three failed tries in a row. Say it once per stretch rather than
+        # every poll, and keep going: connectivity usually comes back.
+        [ "$net_fails" -eq 1 ] && echo "!! poll failed: $net_error" >&2
+        continue
+    fi
     [ -n "$batch" ] || continue
 
-    printf '%s\n' "$batch" | while IFS= read -r msg; do
+    # Via a file, not a pipe: a command run below inherits this loop's stdin,
+    # and anything that reads stdin would swallow the rest of the queue --
+    # which looked exactly like commands being dropped.
+    batchfile="${TMPDIR:-/tmp}/ish-remote.$code.batch"
+    printf '%s\n' "$batch" > "$batchfile" 2>/dev/null || continue
+    while IFS= read -r msg; do
         [ -n "$msg" ] || continue
 
     # The payload is "ISH-REMOTE <code> <id> <base64>", all JSON-safe
@@ -136,7 +242,7 @@ while [ "$i" -lt "$max" ]; do
     echo
     echo "--- [$id] running: $cmd"
     if [ "$cmd" = "stop" ] || [ "$cmd" = "ish-remote-stop" ]; then
-        curl -sS -d "listener stopping" "$base/$ot" >/dev/null 2>&1 || true
+        say "listener stopping"
         echo "--- stop received"
         : > "$stopflag"
         break
@@ -144,22 +250,35 @@ while [ "$i" -lt "$max" ]; do
 
     out="${TMPDIR:-/tmp}/ish-remote.$code.out"
     # Combined stdout+stderr, and the exit status, because both matter when
-    # something you cannot see went wrong.
-    sh -c "$cmd" > "$out" 2>&1
+    # something you cannot see went wrong. A command that cannot even be
+    # written out (full disk, unwritable TMPDIR) still has to be reported.
+    if ! : > "$out" 2>/dev/null; then
+        say "[$id] cannot write $out -- no space, or TMPDIR unwritable"
+        continue
+    fi
+    # stdin from /dev/null: a command that reads stdin must not consume the
+    # queue, and an interactive one must fail rather than hang the listener.
+    sh -c "$cmd" > "$out" 2>&1 < /dev/null
     rc=$?
     echo "rc=$rc" >> "$out"
     cat "$out"
 
     size=$(wc -c < "$out" 2>/dev/null || echo 0)
-    if [ "$size" -le "$inline_max" ]; then
-        curl -sS --data-binary @"$out" "$base/$ot" >/dev/null 2>&1 || true
+    # A command that printed nothing at all still needs an answer, or the far
+    # end cannot tell "it ran and said nothing" from "it never ran".
+    if [ "$size" -eq 0 ]; then
+        say "[$id] rc=$rc, no output"
+    elif [ "$size" -le "$inline_max" ]; then
+        if ! net_post_file "$out" "$base/$ot" >/dev/null; then
+            echo "!! $size bytes of output not delivered: $net_error" >&2
+        fi
     else
         # Chunk it over the relay rather than depending on a paste host: the
         # device that most needs this (a phone) is the one most likely to
         # reach the relay and nothing else -- observed exactly that, ntfy
         # fine and the paste upload refused.
         parts=$(( size / inline_max + 1 ))
-        curl -sS -d "[$id] rc=$rc, $size bytes in $parts parts" "$base/$ot" >/dev/null 2>&1 || true
+        say "[$id] rc=$rc, $size bytes in $parts parts"
         split_dir="${TMPDIR:-/tmp}/ish-remote.$code.parts"
         rm -rf "$split_dir"; mkdir -p "$split_dir"
         # split -C keeps lines whole, which matters: the far end reads these.
@@ -169,12 +288,16 @@ while [ "$i" -lt "$max" ]; do
         for part in "$split_dir"/p*; do
             [ -f "$part" ] || continue
             part_i=$((part_i + 1))
-            { echo "[$id part $part_i/$parts]"; cat "$part"; } \
-                | curl -sS --data-binary @- "$base/$ot" >/dev/null 2>&1 || true
+            _labeled="$part.msg"
+            { echo "[$id part $part_i/$parts]"; cat "$part"; } > "$_labeled"
+            if ! net_post_file "$_labeled" "$base/$ot" >/dev/null; then
+                echo "!! part $part_i/$parts not delivered: $net_error" >&2
+            fi
         done
         rm -rf "$split_dir"
     fi
-    done   # end of the per-message batch loop
+    done < "$batchfile"
+    rm -f "$batchfile" 2>/dev/null
 
     [ -f "$stopflag" ] && break
 done
