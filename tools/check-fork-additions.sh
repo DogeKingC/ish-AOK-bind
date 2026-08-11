@@ -142,6 +142,8 @@ need_file opt/AOK/tools/android/chroot-setup.sh
 need_file opt/AOK/tools/android/root-profile.sh
 need_in fs/aok-tools.manifest android/chroot-setup.sh "shipped to /AOK/tools on the device"
 need_file docs/android-bringup.md
+need_file opt/AOK/tools/ish-report.sh
+need_in fs/aok-tools.manifest ish-report.sh "the one-command diagnostic report"
 
 # --- shared ---------------------------------------------------------------
 need_file kernel/ioctl_abi.h
