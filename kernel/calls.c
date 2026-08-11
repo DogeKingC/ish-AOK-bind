@@ -4663,7 +4663,10 @@ static void record_guest_fault_event(const char *kind, const struct cpu_state *c
              "pid=%d comm=%s abi=%s ip=%#llx fault_addr=%#llx access=%s",
              current != NULL ? current->pid : -1,
              current != NULL ? current->comm : "?",
-             (current != NULL && current->abi == GUEST_ABI_AMD64) ? "amd64" : "i386",
+             // Every non-amd64 guest used to be recorded as "i386", so an
+             // arm64 crash arrived labelled as the one ABI it could not be
+             // -- and this record is what you read when the guest is gone.
+             current != NULL ? guest_abi_desc(current->abi).name : "?",
              (unsigned long long) ip,
              (unsigned long long) fault_addr,
              is_write ? "write" : "read");
