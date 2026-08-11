@@ -46,6 +46,7 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 #include "test_common.h"
 
@@ -192,37 +193,86 @@ static void test_instructions(void) {
           "asm stp q0,q0 through a tagged pointer");
 }
 
+// Every operation here can kill the process, and a dead process reports one
+// data point per run. Each probe therefore runs in a forked child: a crash
+// costs that probe and nothing else, so a single run maps the whole failure
+// surface instead of naming its first point.
+static int probe(const char *desc, void (*fn)(void)) {
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid < 0) {
+        printf("FAIL %s: cannot fork (errno=%d %s)\n", desc, errno, strerror(errno));
+        failures_total++;
+        return -1;
+    }
+    if (pid == 0) {
+        unsigned before = failures_total;
+        fn();
+        _exit(failures_total != before ? 1 : 0);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        printf("FAIL %s: waitpid failed\n", desc);
+        failures_total++;
+        return -1;
+    }
+    if (WIFSIGNALED(status)) {
+        printf("FAIL %s: killed by signal %d\n", desc, WTERMSIG(status));
+        failures_total++;
+        return -1;
+    }
+    if (WEXITSTATUS(status) != 0) {
+        // The child printed the specific failure before exiting.
+        failures_total++;
+        return -1;
+    }
+    test_logf("ok %s\n", desc);
+    return 0;
+}
+
+// fork() carries no arguments, so the parameter for the current probe goes
+// here. Set it, then probe().
+static size_t probe_size;
+
+static void probe_memset(void) {
+    size_t n = probe_size;
+    memset(page, 0, page_size);
+    step("memset(tagged %p, 0x5a, %zu)", tag_ptr(page), n);
+    memset(tag_ptr(page), 0x5a, n);
+    int ok = 1;
+    for (size_t j = 0; j < n; j++)
+        if ((unsigned char) page[j] != 0x5a)
+            ok = 0;
+    if (n < page_size && (unsigned char) page[n] != 0)
+        ok = 0;
+    checkf(ok, "memset(tagged, 0x5a, %zu) wrote the right bytes", n);
+}
+
+static void probe_memcpy(void) {
+    char *src = page;
+    char *dst = page + page_size / 2;
+    for (size_t i = 0; i < page_size / 2; i++)
+        src[i] = (char) (i * 7 + 1);
+    step("memcpy(tagged, tagged, %zu)", page_size / 2);
+    memcpy(tag_ptr(dst), tag_ptr(src), page_size / 2);
+    check(memcmp(dst, src, page_size / 2) == 0, "memcpy between two tagged pointers");
+}
+
 // The failing case on the device. Sizes chosen to walk every branch of a
 // SIMD memset: under 16 bytes, exactly the pair-store width, and past the
 // point where it loops.
 static void test_bulk(void) {
     static const size_t sizes[] = {1, 8, 15, 16, 17, 32, 64, 128, 1024, 4000};
+    char desc[64];
 
     for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
-        size_t n = sizes[i];
-        memset(page, 0, page_size);
-
-        step("memset(tagged %p, 0x5a, %zu)", tag_ptr(page), n);
-        memset(tag_ptr(page), 0x5a, n);
-        int ok = 1;
-        for (size_t j = 0; j < n; j++)
-            if ((unsigned char) page[j] != 0x5a)
-                ok = 0;
-        // Nothing past the length may have been touched.
-        if (n < page_size && (unsigned char) page[n] != 0)
-            ok = 0;
-        checkf(ok, "memset(tagged, 0x5a, %zu)", n);
+        probe_size = sizes[i];
+        snprintf(desc, sizeof(desc), "memset(tagged, %zu)", sizes[i]);
+        probe(desc, probe_memset);
     }
-
-    char *src = page;
-    char *dst = page + page_size / 2;
-    for (size_t i = 0; i < page_size / 2; i++)
-        src[i] = (char) (i * 7 + 1);
-
-    step("memcpy(tagged, tagged, %zu)", page_size / 2);
-    memcpy(tag_ptr(dst), tag_ptr(src), page_size / 2);
-    check(memcmp(dst, src, page_size / 2) == 0, "memcpy between two tagged pointers");
+    probe("memcpy(tagged, tagged)", probe_memcpy);
 }
+
 
 // A tagged access that straddles a page boundary leaves the TLB fast path for
 // the gadget's crosspage helper -- a different route to the same memory, and
@@ -335,7 +385,7 @@ int main(int argc, char **argv) {
     long sz = sysconf(_SC_PAGESIZE);
     page_size = sz > 0 ? (size_t) sz : 4096;
     page = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (page == MAP_FAILED) {
         printf("FAIL cannot map a page (errno=%d %s)\n", errno, strerror(errno));
         failures_total++;
@@ -344,17 +394,17 @@ int main(int argc, char **argv) {
     memset(page, 0, page_size);
 
     step("== scalar ==");
-    test_scalar();
+    probe("scalar", test_scalar);
     step("== instructions ==");
-    test_instructions();
+    probe("instructions", test_instructions);
     step("== bulk ==");
     test_bulk();
     step("== crosspage ==");
-    test_crosspage();
+    probe("crosspage", test_crosspage);
     step("== atomics ==");
-    test_atomics();
+    probe("atomics", test_atomics);
     step("== syscalls ==");
-    test_syscalls();
+    probe("syscalls", test_syscalls);
 
     munmap(page, page_size);
     return finish_suite("tagged_pointer");
