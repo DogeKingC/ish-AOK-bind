@@ -264,6 +264,7 @@ if get_option('kernel') == 'ish'
         'kernel/binder.c',
         'kernel/ashmem.c',
         'kernel/dma_heap.c',
+        'kernel/property_area.c',
         'kernel/ptrace.c',
 
         'kernel/fs.c',

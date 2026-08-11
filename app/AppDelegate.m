@@ -49,6 +49,7 @@
 #include "kernel/binder.h"
 #include "kernel/ashmem.h"
 #include "kernel/dma_heap.h"
+#include "kernel/property_area.h"
 #include "tools/fakefs.h"
 #include "fs/path.h"
 #include "fs/real.h"
@@ -2432,6 +2433,12 @@ static TerminalViewController *CreateTerminalViewController(void) {
     binder_create_device_nodes();
     ashmem_create_device_node();
     dma_heap_create_device_nodes();
+
+    // Android's property area. Rebuilt every boot from the tree's own
+    // build.prop files, because on a device /dev is a tmpfs and the area
+    // never outlives the session that wrote it. Without it every libbinder
+    // client spins on servicemanager.ready and never opens the driver above.
+    property_area_create();
 
     generic_mkdirat(AT_PWD, "/dev/pts", 0755);
 

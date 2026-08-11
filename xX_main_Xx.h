@@ -8,6 +8,7 @@
 #include "kernel/binder.h"
 #include "kernel/ashmem.h"
 #include "kernel/dma_heap.h"
+#include "kernel/property_area.h"
 #include "fs/real.h"
 #include "fs/sock.h"
 #ifdef __APPLE__
@@ -91,6 +92,9 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
     binder_create_device_nodes();
     ashmem_create_device_node();
     dma_heap_create_device_nodes();
+    // /dev/__properties__, without which every libbinder client spins on
+    // servicemanager.ready instead of opening the driver above.
+    property_area_create();
     char cwd[MAX_PATH + 1];
     if (root == NULL && workdir == NULL) {
         getcwd(cwd, sizeof(cwd));

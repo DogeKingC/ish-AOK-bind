@@ -20,7 +20,7 @@ BUILD_DIR="${1:-build}"
 shift || true
 TESTS=("$@")
 if [ ${#TESTS[@]} -eq 0 ]; then
-    TESTS=(binder_ipc binder_ping ashmem dma_heap selinuxfs kmsg proc_random)
+    TESTS=(binder_ipc binder_ping ashmem dma_heap selinuxfs kmsg proc_random property_area)
 fi
 
 ISH="$BUILD_DIR/ish"
@@ -45,6 +45,42 @@ cleanup() { rm -rf "$GUEST_ROOT"; }
 trap cleanup EXIT
 
 tar -xf "$ROOTFS_TAR" -C "$GUEST_ROOT"
+
+# Android property files, for property_area. The kernel reads these at boot
+# (kernel/property_area.c) and there is no way to make it re-read them from
+# inside the guest, so they have to be in the root before ish starts. They are
+# inert on an Alpine root, so they are planted once for every test rather than
+# conditionally for one.
+#
+# The content is the interesting half of init's parsing rules: comments,
+# whitespace either side of the '=', a later line and a later file overriding
+# an earlier one, an import, a value past PROP_VALUE_MAX with and without a
+# ro. name, and the two key prefixes init refuses to take from a file.
+mkdir -p "$GUEST_ROOT/system/etc" "$GUEST_ROOT/vendor"
+long_value=$(printf 'x%.0s' $(seq 100))
+cat > "$GUEST_ROOT/system/build.prop" <<EOF
+# iSH property-area test fixture; see tests/manual/property_area.c
+ish.test.fixture=1
+ro.ish.test.plain=plain
+ro.ish.test.empty=
+ro.ish.test.dup=first
+ro.ish.test.dup=second
+ro.ish.test.override=system
+ro.ish.test.deep.a.b.c=nested
+ro.ish.test.hash=value # not a comment
+#ro.ish.test.commented=nope
+ro.ish.test.long=$long_value
+ish.test.longnonro=$long_value
+ctl.start=bogus
+sys.powerctl=reboot
+import /system/etc/ish-test-import.prop
+EOF
+# printf, not the heredoc: the trailing spaces are the point of this line and
+# an editor or a hook that trims them would quietly delete the test.
+printf '  ro.ish.test.spaced   =   value with spaces   \n' >> "$GUEST_ROOT/system/build.prop"
+echo 'ro.ish.test.imported=yes' > "$GUEST_ROOT/system/etc/ish-test-import.prop"
+# /vendor/build.prop is read after /system/build.prop, so it wins.
+echo 'ro.ish.test.override=vendor' > "$GUEST_ROOT/vendor/build.prop"
 
 fail=0
 for test_name in "${TESTS[@]}"; do

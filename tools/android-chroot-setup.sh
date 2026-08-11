@@ -15,6 +15,9 @@
 #                      so nothing SELinux-related works either.
 #   no /dev/binder     libbinder aborts with "Binder driver '/dev/binder'
 #                      failed. Terminating." A chroot cannot see the outer /dev.
+#   no property area   every libbinder client spins on servicemanager.ready
+#                      without ever opening the binder driver, so it looks
+#                      like a binder hang and is not one.
 #   no /dev/null       a great deal of Android code opens it unconditionally
 #                      and dies quietly when it cannot.
 #   no selinuxfs       servicemanager's first act is a fatal CHECK on
@@ -82,6 +85,27 @@ mknod_if_missing dev/dma_heap/system 10 56
 mknod_if_missing dev/binder        249 0
 mknod_if_missing dev/hwbinder      249 1
 mknod_if_missing dev/vndbinder     249 2
+
+# --- the property area -----------------------------------------------------
+# iSH builds /dev/__properties__ at boot, but into the OUTER root's /dev,
+# which a chroot cannot see -- and it reads the outer root's build.prop files,
+# which are not this tree's. Writing the tree's path to /proc/ish/property_area
+# rebuilds it from THIS tree: its build.prop files in, its dev/__properties__
+# out. See kernel/property_area.c.
+#
+# Unlike the device nodes this does not persist usefully: it is a snapshot of
+# the tree's property files, so re-running it after editing one is the point.
+if [ -w /proc/ish/property_area ]; then
+    if echo "$ROOT" > /proc/ish/property_area; then
+        note "built dev/__properties__ ($(cat /proc/ish/property_area | tr '\n' ' '))"
+    else
+        echo "  FAILED to build dev/__properties__"
+        fail=1
+    fi
+else
+    echo "  FAILED: no /proc/ish/property_area (is /proc mounted, and is this iSH-AOK?)"
+    fail=1
+fi
 
 # --- mounts ----------------------------------------------------------------
 # Lost on every restart. Mounting something twice on the same point would
@@ -155,6 +179,15 @@ fi
 for node in dev/binder dev/null dev/kmsg; do
     [ -c "$node" ] || { echo "  FAILED: $node is not a character device"; fail=1; }
 done
+
+# A directory here would send bionic looking for per-SELinux-context files
+# that nothing writes; it has to be the single pre-split file.
+if [ -f dev/__properties__ ]; then
+    note "property area: $(wc -c < dev/__properties__) bytes"
+else
+    echo "  FAILED: dev/__properties__ is not a regular file"
+    fail=1
+fi
 
 if [ "$fail" -eq 0 ]; then
     echo "ready: chroot . /system/bin/servicemanager"

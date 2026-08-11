@@ -5,6 +5,7 @@
 #include "kernel/errno.h"
 #include "kernel/fs.h"
 #include "kernel/binder.h"
+#include "kernel/property_area.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -448,6 +449,7 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"documents", .show = proc_ish_show_documents},
     {"host_info", .show = proc_ish_show_host_info},  // Add host hardware related information
     {"ips", .show = proc_ish_show_ips},
+    {"property_area", S_IFREG | 0644, .show = property_area_show, .update = property_area_update},
     {"version", .show = proc_ish_show_version},
 });
 

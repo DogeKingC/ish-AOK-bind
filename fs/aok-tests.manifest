@@ -93,6 +93,7 @@ selinuxfs.c
 kmsg.c
 proc_random.c
 binder_ping.c
+property_area.c
 mount_stdev.c
 mmap_truncate_sigbus.c
 null_page_fault.c

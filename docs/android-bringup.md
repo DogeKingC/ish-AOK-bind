@@ -27,32 +27,74 @@ Android userspace, not just under our own tests:
 | `getcon` / process contexts | `fs/proc/pid.c` | `/proc/self/attr/current` reads `u:r:init:s0` |
 | ashmem, DMA-BUF heaps | `kernel/ashmem.c`, `kernel/dma_heap.c` | guest tests; not yet exercised by Android |
 | guest-writable `/dev/kmsg` | `fs/mem.c`, `kernel/log.c` | Android's fatal messages appear in `dmesg` |
+| system properties | `kernel/property_area.c` | bionic's own reader parses the area; not yet driven by a live client |
 
-## The current blocker: no property service
+## The property area
 
-`service list` and every other ordinary client hangs **before touching binder**.
-Modern libbinder waits on a property first:
+`service list` and every other ordinary client used to hang **before touching
+binder**. Modern libbinder waits on a property first:
 
 ```cpp
 while (!WaitForProperty("servicemanager.ready", "true", 1s)) { ... }
 ```
 
-servicemanager cannot set it -- there is no property service -- and logs
-`Failed to set servicemanager ready property`. With `/dev/__properties__`
-absent, `__system_property_find` returns null, the wait cannot block on a
-serial, and the retry loop becomes a busy spin: the process burns CPU with only
-fds 0/1/2 open and never calls `ProcessState::self()`.
+servicemanager cannot set it -- setting a property means talking to a property
+service, and there is none -- so it logs `Failed to set servicemanager ready
+property`. With `/dev/__properties__` absent, `__system_property_find` returned
+null, the wait had no serial to block on, and the retry loop became a busy
+spin: the process burned CPU with only fds 0/1/2 open and never called
+`ProcessState::self()`.
 
-This is why `binder_ping` exists. `PING_TRANSACTION` depends on no property, no
-logd and no init, so it is the one call that can be aimed at a live
-servicemanager while the rest of the platform is missing.
+`kernel/property_area.c` now writes that file at boot, next to the binder and
+ashmem device nodes. It contains `servicemanager.ready=true` plus everything in
+the tree's own `build.prop` files, read in init's order with the later file
+winning (`PropertyLoadBootDefaults` in `system/core/init/property_service.cpp`),
+including `import` lines and the keys init refuses to take from a file.
 
-The fix is the Android property area: `/dev/__properties__`, a documented
-shared-memory format (`prop_area` header plus a trie, plus a serialized
-property-info file) that init normally populates. Nothing in it needs a kernel
-change or an Android binary -- a generator running under iSH can write the files
-and seed `servicemanager.ready=true`. It unblocks far more than one call, since
-essentially all of Android userspace reads properties at startup.
+Two things worth knowing about it:
+
+- **The layout is the pre-split one.** bionic picks its layout from what is at
+  `/dev/__properties__`: a directory with a `property_info` in it means one
+  `prop_area` per SELinux context plus a serialized context trie, a directory
+  without one means the `/plat_property_contexts` split, and a *regular file*
+  means the whole property set in a single `prop_area`. We write the last.
+  It is what Android used before 8.0, it is still in current bionic
+  (`SystemProperties::InitContexts`), and the per-context split it gives up
+  exists to stop one domain reading another's properties -- which means
+  nothing next to a permissive `fs/selinuxfs.c`.
+- **`servicemanager.ready` is seeded, not observed.** It says the area was
+  built, not that servicemanager is up. Start servicemanager before anything
+  that talks to it, or the client will get past the property and then block in
+  binder with no context manager -- which `/proc/ish/binder` reports as `no
+  context manager`.
+
+There is still no property *service*: `/dev/socket/property_service` does not
+exist, so `__system_property_set()` fails and the area is read-only. To change
+a property, edit the `build.prop` it came from and rebuild:
+
+```sh
+echo / > /proc/ish/property_area     # or a tree's path, for a chroot
+cat /proc/ish/property_area
+```
+
+The file is replaced, not rewritten, so a process that already mapped the old
+one keeps it -- restart the process, not the session.
+
+`/proc/ish/property_area` also reports what the last build produced, which
+matters because from inside the guest "the property is not set" and "the area
+was never built" look identical and call for opposite next steps.
+
+**What has not been shown yet** is a live Android client getting past
+`WaitForProperty` and going on to make a real call. What has been shown is that
+bionic's own unmodified `prop_area.cpp` maps the area and finds every property
+in it by name, long out-of-line values included, and that
+`tests/manual/property_area.c` -- an independent transcription of the read side
+-- agrees. The next person with a device should point `service list` at a
+running servicemanager and see how far it gets.
+
+`binder_ping` still exists and is still the cheapest probe:
+`PING_TRANSACTION` depends on no property, no logd and no init, so it isolates
+binder from everything above it.
 
 ## Diagnosing a hang
 
@@ -63,6 +105,10 @@ check: if a hung client does **not** appear in the dump at all, it never opened
 the driver, and the problem is upstream of binder entirely -- that is exactly
 how the property spin was found.
 
+When a client is hung upstream of binder, `/proc/ish/property_area` is the next
+place to look: a `no area` line, or a property count that does not include what
+the client is waiting on, explains it without a debugger.
+
 Android's own explanation of a failure usually goes to logd, which does not
 exist here. It ends up in `dmesg` only because `/dev/kmsg` accepts writes;
 `android::base`'s KernelLogger writes there. If `dmesg` is silent about a
@@ -72,9 +118,10 @@ a regular file -- a plain file at that path swallows every message.
 ## Two ways to run a tree
 
 **As an iSH root (preferred).** iSH mounts `/proc`, `/sys` and `/dev/pts` at
-boot and creates `/dev/binder`, `/dev/ashmem` and `/dev/dma_heap` itself, so
-almost nothing is left to do. See `tools/android-root-profile.sh` for the
-session profile, and note:
+boot, creates `/dev/binder`, `/dev/ashmem` and `/dev/dma_heap` itself, and
+builds `/dev/__properties__` from the tree's own `build.prop` files, so almost
+nothing is left to do. See `tools/android-root-profile.sh` for the session
+profile, and note:
 
 - The launch/boot commands must be set explicitly. **Do not leave Boot Command
   at `/sbin/init`**: Android has no `/sbin/init`, and iSH's fallback list starts
@@ -103,15 +150,33 @@ thing and verifies it from inside the chroot. Four separate debugging rounds
 were lost to setup drift before it existed, each presenting as a different
 Android failure.
 
+A chroot needs one thing a root does not: the property area iSH builds at boot
+went into the *outer* root's `/dev`, from the *outer* root's `build.prop` files
+-- neither of which is the tree. The setup script fixes that by writing the
+tree's path to `/proc/ish/property_area`, which rebuilds it from that tree into
+that tree's `dev/__properties__`.
+
 ## Anticipated order of remaining work
 
-1. **Property area** (`/dev/__properties__`) -- the current blocker.
+1. **Run a real client against the area.** `service list` with servicemanager
+   already started is the one-line experiment that says whether the property
+   work landed. Until someone does it, the property area is verified against
+   bionic's reader and nothing else.
 2. **logd**, or a socket sink at `/dev/socket/logdw`, so Android's own logging
    is visible without relying on the kmsg path.
 3. Whatever the first real service needs after that. Do not build ahead of the
    evidence: every wall so far has been something other than the one predicted,
-   and the cheap diagnostics (`/proc/ish/binder`, `dmesg`, `binder_ping`) have
-   each been worth more than a round of speculation.
+   and the cheap diagnostics (`/proc/ish/binder`, `/proc/ish/property_area`,
+   `dmesg`, `binder_ping`) have each been worth more than a round of
+   speculation.
+
+A property service is deliberately *not* on this list. Nothing has yet been
+seen to need one: the properties Android reads at startup come from files, and
+the one write that mattered (`servicemanager.ready`) is answered by seeding it.
+If something turns out to need a real `__system_property_set`, that is when to
+build the socket at `/dev/socket/property_service` -- and it will need the
+in-place value update with the dirty-serial protocol, which the read-only area
+does not implement.
 
 ## Known latent issue
 

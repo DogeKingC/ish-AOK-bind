@@ -72,6 +72,19 @@ need_in fs/dev.c          dma_heap_dev                 "dma-heap minor dispatch"
 need_in fs/devices.h      DEV_DMA_HEAP_SYSTEM_MINOR
 need_in meson.build       kernel/dma_heap.c
 
+# --- Android property area -------------------------------------------------
+# /dev/__properties__. Without it every libbinder client spins on
+# servicemanager.ready and never opens the binder driver, so losing the boot
+# hook would look like a binder regression rather than a missing file.
+need_file kernel/property_area.c
+need_file kernel/property_area.h
+need_file tests/manual/property_area.c
+need_in app/AppDelegate.m property_area_create "builds /dev/__properties__ at boot"
+need_in xX_main_Xx.h      property_area_create "builds /dev/__properties__ at boot (CLI)"
+need_in fs/proc/ish.c     property_area_show   "/proc/ish/property_area, the chroot's only way in"
+need_in fs/proc/ish.c     property_area_update
+need_in meson.build       kernel/property_area.c
+
 # --- permissive SELinux stub ----------------------------------------------
 need_file fs/selinuxfs.c
 need_file tests/manual/selinuxfs.c
@@ -141,11 +154,13 @@ need_in fs/aok-tests.manifest             ashmem.c
 need_in fs/aok-tests.manifest             dma_heap.c
 need_in fs/aok-tests.manifest             selinuxfs.c
 need_in fs/aok-tests.manifest             kmsg.c
+need_in fs/aok-tests.manifest             property_area.c
 need_in tests/manual/setup-regressions.sh binder_ipc
 need_in tests/manual/setup-regressions.sh ashmem
 need_in tests/manual/setup-regressions.sh dma_heap
 need_in tests/manual/setup-regressions.sh selinuxfs
 need_in tests/manual/setup-regressions.sh kmsg
+need_in tests/manual/setup-regressions.sh property_area
 
 # --- CI -------------------------------------------------------------------
 # Upstream guards these on repository *name*, which this fork's name does not

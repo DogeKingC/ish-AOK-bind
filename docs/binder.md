@@ -185,6 +185,7 @@ that look identical from outside, and each one is a different line here:
 
 | symptom | reading |
 |---|---|
+| the caller is not in the dump at all | it never opened the driver; the problem is above binder, and `/proc/ish/property_area` is the next thing to check |
 | `no context manager` | nobody claimed handle 0; the caller waits forever |
 | `manager pid -1 (owner is gone)` | it registered, then the process died |
 | caller has `stack 1`, manager `todo 1` | the work was queued and nobody dequeued it |
@@ -204,16 +205,29 @@ That is libbinder on one side, this driver in the middle, and
 `BBinder::onTransact` on the other -- a complete transaction round trip with
 real Android userspace, not a test speaking the protocol to itself.
 
-It exists because `service list` cannot demonstrate this. Modern libbinder waits
-on the `servicemanager.ready` property before it constructs `ProcessState`, so
-with no property service every ordinary client spins without ever opening the
-driver. `PING_TRANSACTION` depends on no property, no logd and no init, which
-makes it the one call that works while the rest of the platform is still
-missing.
+It exists because at the time `service list` could not demonstrate it. Modern
+libbinder waits on the `servicemanager.ready` property before it constructs
+`ProcessState`, and with no property area every ordinary client spun without
+ever opening the driver. `PING_TRANSACTION` depends on no property, no logd and
+no init, which made it the one call that worked while the rest of the platform
+was missing -- and still makes it the probe that isolates binder from
+everything above it.
+
+`kernel/property_area.c` now writes `/dev/__properties__` at boot with
+`servicemanager.ready=true` seeded, so that particular wait is answered. See
+`docs/android-bringup.md`; note that the property is seeded rather than
+observed, so a client can now get past it and block in binder instead, which
+this file's table is for.
 
 ## Beyond binder
 
 Binder is necessary but not sufficient for running Android userspace.
+
+System properties are implemented too -- `kernel/property_area.c`,
+`tests/manual/property_area.c`. iSH writes `/dev/__properties__` at boot in
+bionic's single-file (pre-split) layout, seeded with `servicemanager.ready` and
+filled from the tree's own `build.prop` files. That is what stops a libbinder
+client spinning before it opens this driver at all.
 
 `ashmem` (`/dev/ashmem`) is now implemented too -- see `kernel/ashmem.c` and
 `tests/manual/ashmem.c`. It is backed the same way binder's receive region is,

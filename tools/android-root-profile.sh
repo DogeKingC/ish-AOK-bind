@@ -6,9 +6,18 @@
 #     /system/bin/sh /android-profile.sh
 #
 # Most of what the chroot needed is already done by the time this runs: iSH
-# mounts /proc, /sys and /dev/pts at boot, and creates /dev/binder,
-# /dev/ashmem and /dev/dma_heap/* itself. What is left is the environment and
-# one mount.
+# mounts /proc, /sys and /dev/pts at boot, creates /dev/binder, /dev/ashmem
+# and /dev/dma_heap/* itself, and builds /dev/__properties__ from this tree's
+# own build.prop files. What is left is the environment and one mount.
+#
+# After editing a build.prop, rebuild the property area without restarting the
+# app:
+#
+#     echo / > /proc/ish/property_area
+#     cat /proc/ish/property_area
+#
+# A process that already started keeps the area it mapped, so restart the
+# process too -- but not the session.
 #
 # The environment matters more than it looks. iSH boots the session with
 # PATH=/usr/local/sbin:...:/bin and HOME=/root, and an Android tree has none of
