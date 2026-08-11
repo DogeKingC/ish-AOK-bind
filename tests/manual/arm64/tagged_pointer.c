@@ -149,6 +149,49 @@ static void test_scalar(void) {
     check(*p64 == 0x0123456789abcdefULL, "64-bit load through a tagged pointer");
 }
 
+// Individual instructions, hand-written, so the compiler cannot change which
+// one is under test. This exists because the device dump attributed the fault
+// to `dup v0.16b, w1` -- an instruction with no memory operand -- inside
+// memset. Either that attribution is wrong, or something without an address
+// is being executed as a store. One of these five lines says which.
+//
+// The order matters: cheapest and most fundamental first, so the last `-> `
+// line before a crash names the narrowest failing instruction.
+static void test_instructions(void) {
+    unsigned long tagged = (unsigned long) tag_ptr(page);
+    memset(page, 0, 64);
+
+    step("asm: strb to tagged %#lx", tagged);
+    __asm__ volatile("strb %w0, [%1]" :: "r"(0xa5), "r"(tagged) : "memory");
+    check((unsigned char) page[0] == 0xa5, "asm strb through a tagged pointer");
+
+    step("asm: ldrb from tagged %#lx", tagged);
+    unsigned int got = 0;
+    __asm__ volatile("ldrb %w0, [%1]" : "=r"(got) : "r"(tagged) : "memory");
+    check(got == 0xa5, "asm ldrb through a tagged pointer");
+
+    // No memory operand whatsoever. If this faults, the bug is not about
+    // addresses at all -- an instruction is being executed as a store.
+    step("asm: dup v0.16b, w0 -- no memory operand");
+    __asm__ volatile("dup v0.16b, %w0" :: "r"(0x5a) : "v0");
+    check(1, "dup v0.16b executed without touching memory");
+
+    // The dup and the store have to be one asm block: as separate blocks the
+    // compiler is entitled to treat v0 as dead after the clobber, and the
+    // store would write whatever happened to be left in it.
+    step("asm: str q0 to tagged %#lx", tagged);
+    __asm__ volatile("dup v0.16b, %w0\n\tstr q0, [%1]"
+                     :: "r"(0x5a), "r"(tagged) : "memory", "v0");
+    check((unsigned char) page[0] == 0x5a && (unsigned char) page[15] == 0x5a,
+          "asm str q0 through a tagged pointer");
+
+    step("asm: stp q0, q0 to tagged %#lx", tagged + 16);
+    __asm__ volatile("dup v0.16b, %w0\n\tstp q0, q0, [%1]"
+                     :: "r"(0x5a), "r"(tagged + 16) : "memory", "v0");
+    check((unsigned char) page[16] == 0x5a && (unsigned char) page[47] == 0x5a,
+          "asm stp q0,q0 through a tagged pointer");
+}
+
 // The failing case on the device. Sizes chosen to walk every branch of a
 // SIMD memset: under 16 bytes, exactly the pair-store width, and past the
 // point where it loops.
@@ -302,6 +345,8 @@ int main(int argc, char **argv) {
 
     step("== scalar ==");
     test_scalar();
+    step("== instructions ==");
+    test_instructions();
     step("== bulk ==");
     test_bulk();
     step("== crosspage ==");
