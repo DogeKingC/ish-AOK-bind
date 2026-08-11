@@ -115,6 +115,7 @@ need_in fs/proc/sys.c boot_id_lock "boot_id is generated under a lock"
 
 # --- Android chroot setup --------------------------------------------------
 need_file tools/android-chroot-setup.sh
+need_file tools/android-root-profile.sh
 
 # --- shared ---------------------------------------------------------------
 need_file kernel/ioctl_abi.h
