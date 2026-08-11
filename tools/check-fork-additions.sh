@@ -85,6 +85,17 @@ need_in fs/proc/ish.c     property_area_show   "/proc/ish/property_area, the chr
 need_in fs/proc/ish.c     property_area_update
 need_in meson.build       kernel/property_area.c
 
+# --- arm64 guest: tagged pointers -----------------------------------------
+# AArch64 TBI. bionic tags every heap pointer, so without the untagging every
+# arm64 Android process dies in libc's first memset -- and the tag is stripped
+# in the JIT's TLB fast path only, which is easy to lose track of.
+need_file tests/manual/arm64/tagged_pointer.c
+need_in kernel/abi.h   guest_abi_untag_addr "the shared TBI untagging helper"
+need_in kernel/user.c  guest_abi_untag_addr "syscall pointers are untagged"
+need_in emu/arm64_interp.c guest_abi_untag_addr "interpreter loads/stores are untagged"
+need_in fs/aok-tests.manifest             arm64/tagged_pointer.c
+need_in tests/manual/setup-regressions.sh tagged_pointer
+
 # --- permissive SELinux stub ----------------------------------------------
 need_file fs/selinuxfs.c
 need_file tests/manual/selinuxfs.c

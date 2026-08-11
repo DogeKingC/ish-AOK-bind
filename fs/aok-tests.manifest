@@ -146,5 +146,6 @@ arm64/stlr_ldar_publish.c
 arm64/ptrace_singlestep.c
 arm64/ands_bcond_fusion.c
 arm64/hle_loop.c
+arm64/tagged_pointer.c
 riscv64/ptrace_regset.c
 aes_gcm_accel.c
