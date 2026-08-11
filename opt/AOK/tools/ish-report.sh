@@ -4,7 +4,8 @@
 #
 #     sh /AOK/tools/ish-report.sh tagged_pointer
 #     sh /AOK/tools/ish-report.sh                 # state only, no tests
-#     sh /AOK/tools/ish-report.sh --push tagged_pointer   # and push it
+#     sh /AOK/tools/ish-report.sh --post tagged_pointer   # and upload it
+#     sh /AOK/tools/ish-report.sh --push tagged_pointer   # and push it to a branch
 #
 # Debugging iSH from a distance means someone reads output they cannot
 # produce. Doing that by hand costs a round trip per fact -- run the test,
@@ -15,22 +16,33 @@
 #
 # The report goes to a file and to stdout, so it can be pasted or redirected.
 #
+# --post uploads it and prints a URL, which is the shortest path when the
+# reader is elsewhere: they fetch the URL instead of being sent a retyping of
+# the output. It needs no credentials, which --push does, so it is the one that
+# works from a phone. The endpoint is ISH_REPORT_POST_URL if the default does
+# not suit -- point it at your own host and nothing leaves your control.
+#
 # --push additionally commits it to a throwaway branch and pushes, which is
 # worth it for anyone reading this from elsewhere: a pasted report gets
 # truncated or reflowed exactly when it is long, and it is long precisely when
 # something interesting happened. Needs to run from inside a checkout that can
 # push; ISH_REPORT_REPO names one if the working directory is not it.
 #
-# It records paths, mounts and a process list. Nothing is uploaded anywhere by
-# this script, but glance at it before sending it on.
+# It records paths, mounts and a process list. Neither --post nor --push is the
+# default, and plain runs upload nothing -- but --post puts the file on a
+# third-party host, so glance at it first.
 
 set -u
 
 push=0
-if [ "${1:-}" = "--push" ]; then
-    push=1
-    shift
-fi
+post=0
+while :; do
+    case "${1:-}" in
+        --push) push=1; shift ;;
+        --post) post=1; shift ;;
+        *) break ;;
+    esac
+done
 
 tests="$*"
 out="${ISH_REPORT_OUT:-${TMPDIR:-/tmp}/ish-report.txt}"
@@ -98,6 +110,24 @@ echo "===== end of report ====="
 report 2>&1 | tee "$out"
 echo
 echo "written to: $out" >&2
+
+if [ "$post" -eq 1 ]; then
+    post_url="${ISH_REPORT_POST_URL:-https://paste.rs}"
+    url=""
+    if command -v curl >/dev/null 2>&1; then
+        url=$(curl -sS --data-binary @"$out" "$post_url" 2>&1 | tail -1)
+    elif command -v wget >/dev/null 2>&1; then
+        # busybox wget has no --post-file; this fails cleanly on those.
+        url=$(wget -qO- --post-file="$out" "$post_url" 2>&1 | tail -1)
+    else
+        echo "--post: needs curl or wget (apk add curl)" >&2
+    fi
+    case "$url" in
+        http*) echo "posted: $url" >&2 ;;
+        "")    ;;
+        *)     echo "--post: upload did not return a URL: $url" >&2 ;;
+    esac
+fi
 
 [ "$push" -eq 1 ] || exit 0
 
