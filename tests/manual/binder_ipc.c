@@ -32,6 +32,10 @@
 //   state        /proc/ish/binder reports the live driver state -- which
 //                context manager is registered, and which processes hold the
 //                driver open.
+//   poll         a receiver driven by epoll rather than a blocking read is
+//                woken when a transaction arrives. This is how real Android
+//                receives: servicemanager epolls the binder fd, so the poll
+//                wakeup is the only thing that can wake it.
 //   binderfs     Mounting binderfs and creating a device with BINDER_CTL_ADD
 //                makes a new node appear in the directory. SKIPped when the
 //                mount is not permitted.
@@ -55,6 +59,7 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
+#include <sys/epoll.h>
 #include <sys/wait.h>
 
 #include "test_common.h"
@@ -1000,7 +1005,105 @@ static void test_security_context(const char *dev) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 5: binderfs
+// Phase 5: delivery to a poll-driven receiver
+// ---------------------------------------------------------------------------
+
+// Every other phase blocks in BINDER_WRITE_READ, which is woken by notify() on
+// the thread's own condition variable. Real Android does not: servicemanager
+// drives an android::Looper and epolls the binder fd, so the ONLY thing that
+// can wake it is the driver's poll wakeup. If that is ever dropped, a
+// transaction sits in the queue and the receiver sleeps forever -- and no
+// blocking-read test can tell.
+static void test_poll_delivery(const char *dev) {
+    if (access(dev, F_OK) != 0) {
+        printf("SKIP poll: no %s\n", dev);
+        return;
+    }
+
+    struct binder server = { .fd = -1 };
+    if (binder_open_dev(&server, dev) < 0) {
+        check(0, "poll server open+mmap");
+        return;
+    }
+    int32_t zero = 0;
+    if (ioctl(server.fd, BINDER_SET_CONTEXT_MGR, &zero) < 0) {
+        printf("SKIP poll: context manager already claimed on %s (errno=%d)\n", dev, errno);
+        binder_close_dev(&server);
+        return;
+    }
+
+    // Enter the looper the way a real receiver does, then never issue a
+    // blocking read: readiness has to arrive through poll alone.
+    uint32_t enter = BC_ENTER_LOOPER;
+    check(binder_wr(&server, &enter, sizeof(enter), NULL, 0, NULL) == 0, "poll server enters looper");
+
+    int epfd = epoll_create1(0);
+    check(epfd >= 0, "epoll_create1");
+    struct epoll_event ev = { .events = EPOLLIN, .data = { .fd = server.fd } };
+    check(epfd >= 0 && epoll_ctl(epfd, EPOLL_CTL_ADD, server.fd, &ev) == 0, "epoll_ctl ADD binder fd");
+
+    int sync_pipe[2];
+    check(pipe(sync_pipe) == 0, "poll sync pipe");
+
+    pid_t child = fork();
+    check(child >= 0, "fork poll client");
+    if (child == 0) {
+        close(sync_pipe[1]);
+        char go;
+        (void) !read(sync_pipe[0], &go, 1);
+        close(sync_pipe[0]);
+        struct binder client = { .fd = -1 };
+        if (binder_open_dev(&client, dev) < 0) {
+            fflush(NULL);
+            _exit(70);
+        }
+        struct client_ctx cctx = { .b = &client };
+        client_call(&client, TF_ONE_WAY, &cctx);
+        binder_close_dev(&client);
+        fflush(NULL);
+        _exit(0);
+    }
+    close(sync_pipe[0]);
+
+    // Drain anything already pending, so the wakeup we are testing is caused
+    // by the child's transaction and not by leftover setup traffic.
+    struct epoll_event got;
+    while (epoll_wait(epfd, &got, 1, 0) > 0) {
+        uint8_t drain[512];
+        size_t consumed = 0;
+        if (binder_wr(&server, NULL, 0, drain, sizeof(drain), &consumed) < 0)
+            break;
+        if (consumed == 0)
+            break;
+    }
+
+    (void) !write(sync_pipe[1], "g", 1);
+    close(sync_pipe[1]);
+
+    // Generous: this is a hang detector, not a latency measurement.
+    int n = epoll_wait(epfd, &got, 1, 10000);
+    check(n > 0, "the binder fd becomes readable when a transaction arrives");
+    if (n <= 0)
+        printf("       epoll_wait timed out: a poll wakeup was dropped\n");
+
+    if (n > 0) {
+        uint8_t readbuf[512];
+        size_t consumed = 0;
+        check(binder_wr(&server, NULL, 0, readbuf, sizeof(readbuf), &consumed) == 0,
+              "the woken read returns");
+        struct server_ctx sctx = { .b = &server };
+        br_parse(readbuf, consumed, server_handler, &sctx);
+        check(sctx.saw_transaction > 0, "and the transaction is actually there");
+    }
+
+    close(epfd);
+    int status = 0;
+    waitpid(child, &status, 0);
+    binder_close_dev(&server);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: binderfs
 // ---------------------------------------------------------------------------
 
 static void test_binderfs(void) {
@@ -1091,6 +1194,7 @@ int main(int argc, char **argv) {
     test_transaction(binder_path);
     test_death_notification(vndbinder_path);
     test_security_context(binder_dev_named("hwbinder"));
+    test_poll_delivery(binder_dev_named("hwbinder"));
     test_binderfs();
 
     return finish_suite("binder_ipc");
