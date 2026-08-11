@@ -191,6 +191,26 @@ that look identical from outside, and each one is a different line here:
 | manager thread not `waiting for-proc-work` | no thread is available to take it |
 | manager `waiting` with its own `stack` | it is blocked on a reply it must itself produce |
 
+## Verified against real Android userspace
+
+`binder_ping --external` sends `PING_TRANSACTION` to whatever owns handle 0 and
+waits for the reply. Run against a live `servicemanager` on device, it reports:
+
+```
+ok handle 0 replied to PING_TRANSACTION
+```
+
+That is libbinder on one side, this driver in the middle, and
+`BBinder::onTransact` on the other -- a complete transaction round trip with
+real Android userspace, not a test speaking the protocol to itself.
+
+It exists because `service list` cannot demonstrate this. Modern libbinder waits
+on the `servicemanager.ready` property before it constructs `ProcessState`, so
+with no property service every ordinary client spins without ever opening the
+driver. `PING_TRANSACTION` depends on no property, no logd and no init, which
+makes it the one call that works while the rest of the platform is still
+missing.
+
 ## Beyond binder
 
 Binder is necessary but not sufficient for running Android userspace.

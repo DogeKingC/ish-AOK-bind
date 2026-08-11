@@ -99,6 +99,19 @@ enum {
 // B_PACK_CHARS('_','P','N','G') -- what every BBinder answers.
 #define PING_TRANSACTION 0x5f504e47
 
+// In --external mode this is a probe aimed at another process, and its two
+// outcomes must not print the same last line. finish_suite reports PASS
+// whenever nothing FAILED, and a skip is not a failure -- so a skipped probe
+// and a successful one both ended with "binder_ping: PASS", which is exactly
+// the ambiguity a probe exists to remove. The default mode keeps finish_suite,
+// because it is a real self-contained test and the harness looks for that line.
+static int skipped(int external) {
+    if (!external)
+        return finish_suite("binder_ping");
+    printf("binder_ping: SKIP (nothing was verified)\n");
+    return 2;
+}
+
 static void check(int cond, const char *what) {
     if (!cond) {
         printf("FAIL %s (errno=%d %s)\n", what, errno, strerror(errno));
@@ -321,7 +334,7 @@ int main(int argc, char **argv) {
         dev = pick_device();
     if (dev == NULL) {
         printf("SKIP binder_ping: no binder device (errno=%d %s)\n", errno, strerror(errno));
-        return finish_suite("binder_ping");
+        return skipped(external);
     }
     test_logf("device %s\n", dev);
 
@@ -344,7 +357,7 @@ int main(int argc, char **argv) {
             printf("SKIP binder_ping: could not claim handle 0 (something else owns it)\n");
             close(ready[0]);
             waitpid(server, NULL, 0);
-            return finish_suite("binder_ping");
+            return skipped(external);
         }
         close(ready[0]);
     }
@@ -363,7 +376,7 @@ int main(int argc, char **argv) {
         printf("SKIP binder_ping: handle 0 answered with a failure (0x%08x) -- "
                "is a context manager running?\n", (unsigned) failure);
         binder_close_dev(&client);
-        return finish_suite("binder_ping");
+        return skipped(external);
     }
     check(rc == 1, "handle 0 replied to PING_TRANSACTION");
     if (rc == 0)
