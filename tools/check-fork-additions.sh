@@ -144,6 +144,8 @@ need_in fs/aok-tools.manifest android/chroot-setup.sh "shipped to /AOK/tools on 
 need_file docs/android-bringup.md
 need_file opt/AOK/tools/ish-report.sh
 need_in fs/aok-tools.manifest ish-report.sh "the one-command diagnostic report"
+need_file opt/AOK/tools/ish-remote.sh
+need_in fs/aok-tools.manifest ish-remote.sh "the code-gated remote command listener"
 
 # --- shared ---------------------------------------------------------------
 need_file kernel/ioctl_abi.h

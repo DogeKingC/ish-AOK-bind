@@ -16,6 +16,7 @@ provision-ultimate-devuan.sh
 provision-ultimate-archlinux.sh
 mount-root.sh
 ish-report.sh
+ish-remote.sh
 setup-wayland.sh
 start-wayland.sh
 ktop/ktop.c
