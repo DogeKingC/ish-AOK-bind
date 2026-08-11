@@ -89,6 +89,21 @@ static void checkf(int cond, const char *fmt, ...) {
     va_end(ap);
 }
 
+// Announced BEFORE the operation, and flushed. This test's failure mode is a
+// fatal signal, so a line printed after an operation is lost precisely when
+// it is the one you need: the last `-> ` line names the thing that crashed.
+static void step(const char *fmt, ...) {
+    if (!test_verbose)
+        return;
+    va_list ap;
+    va_start(ap, fmt);
+    printf("-> ");
+    vprintf(fmt, ap);
+    printf("\n");
+    va_end(ap);
+    fflush(stdout);
+}
+
 static void check(int cond, const char *what) {
     if (!cond) {
         printf("FAIL %s\n", what);
@@ -110,10 +125,15 @@ static void test_scalar(void) {
     volatile uint32_t *p32 = tag_ptr(page + 16);
     volatile uint64_t *p64 = tag_ptr(page + 24);
 
+    step("8-bit store to tagged %p", (void *) p8);
     *p8 = 0xa5;
+    step("16-bit store to tagged %p", (void *) p16);
     *p16 = 0x1234;
+    step("32-bit store to tagged %p", (void *) p32);
     *p32 = 0xdeadbeef;
+    step("64-bit store to tagged %p", (void *) p64);
     *p64 = 0x0123456789abcdefULL;
+    step("reading the four back through the untagged page");
 
     // Read back through the UNtagged mapping: the tag must not have changed
     // which bytes were written.
@@ -123,7 +143,9 @@ static void test_scalar(void) {
     check(*(uint64_t *) (page + 24) == 0x0123456789abcdefULL,
           "64-bit store through a tagged pointer");
 
+    step("8-bit load from tagged %p", (void *) p8);
     check(*p8 == 0xa5, "8-bit load through a tagged pointer");
+    step("64-bit load from tagged %p", (void *) p64);
     check(*p64 == 0x0123456789abcdefULL, "64-bit load through a tagged pointer");
 }
 
@@ -137,6 +159,7 @@ static void test_bulk(void) {
         size_t n = sizes[i];
         memset(page, 0, page_size);
 
+        step("memset(tagged %p, 0x5a, %zu)", tag_ptr(page), n);
         memset(tag_ptr(page), 0x5a, n);
         int ok = 1;
         for (size_t j = 0; j < n; j++)
@@ -153,6 +176,7 @@ static void test_bulk(void) {
     for (size_t i = 0; i < page_size / 2; i++)
         src[i] = (char) (i * 7 + 1);
 
+    step("memcpy(tagged, tagged, %zu)", page_size / 2);
     memcpy(tag_ptr(dst), tag_ptr(src), page_size / 2);
     check(memcmp(dst, src, page_size / 2) == 0, "memcpy between two tagged pointers");
 }
@@ -174,11 +198,13 @@ static void test_crosspage(void) {
     // Straddle the boundary by 4 bytes either side.
     uint64_t *straddle = (uint64_t *) (region + page_size - 4);
     volatile uint64_t *tagged = tag_ptr(straddle);
+    step("page-straddling 64-bit store to tagged %p", (void *) tagged);
     *tagged = 0xcafef00dd00dfeedULL;
     check(*straddle == 0xcafef00dd00dfeedULL, "page-straddling store through a tagged pointer");
     check(*tagged == 0xcafef00dd00dfeedULL, "page-straddling load through a tagged pointer");
 
     // And a bulk copy across the boundary.
+    step("page-straddling memset through a tagged pointer");
     memset(tag_ptr(region + page_size - 64), 0x33, 128);
     int ok = 1;
     for (size_t i = 0; i < 128; i++)
@@ -195,10 +221,12 @@ static void test_atomics(void) {
     uint64_t *tagged = tag_ptr(slot);
 
     // LDXR/STXR and the LSE forms both land here depending on the compiler.
+    step("atomic store to tagged %p", (void *) tagged);
     __atomic_store_n(tagged, 100, __ATOMIC_SEQ_CST);
     check(*slot == 100, "atomic store through a tagged pointer");
     check(__atomic_load_n(tagged, __ATOMIC_SEQ_CST) == 100,
           "atomic load through a tagged pointer");
+    step("atomic fetch-add on tagged %p", (void *) tagged);
     check(__atomic_fetch_add(tagged, 5, __ATOMIC_SEQ_CST) == 100,
           "atomic fetch-add through a tagged pointer");
     check(*slot == 105, "atomic fetch-add landed on the right address");
@@ -228,6 +256,7 @@ static void test_syscalls(void) {
         return;
     }
     memset(page, 0xff, 64);
+    step("read() into tagged %p", tag_ptr(page));
     ssize_t n = read(fd, tag_ptr(page), 64);
     close(fd);
 
@@ -271,10 +300,15 @@ int main(int argc, char **argv) {
     }
     memset(page, 0, page_size);
 
+    step("== scalar ==");
     test_scalar();
+    step("== bulk ==");
     test_bulk();
+    step("== crosspage ==");
     test_crosspage();
+    step("== atomics ==");
     test_atomics();
+    step("== syscalls ==");
     test_syscalls();
 
     munmap(page, page_size);
