@@ -15,8 +15,13 @@
 # random the better. From it both sides derive one ntfy.sh topic to send
 # commands on and one to send output back on. The listener polls the command
 # topic; anything stamped with the matching code, it runs; the output goes to
-# the reply topic (or, when large, to a paste whose URL it sends). ntfy.sh is a
+# the reply topic, split across several messages when it is large. ntfy.sh is a
 # public relay and needs no account.
+#
+# It drains every pending command, oldest first, rather than only the newest.
+# That matters on iOS, where the app is suspended whenever it is not in the
+# foreground: a sender working meanwhile queues several commands, and they all
+# land at once when it resumes.
 #
 # READ THIS BEFORE YOU RUN IT. This executes commands fetched from the network
 # as you, in this shell. Whoever knows the code can run anything on this
@@ -34,7 +39,7 @@
 #   ISH_REMOTE_BASE      relay base URL           (default https://ntfy.sh)
 #   ISH_REMOTE_INTERVAL  seconds between polls     (default 4)
 #   ISH_REMOTE_MAX       stop after N polls        (default 900, ~1h at 4s)
-#   ISH_REMOTE_INLINE    reply inline up to N bytes, paste above that (default 3000)
+#   ISH_REMOTE_INLINE    bytes per reply message, split above it (default 3000)
 
 set -u
 
@@ -75,8 +80,12 @@ code="${1:-${ISH_REMOTE_CODE:-}}"
 
 ct=$(cmd_topic "$code")
 ot=$(out_topic "$code")
-state="${TMPDIR:-/tmp}/ish-remote.$code.last"
-last=$(cat "$state" 2>/dev/null || echo "")
+seen="${TMPDIR:-/tmp}/ish-remote.$code.seen"
+stopflag="${TMPDIR:-/tmp}/ish-remote.$code.stop"
+rm -f "$stopflag"
+# Ids already run. Kept across restarts so resuming does not replay the topic's
+# whole history; delete it to deliberately re-run everything.
+[ -f "$seen" ] || : > "$seen"
 
 echo "================================================================"
 echo " ish-remote listening"
@@ -96,11 +105,16 @@ while [ "$i" -lt "$max" ]; do
     i=$((i + 1))
     sleep "$interval"
 
-    # Newest cached message on the command topic. since=all + tail -1 is
-    # robust to the listener having been busy running a slow command: the
-    # freshest message is always the last line regardless of timing.
-    msg=$(curl -sS "$base/$ct/json?poll=1&since=all" 2>/dev/null | tail -1)
-    [ -n "$msg" ] || continue
+    # EVERY pending message, oldest first -- not just the newest. iOS suspends
+    # iSH whenever it is not the foreground app, so a sender working in the
+    # meantime queues several commands and they all arrive at once on resume.
+    # Taking only the latest silently dropped the rest, which looks from the
+    # far end like commands vanishing.
+    batch=$(curl -sS "$base/$ct/json?poll=1&since=all" 2>/dev/null)
+    [ -n "$batch" ] || continue
+
+    printf '%s\n' "$batch" | while IFS= read -r msg; do
+        [ -n "$msg" ] || continue
 
     # The payload is "ISH-REMOTE <code> <id> <base64>", all JSON-safe
     # characters, so a plain field extraction is enough -- no JSON parser.
@@ -111,20 +125,20 @@ while [ "$i" -lt "$max" ]; do
     id="${3:-}"
     b64="${4:-}"
     [ -n "$id" ] || continue
-    [ "$id" != "$last" ] || continue            # already ran this one
+    # Already-run ids live in a seen-file: a batch replays the whole cached
+    # topic every poll, so "the last one I ran" is not enough state.
+    grep -qx "$id" "$seen" 2>/dev/null && continue
 
     cmd=$(printf '%s' "$b64" | base64 -d 2>/dev/null)
-    if [ -z "$cmd" ]; then
-        last="$id"; echo "$last" > "$state" 2>/dev/null || true
-        continue
-    fi
+    echo "$id" >> "$seen"
+    [ -n "$cmd" ] || continue
 
     echo
     echo "--- [$id] running: $cmd"
     if [ "$cmd" = "stop" ] || [ "$cmd" = "ish-remote-stop" ]; then
         curl -sS -d "listener stopping" "$base/$ot" >/dev/null 2>&1 || true
         echo "--- stop received"
-        last="$id"; echo "$last" > "$state" 2>/dev/null || true
+        : > "$stopflag"
         break
     fi
 
@@ -137,19 +151,32 @@ while [ "$i" -lt "$max" ]; do
     cat "$out"
 
     size=$(wc -c < "$out" 2>/dev/null || echo 0)
-    if [ "$size" -gt "$inline_max" ]; then
-        # Too big for one relay message: stash it on a paste and send the URL.
-        url=$(curl -sS --data-binary @"$out" https://paste.rs 2>/dev/null | tail -1)
-        case "$url" in
-            http*) curl -sS -d "[$id] rc=$rc, output ($size bytes): $url" "$base/$ot" >/dev/null 2>&1 || true ;;
-            *)     curl -sS -d "[$id] rc=$rc, output was $size bytes and the paste upload failed" "$base/$ot" >/dev/null 2>&1 || true ;;
-        esac
-    else
+    if [ "$size" -le "$inline_max" ]; then
         curl -sS --data-binary @"$out" "$base/$ot" >/dev/null 2>&1 || true
+    else
+        # Chunk it over the relay rather than depending on a paste host: the
+        # device that most needs this (a phone) is the one most likely to
+        # reach the relay and nothing else -- observed exactly that, ntfy
+        # fine and the paste upload refused.
+        parts=$(( size / inline_max + 1 ))
+        curl -sS -d "[$id] rc=$rc, $size bytes in $parts parts" "$base/$ot" >/dev/null 2>&1 || true
+        split_dir="${TMPDIR:-/tmp}/ish-remote.$code.parts"
+        rm -rf "$split_dir"; mkdir -p "$split_dir"
+        # split -C keeps lines whole, which matters: the far end reads these.
+        split -C "$inline_max" "$out" "$split_dir/p" 2>/dev/null \
+            || split -b "$inline_max" "$out" "$split_dir/p" 2>/dev/null
+        part_i=0
+        for part in "$split_dir"/p*; do
+            [ -f "$part" ] || continue
+            part_i=$((part_i + 1))
+            { echo "[$id part $part_i/$parts]"; cat "$part"; } \
+                | curl -sS --data-binary @- "$base/$ot" >/dev/null 2>&1 || true
+        done
+        rm -rf "$split_dir"
     fi
+    done   # end of the per-message batch loop
 
-    last="$id"
-    echo "$last" > "$state" 2>/dev/null || true
+    [ -f "$stopflag" ] && break
 done
 
 echo "ish-remote: done after $i polls"
