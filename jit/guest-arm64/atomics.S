@@ -51,7 +51,13 @@
     ldr x21, [x26]
     b 2f
 1:  ldr x21, [_cpu, #CPU_sp]
-2:  mov x7, x21               // keep the guest address in x21: read_prep
+2:  // TBI: strip the tag before anything uses the address, including the
+    // monitor. On hardware the tag is ignored on dereference, so an LDXR
+    // tagged A and an STXR tagged B on the same location DO pair -- keeping
+    // the tag in excl_addr would make them miss each other and turn every
+    // tagged LL/SC loop into a spin.
+    and x21, x21, #0x00ffffffffffffff
+    mov x7, x21               // keep the guest address in x21: read_prep
                               // translates x7 in place, and the monitor
                               // must record the GUEST address
     read_prep \bits, \name
@@ -98,7 +104,12 @@
     ldr x21, [x10]           // guest address
     b 2f
 1:  ldr x21, [_cpu, #CPU_sp]
-2:
+2:  // TBI, as in ldxr_gadget above. This gadget does not go through
+    // write_prep -- it hands the guest address to arm64_cas itself -- so it
+    // is the one memory path in the arm64 guest that nothing else masks for
+    // it. A tagged pointer reached arm64_cas verbatim and faulted there,
+    // which is what __atomic_fetch_add on a tagged pointer does.
+    and x21, x21, #0x00ffffffffffffff
     ldr x9, [_cpu, #CPU_excl_addr]
     cmp x9, x21
     b.ne stxr_fail_\name
@@ -176,7 +187,10 @@ stxr_gadget stxr64, 3
     ldr x21, [x10]           // guest address
     b 2f
 1:  ldr x21, [_cpu, #CPU_sp]
-2:
+2:  // TBI: see ldxr_gadget. Every gadget in this file builds its own
+    // address instead of going through read_prep/write_prep, so each
+    // one has to strip the tag for itself.
+    and x21, x21, #0x00ffffffffffffff
     mov x24, #0              // expected (Rs), 31 = XZR
     cmp x23, #31
     b.eq 3f
@@ -324,7 +338,10 @@ lse_rmw_fault:
     ldr x21, [x10]           // guest address
     b 2f
 1:  ldr x21, [_cpu, #CPU_sp]
-2:
+2:  // TBI: see ldxr_gadget. Every gadget in this file builds its own
+    // address instead of going through read_prep/write_prep, so each
+    // one has to strip the tag for itself.
+    and x21, x21, #0x00ffffffffffffff
     ldr x24, [x9, x23, lsl #3]  // expected lo (Rs, even, never 31)
     add x11, x23, #1
     mov x25, #0
@@ -400,7 +417,10 @@ casp_gadget casp64, 3
     ldr x21, [x10]           // guest address
     b 2f
 1:  ldr x21, [_cpu, #CPU_sp]
-2:
+2:  // TBI: see ldxr_gadget. Every gadget in this file builds its own
+    // address instead of going through read_prep/write_prep, so each
+    // one has to strip the tag for itself.
+    and x21, x21, #0x00ffffffffffffff
     sub sp, sp, #16          // val_out[2] (survives save_c's 0xa0 frame)
     save_c
     mov x0, x1               // cpu (x1 still intact)
@@ -456,7 +476,10 @@ ldxp_gadget ldxp64, 3
     ldr x21, [x10]           // guest address
     b 2f
 1:  ldr x21, [_cpu, #CPU_sp]
-2:
+2:  // TBI: see ldxr_gadget. Every gadget in this file builds its own
+    // address instead of going through read_prep/write_prep, so each
+    // one has to strip the tag for itself.
+    and x21, x21, #0x00ffffffffffffff
     mov x25, #0              // desired lo (Rt; 31 = XZR = 0)
     cmp x20, #31
     b.eq 3f

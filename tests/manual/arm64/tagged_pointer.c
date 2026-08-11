@@ -186,6 +186,21 @@ static void test_instructions(void) {
     check((unsigned char) page[0] == 0x5a && (unsigned char) page[15] == 0x5a,
           "asm str q0 through a tagged pointer");
 
+    // musl's memset small-count tail, hand-written here so it runs from THIS
+    // binary rather than from ld-musl. Every instruction in it has already
+    // passed above; if the inline copy works and the libc call does not, the
+    // difference is where the code lives, not what it does -- which is the
+    // one thing the device dumps cannot distinguish, because they report the
+    // fault at the callee's first instruction either way.
+    step("asm: musl memset tail (dup/add/strb) inline, tagged %#lx", tagged);
+    memset(page, 0, 8);
+    __asm__ volatile("dup v1.16b, %w1\n\t"
+                     "add x9, %0, #1\n\t"
+                     "strb %w1, [%0]\n\t"
+                     "strb %w1, [x9, #-1]"
+                     :: "r"(tagged), "r"(0x5a) : "memory", "v1", "x9");
+    check((unsigned char) page[0] == 0x5a, "inline copy of musl's memset tail");
+
     step("asm: stp q0, q0 to tagged %#lx", tagged + 16);
     __asm__ volatile("dup v0.16b, %w0\n\tstp q0, q0, [%1]"
                      :: "r"(0x5a), "r"(tagged + 16) : "memory", "v0");
@@ -248,6 +263,14 @@ static void probe_memset(void) {
     checkf(ok, "memset(tagged, 0x5a, %zu) wrote the right bytes", n);
 }
 
+// The libc call on its own, so it is reported separately from the size sweep.
+static void probe_libc_memset_one(void) {
+    memset(page, 0, 8);
+    step("libc memset(tagged, 0x5a, 1) -- the call, not the instructions");
+    memset(tag_ptr(page), 0x5a, 1);
+    check((unsigned char) page[0] == 0x5a, "libc memset of one byte through a tagged pointer");
+}
+
 static void probe_memcpy(void) {
     char *src = page;
     char *dst = page + page_size / 2;
@@ -270,6 +293,7 @@ static void test_bulk(void) {
         snprintf(desc, sizeof(desc), "memset(tagged, %zu)", sizes[i]);
         probe(desc, probe_memset);
     }
+    probe("libc memset(tagged, 1)", probe_libc_memset_one);
     probe("memcpy(tagged, tagged)", probe_memcpy);
 }
 
