@@ -2562,3 +2562,115 @@ void binder_create_device_nodes(void) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// State dump (/proc/ish/binder)
+// ---------------------------------------------------------------------------
+
+// Linux exposes this through debugfs; we hang it off /proc/ish because it is an
+// introspection aid rather than a Linux interface anyone codes against.
+//
+// It exists because "the call hangs" is otherwise unanswerable from the guest.
+// A transaction to handle 0 that never returns has a handful of distinct
+// causes -- no context manager registered, a manager whose process died, no
+// thread waiting to take proc work, work sitting queued that nobody dequeued,
+// a reply that cannot find its way back up a transaction stack -- and they are
+// indistinguishable from the outside. Each one is visible here.
+
+static const char *binder_looper_state(int looper) {
+    if (looper & BINDER_LOOPER_STATE_EXITED)
+        return "exited";
+    if (looper & BINDER_LOOPER_STATE_INVALID)
+        return "invalid";
+    if (looper & BINDER_LOOPER_STATE_ENTERED)
+        return "entered";
+    if (looper & BINDER_LOOPER_STATE_REGISTERED)
+        return "registered";
+    return "none";
+}
+
+static size_t binder_list_count(struct list *list) {
+    size_t n = 0;
+    struct list *item;
+    list_for_each(list, item)
+        n++;
+    return n;
+}
+
+int binder_show_state(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    lock(&binder_lock, 0);
+
+    for (size_t i = 0; i < sizeof(binder_contexts) / sizeof(binder_contexts[0]); i++) {
+        struct binder_context *context = &binder_contexts[i];
+        // The first question to ask about a hung transaction: is anyone
+        // actually listening on handle 0?
+        if (context->mgr_node == NULL) {
+            proc_printf(buf, "context %s: no context manager\n", context->name);
+            continue;
+        }
+        struct binder_proc *mgr = context->mgr_node->proc;
+        proc_printf(buf, "context %s: manager pid %d%s\n", context->name,
+                    mgr != NULL ? (int) mgr->pid : -1,
+                    mgr == NULL ? " (owner is gone)" : "");
+        proc_printf(buf, "  secctx %s\n",
+                    context->mgr_node->txn_security_ctx ? "yes" : "no");
+    }
+
+    struct binder_proc *proc;
+    list_for_each_entry(&binder_procs, proc, link) {
+        proc_printf(buf, "proc %d context %s%s%s\n", (int) proc->pid,
+                    proc->context != NULL ? proc->context->name : "?",
+                    proc->is_dead ? " dead" : "", proc->frozen ? " frozen" : "");
+        // Work parked on the process rather than a thread is waiting for ANY
+        // thread to come and take it; if this is nonzero while every thread
+        // below is idle, the wakeup is what went wrong.
+        proc_printf(buf, "  todo %zu  outstanding %u  ready_threads %d  max_threads %d\n",
+                    binder_list_count(&proc->todo), proc->outstanding_txns,
+                    proc->ready_threads, proc->max_threads);
+
+        struct binder_thread *thread;
+        list_for_each_entry(&proc->threads, thread, proc_link) {
+            proc_printf(buf, "  thread %d: looper %s%s%s todo %zu",
+                        (int) thread->pid, binder_looper_state(thread->looper),
+                        thread->waiting ? " waiting" : "",
+                        thread->wait_for_proc_work ? " for-proc-work" : "",
+                        binder_list_count(&thread->todo));
+            // A non-empty transaction stack on a thread that is also waiting
+            // is the shape of a deadlock: it is blocked on a reply to a call
+            // it made, and cannot service the call that would produce it.
+            size_t depth = 0;
+            for (struct binder_transaction *t = thread->transaction_stack;
+                 t != NULL && depth < 16; t = t->to_parent)
+                depth++;
+            if (depth > 0)
+                proc_printf(buf, " stack %zu", depth);
+            if (thread->is_dead)
+                proc_printf(buf, " dead");
+            proc_printf(buf, "\n");
+        }
+
+        struct binder_node *node;
+        list_for_each_entry(&proc->nodes, node, proc_link) {
+            proc_printf(buf, "  node %d: refs %zu strong %d/%d weak %d async %zu%s\n",
+                        node->debug_id, binder_list_count(&node->refs),
+                        node->internal_strong_refs, node->local_strong_refs,
+                        node->local_weak_refs, binder_list_count(&node->async_todo),
+                        node->has_async_transaction ? " async-in-flight" : "");
+        }
+
+        struct binder_ref *ref;
+        list_for_each_entry(&proc->refs, ref, proc_link) {
+            proc_printf(buf, "  ref handle %u -> node %d (proc %d) strong %d weak %d%s\n",
+                        ref->desc, ref->node != NULL ? ref->node->debug_id : -1,
+                        ref->node != NULL && ref->node->proc != NULL
+                            ? (int) ref->node->proc->pid : -1,
+                        ref->strong, ref->weak, ref->death != NULL ? " death-requested" : "");
+        }
+    }
+
+    if (list_empty(&binder_procs))
+        proc_printf(buf, "no processes have the driver open\n");
+
+    unlock(&binder_lock);
+    return 0;
+}

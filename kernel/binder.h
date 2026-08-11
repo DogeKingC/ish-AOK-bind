@@ -329,6 +329,12 @@ void binder_create_device_nodes(void);
 // state (and its peers learn about it) without waiting for fd teardown.
 void binder_task_exit(struct task *task);
 
+// Dumps driver state for /proc/ish/binder (fs/proc/ish.c). Declared with the
+// procfs signature so the entry table can point straight at it.
+struct proc_entry;
+struct proc_data;
+int binder_show_state(struct proc_entry *entry, struct proc_data *buf);
+
 // Allocates a minor for a new binderfs device named `name`. Returns the minor,
 // or a negative errno. Used by binderfs's BINDER_CTL_ADD.
 int binder_alloc_minor(const char *name);

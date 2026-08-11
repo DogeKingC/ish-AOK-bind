@@ -90,6 +90,8 @@ need_in fs/proc/pid.c  '{"attr", S_IFDIR'            "attr listed among the pid 
 need_in kernel/exec.c  'security.exec'               "execve consumes the setexeccon context"
 need_in kernel/binder.c BR_TRANSACTION_SEC_CTX \
     "binder delivers the sender's context to a node that asked for one"
+need_in kernel/binder.c binder_show_state "the /proc/ish/binder state dump"
+need_in fs/proc/ish.c   binder_show_state "state dump wired into /proc/ish"
 
 # --- writable /dev/kmsg ---------------------------------------------------
 # Upstream's kmsg_write is a bare `return _EPERM`, so a sync that touches

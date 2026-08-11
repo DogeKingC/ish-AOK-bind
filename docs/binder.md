@@ -156,7 +156,40 @@ its own sg buffers over the context the receiver is about to trust.
 - **Scheduler policy inheritance.** `FLAT_BINDER_FLAG_INHERIT_RT` and the
   priority bits are accepted and ignored; binder priority inheritance has no
   meaning without a real scheduler underneath.
-- **`/binderfs` statistics and `binder_logs` debugfs.** No `/sys/kernel/debug/binder`.
+- **`/binderfs` statistics and `binder_logs` debugfs.** No `/sys/kernel/debug/binder`;
+  `/proc/ish/binder` (below) covers the part that was actually worth having.
+
+## Inspecting driver state
+
+`/proc/ish/binder` dumps what the driver currently believes. Linux puts this in
+debugfs; it lives under `/proc/ish` here because it is an introspection aid
+rather than an interface anyone codes against.
+
+```
+$ cat /proc/ish/binder
+context binder: manager pid 21
+  secctx yes
+context hwbinder: no context manager
+proc 21 context binder
+  todo 0  outstanding 0  ready_threads 1  max_threads 0
+  thread 21: looper entered waiting for-proc-work todo 0
+  node 1: refs 1 strong 1/1 weak 0 async 0
+proc 44 context binder
+  thread 44: looper none todo 0 stack 1
+  ref handle 0 -> node 1 (proc 21) strong 1 weak 0
+```
+
+It exists because "the call hangs" is otherwise unanswerable from inside the
+guest. A transaction to handle 0 that never returns has several distinct causes
+that look identical from outside, and each one is a different line here:
+
+| symptom | reading |
+|---|---|
+| `no context manager` | nobody claimed handle 0; the caller waits forever |
+| `manager pid -1 (owner is gone)` | it registered, then the process died |
+| caller has `stack 1`, manager `todo 1` | the work was queued and nobody dequeued it |
+| manager thread not `waiting for-proc-work` | no thread is available to take it |
+| manager `waiting` with its own `stack` | it is blocked on a reply it must itself produce |
 
 ## Beyond binder
 

@@ -29,6 +29,9 @@
 //                FLAT_BINDER_FLAG_TXN_SECURITY_CTX receives BR_TRANSACTION_SEC_CTX
 //                carrying the *sender's* SELinux context, in the receiver's own
 //                mapping. Run against /dev/hwbinder.
+//   state        /proc/ish/binder reports the live driver state -- which
+//                context manager is registered, and which processes hold the
+//                driver open.
 //   binderfs     Mounting binderfs and creating a device with BINDER_CTL_ADD
 //                makes a new node appear in the directory. SKIPped when the
 //                mount is not permitted.
@@ -604,6 +607,46 @@ static void client_call(struct binder *b, uint32_t flags, struct client_ctx *ctx
     }
 }
 
+// Reads /proc/ish/binder. The driver state dump is the only way to tell the
+// distinct causes of a hung transaction apart from inside the guest, so it has
+// to actually reflect the driver rather than merely exist.
+static int binder_state_contains(const char *needle) {
+    int fd = open("/proc/ish/binder", O_RDONLY);
+    if (fd < 0)
+        return -1;
+    static char buf[65536];
+    size_t used = 0;
+    for (;;) {
+        ssize_t n = read(fd, buf + used, sizeof(buf) - 1 - used);
+        if (n <= 0)
+            break;
+        used += (size_t) n;
+        if (used >= sizeof(buf) - 1)
+            break;
+    }
+    close(fd);
+    buf[used] = '\0';
+    return strstr(buf, needle) != NULL;
+}
+
+static void check_state_reports_manager(void) {
+    char want[64];
+    // The first question to ask about a hung call: is anyone listening on
+    // handle 0, and is it who we think it is?
+    snprintf(want, sizeof(want), "context binder: manager pid %d", (int) getpid());
+    int found = binder_state_contains(want);
+    if (found < 0) {
+        test_logf("skip /proc/ish/binder (not present)\n");
+        return;
+    }
+    check(found, "/proc/ish/binder names the context manager");
+
+    snprintf(want, sizeof(want), "proc %d context binder", (int) getpid());
+    check(binder_state_contains(want) == 1, "/proc/ish/binder lists our process");
+    check(binder_state_contains("no processes have the driver open") == 0,
+          "and does not claim the driver is unused");
+}
+
 static void test_transaction(const char *dev) {
     struct binder server = { .fd = -1 };
     if (binder_open_dev(&server, dev) < 0) {
@@ -622,6 +665,8 @@ static void test_transaction(const char *dev) {
     check(1, "BINDER_SET_CONTEXT_MGR claims handle 0");
     check(ioctl(server.fd, BINDER_SET_CONTEXT_MGR, &zero) < 0 && errno == EBUSY,
           "second BINDER_SET_CONTEXT_MGR is EBUSY");
+
+    check_state_reports_manager();
 
     int sync_pipe[2];
     check(pipe(sync_pipe) == 0, "sync pipe");

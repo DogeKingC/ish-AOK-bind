@@ -4,6 +4,7 @@
 #include "jit/jit.h"
 #include "kernel/errno.h"
 #include "kernel/fs.h"
+#include "kernel/binder.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -440,6 +441,7 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"BAT0_capacity", .show = proc_ish_show_battery_capacity},
     {"BAT0_status", .show = proc_ish_show_battery_status},
     {"UIDevice", .show = proc_ish_show_uidevice},
+    {"binder", .show = binder_show_state},
     {"colors", .show = proc_ish_show_colors},
     {".defaults", S_IFDIR, .readdir = proc_ish_underlying_defaults_readdir},
     {"defaults", S_IFDIR, .readdir = proc_ish_defaults_readdir},
