@@ -79,6 +79,8 @@ need_in fs/mount.c   selinuxfs        "selinuxfs in the filesystems table"
 need_in fs/sock.h    NETLINK_SELINUX_
 need_in fs/sock.c    NETLINK_SELINUX_ "selinux_status_open's netlink fallback is accepted"
 need_in meson.build  fs/selinuxfs.c
+need_in fs/selinuxfs.c selinuxfs_class_index \
+    "class/<name>/index, without which every access check is EINVAL and denied"
 
 # /proc/<pid>/attr/* -- getcon/setcon/setexeccon. Upstream edits fs/proc/pid.c
 # and kernel/exec.c regularly, and both hooks here are small enough to be lost

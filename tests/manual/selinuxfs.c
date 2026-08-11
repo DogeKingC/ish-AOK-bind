@@ -22,6 +22,10 @@
 //                failed load as fatal, so this must report success.
 //   access       the AVC query interface: write a request, read back a verdict
 //                that allows everything and leaves nothing undecided.
+//   classes      class/<name>/index and class/<name>/perms/<perm>, which are
+//                how libselinux resolves a class name. A failed lookup is not
+//                "unknown, carry on" -- it is EINVAL, and servicemanager turns
+//                that into a denial.
 //   netlink      NETLINK_SELINUX opens, which is selinux_status_open's
 //                fallback when the status file is unavailable.
 //   attr         /proc/<pid>/attr/*, which is all getcon/setcon/setexeccon
@@ -207,6 +211,68 @@ static void test_netlink_fallback(void) {
     check(sock >= 0, "NETLINK_SELINUX socket opens");
     if (sock >= 0)
         close(sock);
+}
+
+// class/<name>/index and class/<name>/perms/<perm>: how libselinux turns a
+// class name into a number. This is not a nicety -- when the lookup fails
+// libselinux returns 0 and sets EINVAL, and servicemanager maps a failed
+// selinux_check_access() straight to DENIED. On a stub that permits
+// everything, an unresolvable class name silently becomes a denial.
+static void test_class_lookup(void) {
+    char buf[64];
+    char path[256];
+
+    // The classes Android's own object managers check.
+    static const struct { const char *cls; const char *perm; } known[] = {
+        {"service_manager", "add"},
+        {"service_manager", "find"},
+        {"service_manager", "list"},
+        {"binder", "call"},
+        {"binder", "transfer"},
+        {"hwservice_manager", "add"},
+        {"property_service", "set"},
+    };
+    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+        snprintf(path, sizeof(path), "class/%s/index", known[i].cls);
+        int n = read_file(path, buf, sizeof(buf));
+        check(n > 0 && atoi(buf) > 0, "a known class has a nonzero index");
+        if (n <= 0)
+            test_logf("  missing %s\n", path);
+
+        snprintf(path, sizeof(path), "class/%s/perms/%s", known[i].cls, known[i].perm);
+        n = read_file(path, buf, sizeof(buf));
+        check(n > 0 && atoi(buf) > 0, "a known permission has a nonzero bit");
+    }
+
+    // Permissions of one class must be distinguishable from each other.
+    char add[64], find[64];
+    check(read_file("class/service_manager/perms/add", add, sizeof(add)) > 0 &&
+          read_file("class/service_manager/perms/find", find, sizeof(find)) > 0 &&
+          atoi(add) != atoi(find),
+          "two permissions of a class have different bits");
+
+    // A class we have never heard of still resolves, because refusing would
+    // turn "allowed" into a denial, and every class a future Android adds
+    // would break the same silent way.
+    check(read_file("class/some_future_class/index", buf, sizeof(buf)) > 0 &&
+          atoi(buf) > 0, "an unknown class still resolves to a nonzero index");
+    check(read_file("class/some_future_class/perms/whatever", buf, sizeof(buf)) > 0 &&
+          atoi(buf) > 0, "an unknown permission still resolves to a nonzero bit");
+
+    // Stable across reads: libselinux caches what it gets.
+    char first[64], second[64];
+    check(read_file("class/binder/index", first, sizeof(first)) > 0 &&
+          read_file("class/binder/index", second, sizeof(second)) > 0 &&
+          strcmp(first, second) == 0, "a class index is stable across reads");
+
+    // The directory is browsable, and `class` itself is a directory.
+    snprintf(path, sizeof(path), "%s/class", mnt);
+    struct stat st;
+    check(stat(path, &st) == 0 && S_ISDIR(st.st_mode), "class is a directory");
+    snprintf(path, sizeof(path), "%s/class/binder", mnt);
+    check(stat(path, &st) == 0 && S_ISDIR(st.st_mode), "a class is a directory");
+    snprintf(path, sizeof(path), "%s/class/binder/index", mnt);
+    check(stat(path, &st) == 0 && S_ISREG(st.st_mode), "index is a regular file");
 }
 
 static void test_readdir(void) {
@@ -456,6 +522,7 @@ int main(int argc, char **argv) {
     test_enforce_is_honest();
     test_policy_load();
     test_access_verdict();
+    test_class_lookup();
     test_netlink_fallback();
     test_readdir();
 

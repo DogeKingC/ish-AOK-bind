@@ -72,7 +72,17 @@ enum {
     SELINUXFS_LOAD,
     SELINUXFS_NULL,
     SELINUXFS_ACCESS,
+    SELINUXFS_CLASS,
     SELINUXFS_COUNT,
+    // Below the `class` directory. These have no entry in selinuxfs_names:
+    // their names come from the path being looked up rather than a table,
+    // because ANY class or permission name resolves here. See
+    // selinuxfs_class_index() for why that is the correct behaviour for a
+    // stub that permits everything.
+    SELINUXFS_CLASS_SUBDIR,
+    SELINUXFS_CLASS_INDEX,
+    SELINUXFS_CLASS_PERMS_DIR,
+    SELINUXFS_CLASS_PERM,
 };
 
 static const char *const selinuxfs_names[SELINUXFS_COUNT] = {
@@ -86,6 +96,7 @@ static const char *const selinuxfs_names[SELINUXFS_COUNT] = {
     [SELINUXFS_LOAD] = "load",
     [SELINUXFS_NULL] = "null",
     [SELINUXFS_ACCESS] = "access",
+    [SELINUXFS_CLASS] = "class",
 };
 
 // Fixed contents of the scalar files. NULL means the file is not simply read.
@@ -143,10 +154,16 @@ static int selinuxfs_status_host_fd(void) {
 
 // Per-open state. Only `access` needs any: libselinux writes a query and reads
 // the verdict back from the same descriptor.
+#define SELINUXFS_NAME_MAX 64
+
 struct selinuxfs_open {
     int entry;
     char response[128];
     size_t response_len;
+    // For entries under `class`, taken from the looked-up path: readdir and
+    // getpath have no other way to know which class this is.
+    char class_name[SELINUXFS_NAME_MAX];
+    char perm_name[SELINUXFS_NAME_MAX];
 };
 
 static const struct fd_ops selinuxfs_fdops;
@@ -156,16 +173,140 @@ static int selinuxfs_entry_of(struct fd *fd) {
     return open_state != NULL ? open_state->entry : SELINUXFS_ROOT;
 }
 
-static int selinuxfs_lookup(const char *path) {
+// The classes and permissions Android's userspace object managers check,
+// with their real AOSP values so anything that reads them sees what a device
+// would. Anything NOT listed here still resolves -- see selinuxfs_class_index.
+struct selinuxfs_class {
+    const char *name;
+    unsigned index;
+    const char *perms[8]; // NULL-terminated; bit value is 1 << position
+};
+
+static const struct selinuxfs_class selinuxfs_classes[] = {
+    {"binder", 1, {"impersonate", "call", "set_context_mgr", "transfer", NULL}},
+    {"service_manager", 2, {"add", "find", "list", NULL}},
+    {"hwservice_manager", 3, {"add", "find", "list", NULL}},
+    {"property_service", 4, {"set", NULL}},
+};
+#define SELINUXFS_CLASSES_LEN (sizeof(selinuxfs_classes) / sizeof(selinuxfs_classes[0]))
+
+static const struct selinuxfs_class *selinuxfs_known_class(const char *name) {
+    for (size_t i = 0; i < SELINUXFS_CLASSES_LEN; i++)
+        if (strcmp(selinuxfs_classes[i].name, name) == 0)
+            return &selinuxfs_classes[i];
+    return NULL;
+}
+
+// A stable nonzero value for a name we do not have a table entry for. FNV-1a,
+// folded into the low 15 bits so it fits security_class_t and can never be 0.
+static unsigned selinuxfs_name_hash(const char *name) {
+    uint32_t h = 2166136261u;
+    for (const char *p = name; *p != '\0'; p++) {
+        h ^= (unsigned char) *p;
+        h *= 16777619u;
+    }
+    return (h & 0x7fff) | 0x4000; // nonzero, and out of the way of the table
+}
+
+// Every class name resolves, known or not, and this is deliberate.
+//
+// libselinux turns a class name into a number by reading class/<name>/index,
+// and when that read fails it returns 0 and sets EINVAL. Callers do not treat
+// that as "unknown class, carry on" -- servicemanager's actionAllowed() maps a
+// failed selinux_check_access() straight to DENIED. So on a stub that permits
+// everything, refusing to resolve a name converts "allowed" into "denied",
+// which is the opposite of what this filesystem is for. It also means every
+// class a future Android adds would break in the same silent way.
+static unsigned selinuxfs_class_index(const char *name) {
+    const struct selinuxfs_class *known = selinuxfs_known_class(name);
+    return known != NULL ? known->index : selinuxfs_name_hash(name);
+}
+
+// Same reasoning for permission bits. Two unknown permissions of the same class
+// can land on the same bit; that is harmless here because the access vector
+// grants all 32 bits regardless, and nothing audits.
+static unsigned selinuxfs_perm_value(const char *class_name, const char *perm) {
+    const struct selinuxfs_class *known = selinuxfs_known_class(class_name);
+    if (known != NULL) {
+        for (int i = 0; known->perms[i] != NULL; i++)
+            if (strcmp(known->perms[i], perm) == 0)
+                return 1u << i;
+    }
+    return 1u << (selinuxfs_name_hash(perm) % 32);
+}
+
+// Copies one path component into buf. Returns false if it is empty or too long.
+static bool selinuxfs_component(const char *start, size_t len, char *buf) {
+    if (len == 0 || len >= SELINUXFS_NAME_MAX)
+        return false;
+    memcpy(buf, start, len);
+    buf[len] = '\0';
+    return true;
+}
+
+// Fills in class_name/perm_name when the path names something under `class`.
+// Both may be NULL if the caller only wants the entry id.
+static int selinuxfs_lookup_full(const char *path, char *class_name, char *perm_name) {
+    if (class_name != NULL)
+        class_name[0] = '\0';
+    if (perm_name != NULL)
+        perm_name[0] = '\0';
+
     if (path[0] == '\0')
         return SELINUXFS_ROOT;
-    if (path[0] != '/' || path[1] == '\0' || strchr(path + 1, '/') != NULL)
+    if (path[0] != '/')
+        return _ENOENT;
+    const char *p = path + 1;
+    if (*p == '\0')
+        return SELINUXFS_ROOT;
+
+    static const char prefix[] = "class";
+    size_t prefix_len = sizeof(prefix) - 1;
+    if (strncmp(p, prefix, prefix_len) == 0 && (p[prefix_len] == '\0' || p[prefix_len] == '/')) {
+        if (p[prefix_len] == '\0')
+            return SELINUXFS_CLASS;
+        const char *name = p + prefix_len + 1;
+        const char *slash = strchr(name, '/');
+        size_t name_len = slash != NULL ? (size_t) (slash - name) : strlen(name);
+        char local[SELINUXFS_NAME_MAX];
+        if (!selinuxfs_component(name, name_len, local))
+            return _ENOENT;
+        if (class_name != NULL)
+            strcpy(class_name, local);
+        if (slash == NULL)
+            return SELINUXFS_CLASS_SUBDIR;
+
+        const char *rest = slash + 1;
+        if (strcmp(rest, "index") == 0)
+            return SELINUXFS_CLASS_INDEX;
+        if (strcmp(rest, "perms") == 0)
+            return SELINUXFS_CLASS_PERMS_DIR;
+        static const char perms[] = "perms/";
+        if (strncmp(rest, perms, sizeof(perms) - 1) == 0) {
+            const char *perm = rest + sizeof(perms) - 1;
+            if (strchr(perm, '/') != NULL)
+                return _ENOENT;
+            char plocal[SELINUXFS_NAME_MAX];
+            if (!selinuxfs_component(perm, strlen(perm), plocal))
+                return _ENOENT;
+            if (perm_name != NULL)
+                strcpy(perm_name, plocal);
+            return SELINUXFS_CLASS_PERM;
+        }
+        return _ENOENT;
+    }
+
+    if (strchr(p, '/') != NULL)
         return _ENOENT;
     for (int i = 1; i < SELINUXFS_COUNT; i++) {
-        if (strcmp(path + 1, selinuxfs_names[i]) == 0)
+        if (strcmp(p, selinuxfs_names[i]) == 0)
             return i;
     }
     return _ENOENT;
+}
+
+static int selinuxfs_lookup(const char *path) {
+    return selinuxfs_lookup_full(path, NULL, NULL);
 }
 
 static void selinuxfs_stat_entry(int entry, struct statbuf *stat) {
@@ -175,6 +316,18 @@ static void selinuxfs_stat_entry(int entry, struct statbuf *stat) {
     if (entry == SELINUXFS_ROOT) {
         stat->mode = S_IFDIR | 0755;
         stat->nlink = 2;
+        return;
+    }
+    if (entry == SELINUXFS_CLASS || entry == SELINUXFS_CLASS_SUBDIR ||
+            entry == SELINUXFS_CLASS_PERMS_DIR) {
+        stat->mode = S_IFDIR | 0555;
+        stat->nlink = 2;
+        return;
+    }
+    if (entry == SELINUXFS_CLASS_INDEX || entry == SELINUXFS_CLASS_PERM) {
+        // Size is left at 0: the value is computed per open, and libselinux
+        // reads these rather than sizing them.
+        stat->mode = S_IFREG | 0444;
         return;
     }
     // Everything is world-readable; the interfaces userspace writes to are
@@ -206,7 +359,8 @@ static void selinuxfs_stat_entry(int entry, struct statbuf *stat) {
 
 static struct fd *selinuxfs_open(struct mount *UNUSED(mount), const char *path, int UNUSED(flags),
                                  int UNUSED(mode)) {
-    int entry = selinuxfs_lookup(path);
+    char class_name[SELINUXFS_NAME_MAX], perm_name[SELINUXFS_NAME_MAX];
+    int entry = selinuxfs_lookup_full(path, class_name, perm_name);
     if (entry < 0)
         return ERR_PTR(entry);
     struct fd *fd = fd_create(&selinuxfs_fdops);
@@ -218,6 +372,19 @@ static struct fd *selinuxfs_open(struct mount *UNUSED(mount), const char *path, 
         return ERR_PTR(_ENOMEM);
     }
     open_state->entry = entry;
+    strcpy(open_state->class_name, class_name);
+    strcpy(open_state->perm_name, perm_name);
+    // The class files have no fixed contents, so their value is rendered once
+    // here and served from the same buffer the access verdict uses.
+    if (entry == SELINUXFS_CLASS_INDEX) {
+        open_state->response_len = (size_t) snprintf(
+            open_state->response, sizeof(open_state->response), "%u",
+            selinuxfs_class_index(class_name));
+    } else if (entry == SELINUXFS_CLASS_PERM) {
+        open_state->response_len = (size_t) snprintf(
+            open_state->response, sizeof(open_state->response), "%u",
+            selinuxfs_perm_value(class_name, perm_name));
+    }
     fd->data = open_state;
     return fd;
 }
@@ -238,6 +405,9 @@ static ssize_t selinuxfs_read(struct fd *fd, void *buf, size_t bufsize) {
     switch (open_state->entry) {
         case SELINUXFS_ACCESS:
             // Whatever verdict the last write computed.
+        case SELINUXFS_CLASS_INDEX:
+        case SELINUXFS_CLASS_PERM:
+            // Rendered at open time from the path.
             src = open_state->response;
             len = open_state->response_len;
             break;
@@ -341,25 +511,92 @@ static int selinuxfs_poll(struct fd *UNUSED(fd)) {
 }
 
 static int selinuxfs_readdir(struct fd *fd, struct dir_entry *entry) {
-    if (selinuxfs_entry_of(fd) != SELINUXFS_ROOT)
-        return _ENOTDIR;
-    int index = (int) fd->offset + 1; // entry 0 is the root itself
-    if (index >= SELINUXFS_COUNT)
-        return 0;
-    fd->offset = index;
-    strcpy(entry->name, selinuxfs_names[index]);
-    entry->inode = index + 1;
-    entry->type = DT_REG;
-    return 1;
+    struct selinuxfs_open *open_state = fd->data;
+    int which = selinuxfs_entry_of(fd);
+    long index = (long) fd->offset;
+
+    switch (which) {
+        case SELINUXFS_ROOT: {
+            index += 1; // entry 0 is the root itself
+            if (index >= SELINUXFS_COUNT)
+                return 0;
+            fd->offset = (unsigned long) index;
+            strcpy(entry->name, selinuxfs_names[index]);
+            entry->inode = (unsigned) index + 1;
+            entry->type = index == SELINUXFS_CLASS ? DT_DIR : DT_REG;
+            return 1;
+        }
+
+        case SELINUXFS_CLASS: {
+            // Only the classes we have a table entry for are listed. Any name
+            // still resolves on lookup, but a directory listing has to be
+            // finite, and these are the ones worth showing.
+            if (index >= (long) SELINUXFS_CLASSES_LEN)
+                return 0;
+            fd->offset = (unsigned long) index + 1;
+            strcpy(entry->name, selinuxfs_classes[index].name);
+            entry->inode = selinuxfs_classes[index].index + 1000;
+            entry->type = DT_DIR;
+            return 1;
+        }
+
+        case SELINUXFS_CLASS_SUBDIR: {
+            static const char *const children[] = {"index", "perms"};
+            if (index >= 2)
+                return 0;
+            fd->offset = (unsigned long) index + 1;
+            strcpy(entry->name, children[index]);
+            entry->inode = 2000 + (unsigned) index;
+            entry->type = index == 0 ? DT_REG : DT_DIR;
+            return 1;
+        }
+
+        case SELINUXFS_CLASS_PERMS_DIR: {
+            if (open_state == NULL)
+                return 0;
+            const struct selinuxfs_class *known =
+                selinuxfs_known_class(open_state->class_name);
+            // An unknown class has no enumerable permissions -- every name
+            // resolves, so there is no list to give. Empty is the honest
+            // answer, and nothing scans this directory.
+            if (known == NULL || known->perms[index] == NULL)
+                return 0;
+            fd->offset = (unsigned long) index + 1;
+            strcpy(entry->name, known->perms[index]);
+            entry->inode = 3000 + (unsigned) index;
+            entry->type = DT_REG;
+            return 1;
+        }
+
+        default:
+            return _ENOTDIR;
+    }
 }
 
 static int selinuxfs_getpath(struct fd *fd, char *buf) {
+    struct selinuxfs_open *open_state = fd->data;
     int entry = selinuxfs_entry_of(fd);
-    if (entry == SELINUXFS_ROOT)
-        strcpy(buf, "");
-    else
-        snprintf(buf, MAX_PATH, "/%s", selinuxfs_names[entry]);
-    return 0;
+    switch (entry) {
+        case SELINUXFS_ROOT:
+            strcpy(buf, "");
+            return 0;
+        case SELINUXFS_CLASS_SUBDIR:
+            snprintf(buf, MAX_PATH, "/class/%s", open_state->class_name);
+            return 0;
+        case SELINUXFS_CLASS_INDEX:
+            snprintf(buf, MAX_PATH, "/class/%s/index", open_state->class_name);
+            return 0;
+        case SELINUXFS_CLASS_PERMS_DIR:
+            snprintf(buf, MAX_PATH, "/class/%s/perms", open_state->class_name);
+            return 0;
+        case SELINUXFS_CLASS_PERM:
+            snprintf(buf, MAX_PATH, "/class/%s/perms/%s", open_state->class_name,
+                     open_state->perm_name);
+            return 0;
+        default:
+            snprintf(buf, MAX_PATH, "/%s", selinuxfs_names[entry]);
+            return 0;
+    }
 }
 
 static int selinuxfs_stat(struct mount *UNUSED(mount), const char *path, struct statbuf *stat) {
