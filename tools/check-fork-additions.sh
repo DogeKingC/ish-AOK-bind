@@ -112,6 +112,9 @@ need_in fs/mem.c     ish_log_write_record "kmsg_write is not EPERM any more"
 need_file tests/manual/proc_random.c
 need_in fs/proc/sys.c boot_id_lock "boot_id is generated under a lock"
 
+# --- Android chroot setup --------------------------------------------------
+need_file tools/android-chroot-setup.sh
+
 # --- shared ---------------------------------------------------------------
 need_file kernel/ioctl_abi.h
 
