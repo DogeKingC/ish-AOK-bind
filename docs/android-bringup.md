@@ -120,8 +120,8 @@ a regular file -- a plain file at that path swallows every message.
 **As an iSH root (preferred).** iSH mounts `/proc`, `/sys` and `/dev/pts` at
 boot, creates `/dev/binder`, `/dev/ashmem` and `/dev/dma_heap` itself, and
 builds `/dev/__properties__` from the tree's own `build.prop` files, so almost
-nothing is left to do. See `tools/android-root-profile.sh` for the session
-profile, and note:
+nothing is left to do. See `/AOK/tools/android/root-profile.sh`
+(`opt/AOK/tools/android/` in the tree) for the session profile, and note:
 
 - The launch/boot commands must be set explicitly. **Do not leave Boot Command
   at `/sbin/init`**: Android has no `/sbin/init`, and iSH's fallback list starts
@@ -145,8 +145,8 @@ profile, and note:
   delete the app; that destroys the tree.
 
 **In a chroot.** Works, but mounts do not survive an app restart, so it needs
-re-preparing on every launch. `tools/android-chroot-setup.sh` does the whole
-thing and verifies it from inside the chroot. Four separate debugging rounds
+re-preparing on every launch. `/AOK/tools/android/chroot-setup.sh` does the
+whole thing and verifies it from inside the chroot. Four separate debugging rounds
 were lost to setup drift before it existed, each presenting as a different
 Android failure.
 

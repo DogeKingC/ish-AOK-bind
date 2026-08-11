@@ -2,7 +2,7 @@
 # Prepares an Android system tree for chroot under iSH-AOK.
 #
 # Run it once per iSH launch, before chrooting:
-#     sh android-chroot-setup.sh /root/android-sys
+#     sh /AOK/tools/android/chroot-setup.sh /root/android-sys
 #
 # Mounts do NOT survive an app restart, so this needs re-running after every
 # update or relaunch even though the tree itself persists. Device nodes and the

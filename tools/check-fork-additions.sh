@@ -127,8 +127,9 @@ need_file tests/manual/proc_random.c
 need_in fs/proc/sys.c boot_id_lock "boot_id is generated under a lock"
 
 # --- Android chroot setup --------------------------------------------------
-need_file tools/android-chroot-setup.sh
-need_file tools/android-root-profile.sh
+need_file opt/AOK/tools/android/chroot-setup.sh
+need_file opt/AOK/tools/android/root-profile.sh
+need_in fs/aok-tools.manifest android/chroot-setup.sh "shipped to /AOK/tools on the device"
 need_file docs/android-bringup.md
 
 # --- shared ---------------------------------------------------------------

@@ -57,6 +57,11 @@ enum aokfs_node_kind {
     // /tools readdir below, or the files exist in the table but nothing can
     // reach them.
     aokfs_tools_crypto_dir,
+    // Same again, rooted at /tools/android/ (the two scripts for running an
+    // Android system tree, plus their README). They are guest-side scripts
+    // that have to be ON the device to be useful -- a chroot cannot be set up
+    // from a copy that only exists in the repo.
+    aokfs_tools_android_dir,
     // /docs is flat (no subdirectories) -- same generated-table pattern as
     // /tools, minus the ktop-style subdirectory case.
     aokfs_docs_dir,
@@ -119,6 +124,7 @@ static bool aokfs_node_is_dir(enum aokfs_node_kind node) {
         node == aokfs_tools_ktop_dir ||
         node == aokfs_tools_pixman_dir ||
         node == aokfs_tools_crypto_dir ||
+        node == aokfs_tools_android_dir ||
         node == aokfs_docs_dir;
 }
 
@@ -196,6 +202,8 @@ static const char *aokfs_node_path(enum aokfs_node_kind node) {
             return "/tools/pixman";
         case aokfs_tools_crypto_dir:
             return "/tools/crypto";
+        case aokfs_tools_android_dir:
+            return "/tools/android";
         case aokfs_tests_audio_dir:
             return "/tests/audio";
         case aokfs_audio_raw:
@@ -237,6 +245,7 @@ static bool aokfs_lookup_node(const char *path, enum aokfs_node_kind *node_out) 
         aokfs_tools_ktop_dir,
         aokfs_tools_pixman_dir,
         aokfs_tools_crypto_dir,
+        aokfs_tools_android_dir,
         aokfs_tests_audio_dir,
         aokfs_audio_raw,
         aokfs_audio_wav,
@@ -777,6 +786,7 @@ static int aokfs_readdir(struct fd *fd, struct dir_entry *entry) {
                 aokfs_tools_ktop_dir,
                 aokfs_tools_pixman_dir,
                 aokfs_tools_crypto_dir,
+                aokfs_tools_android_dir,
             };
             size_t nfixed = sizeof(tools_fixed) / sizeof(tools_fixed[0]);
             size_t want = (size_t) fd->offset++;
@@ -805,7 +815,8 @@ static int aokfs_readdir(struct fd *fd, struct dir_entry *entry) {
         }
         case aokfs_tools_ktop_dir:
         case aokfs_tools_pixman_dir:
-        case aokfs_tools_crypto_dir: {
+        case aokfs_tools_crypto_dir:
+        case aokfs_tools_android_dir: {
             // One /tools/<name>/ subdirectory: the same generated-table scan
             // /tools itself does, but rooted at this node's own path, so a new
             // subdirectory needs no code here beyond its case label.
