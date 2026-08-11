@@ -106,6 +106,10 @@ static bool user_range_valid_mem(struct task *task, struct mem *mem, guest_addr_
 }
 
 static int __user_read_task_mem(struct task *task, struct mem *mem, guest_addr_t addr, void *buf, size_t count) {
+    // A tagged guest pointer is a normal thing for an arm64 guest to hand a
+    // syscall; Linux untags at exactly this boundary. See
+    // guest_abi_untag_addr() in kernel/abi.h.
+    addr = (guest_addr_t) guest_abi_untag_addr(task->abi, addr);
     if (!user_range_valid_mem(task, mem, addr, count))
         return 1;
     char *cbuf = (char *) buf;
@@ -127,6 +131,10 @@ static int __user_read_task_mem(struct task *task, struct mem *mem, guest_addr_t
 }
 
 static int __user_write_task_mem(struct task *task, struct mem *mem, guest_addr_t addr, const void *buf, size_t count, bool ptrace) {
+    // A tagged guest pointer is a normal thing for an arm64 guest to hand a
+    // syscall; Linux untags at exactly this boundary. See
+    // guest_abi_untag_addr() in kernel/abi.h.
+    addr = (guest_addr_t) guest_abi_untag_addr(task->abi, addr);
     if (!user_range_valid_mem(task, mem, addr, count))
         return 1;
     const char *cbuf = (const char *) buf;
@@ -465,6 +473,10 @@ int user_write(guest_addr_t addr, const void *buf, size_t count) {
 }
 
 int user_read_string(guest_addr_t addr, char *buf, size_t max) {
+    // A tagged guest pointer is a normal thing for an arm64 guest to hand a
+    // syscall; Linux untags at exactly this boundary. See
+    // guest_abi_untag_addr() in kernel/abi.h.
+    addr = (guest_addr_t) guest_abi_untag_addr(current->abi, addr);
     if (addr == 0)
         return 1;
     if (max == 0)
@@ -500,6 +512,10 @@ int user_read_string(guest_addr_t addr, char *buf, size_t max) {
 // (returns _ENAMETOOLONG, matching Linux for paths longer than PATH_MAX).
 // Returns 0 on success. Callers should propagate the return value directly.
 int user_read_path(guest_addr_t addr, char *buf, size_t max) {
+    // A tagged guest pointer is a normal thing for an arm64 guest to hand a
+    // syscall; Linux untags at exactly this boundary. See
+    // guest_abi_untag_addr() in kernel/abi.h.
+    addr = (guest_addr_t) guest_abi_untag_addr(current->abi, addr);
     if (addr == 0)
         return _EFAULT;
     if (max == 0)
@@ -532,6 +548,10 @@ int user_read_path(guest_addr_t addr, char *buf, size_t max) {
 }
 
 int user_write_string(guest_addr_t addr, const char *buf) {
+    // A tagged guest pointer is a normal thing for an arm64 guest to hand a
+    // syscall; Linux untags at exactly this boundary. See
+    // guest_abi_untag_addr() in kernel/abi.h.
+    addr = (guest_addr_t) guest_abi_untag_addr(current->abi, addr);
     if (addr == 0) {
         return 1;
     }

@@ -95,6 +95,11 @@ static inline void arm64_reg_set_sp(struct cpu_state *cpu, unsigned n, bool sf, 
 
 static inline bool arm64_mem_read(struct cpu_state *cpu, struct tlb *tlb,
         guest_addr_t addr, void *out, unsigned size) {
+    // TBI: the top byte is a tag, not part of the address. The JIT's
+    // read_prep/write_prep (jit/guest-arm64/gadgets.h) already strips it;
+    // without the same here, an instruction that lands on the interpreter
+    // faults on a pointer the JIT would have handled.
+    addr = (guest_addr_t) guest_abi_untag_addr(GUEST_ABI_ARM64, addr);
     if (!guest_abi_range_valid(GUEST_ABI_ARM64, addr, size)) {
         cpu->segfault_addr = addr;
         cpu->segfault_was_write = false;
@@ -111,6 +116,11 @@ static inline bool arm64_mem_read(struct cpu_state *cpu, struct tlb *tlb,
 
 static inline bool arm64_mem_write(struct cpu_state *cpu, struct tlb *tlb,
         guest_addr_t addr, const void *value, unsigned size) {
+    // TBI: the top byte is a tag, not part of the address. The JIT's
+    // read_prep/write_prep (jit/guest-arm64/gadgets.h) already strips it;
+    // without the same here, an instruction that lands on the interpreter
+    // faults on a pointer the JIT would have handled.
+    addr = (guest_addr_t) guest_abi_untag_addr(GUEST_ABI_ARM64, addr);
     if (!guest_abi_range_valid(GUEST_ABI_ARM64, addr, size)) {
         cpu->segfault_addr = addr;
         cpu->segfault_was_write = true;

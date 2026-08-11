@@ -4747,6 +4747,21 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
                    (unsigned long long) cpu->arm64_sp,
                    (unsigned long long) cpu->arm64_pc,
                    (unsigned long long) cpu->arm64_tpidr);
+            // A fault address with a top byte set is a TBI-tagged pointer that
+            // reached somewhere it should have been untagged. Saying so here
+            // costs one line and is the difference between "a wild pointer"
+            // and "one missing mask" -- which is exactly how long the first
+            // one of these took to work out.
+            guest_addr_t untagged =
+                (guest_addr_t) guest_abi_untag_addr(GUEST_ABI_ARM64, cpu->segfault_addr);
+            if (untagged != cpu->segfault_addr)
+                printk("  TAGGED POINTER: tag=%#x untagged=%#llx (%s) -- "
+                       "this address should have been untagged before it got here\n",
+                       (unsigned) (cpu->segfault_addr >> 56),
+                       (unsigned long long) untagged,
+                       mem_ptr_fault(current->mem, untagged,
+                                     cpu->segfault_was_write ? MEM_WRITE : MEM_READ) != NULL
+                           ? "mapped" : "unmapped");
             dump_addr_backing("  pc-backing", current_fault_ip(cpu));
             dump_arm64_fault_memdump(cpu);
             arm64_watch_dump();

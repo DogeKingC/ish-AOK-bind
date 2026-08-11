@@ -193,6 +193,27 @@ static inline bool guest_abi_addr_valid(enum guest_abi abi, qword_t addr) {
     return addr < guest_abi_user_addr_max(abi);
 }
 
+// AArch64's Top Byte Ignore: the hardware discards bits 56-63 of a data
+// address on dereference, and bionic uses that to carry a heap tag in them
+// (Scudo's TBI tagging level, which needs no MTE hardware -- AT_HWCAP2 is 0
+// here and it is enabled anyway). A tagged pointer is therefore *normal*, not
+// a bug: every Android process makes them, and the first tagged memset in
+// libc's startup faults without this.
+//
+// Linux calls this untagged_addr() and applies it at the boundaries where the
+// kernel dereferences a user pointer -- deliberately NOT to mmap/munmap/
+// mprotect addresses, which must be untagged by the caller. The placement is
+// copied here for the same reason: an mmap that silently mapped at the
+// tagged address would be a worse bug than the fault it replaced.
+//
+// Only ARM64 does this. i386 has no spare bits, and amd64's LAM is not
+// something any guest here enables.
+static inline qword_t guest_abi_untag_addr(enum guest_abi abi, qword_t addr) {
+    if (abi == GUEST_ABI_ARM64)
+        return addr & 0x00ffffffffffffffULL;
+    return addr;
+}
+
 static inline bool guest_abi_range_valid(enum guest_abi abi, qword_t addr, qword_t size) {
     qword_t max = guest_abi_user_addr_max(abi);
     if (addr >= max)
