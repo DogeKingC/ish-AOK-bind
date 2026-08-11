@@ -19,6 +19,17 @@
 # the reply topic, split across several messages when it is large. ntfy.sh is a
 # public relay and needs no account.
 #
+# ISH_REMOTE_CMD_URL exists because the relay's free tier rate-limits the
+# SENDER, and the sender is the one end that cannot simply wait: a debugging
+# session is a stream of commands. Point it at any URL whose contents the far
+# end can update -- a file on a git forge's raw view is the obvious one, since
+# it needs no account on this side and no quota on theirs. Replies still go to
+# the relay, which is fine: they are a fraction of the traffic and they come
+# from this device rather than from whoever is driving it.
+#
+# Same line format either way, so nothing else changes:
+#     ISH-REMOTE <code> <id> <base64 of the command>
+#
 # --keepalive addresses the thing that otherwise makes this useless on a phone:
 # iOS suspends the app the moment it stops being frontmost, so the listener only
 # polls while you are staring at it -- which is exactly when you are not reading
@@ -50,12 +61,14 @@
 #   ISH_REMOTE_INTERVAL  seconds between polls     (default 4)
 #   ISH_REMOTE_MAX       stop after N polls        (default 900, ~1h at 4s)
 #   ISH_REMOTE_DSP       audio device for --keepalive (default /dev/dsp)
+#   ISH_REMOTE_CMD_URL   fetch commands from this URL instead of the relay
 #   ISH_REMOTE_INLINE    bytes per reply message, split above it (default 3000)
 
 set -u
 
 base="${ISH_REMOTE_BASE:-https://ntfy.sh}"
 dsp="${ISH_REMOTE_DSP:-/dev/dsp}"
+cmd_url="${ISH_REMOTE_CMD_URL:-}"
 interval="${ISH_REMOTE_INTERVAL:-4}"
 max="${ISH_REMOTE_MAX:-900}"
 inline_max="${ISH_REMOTE_INLINE:-3000}"
@@ -157,7 +170,11 @@ rm -f "$stopflag"
 
 echo "================================================================"
 echo " ish-remote listening"
-echo "   command topic: $base/$ct"
+if [ -n "$cmd_url" ]; then
+    echo "   commands from: $cmd_url  (no relay quota on the sending side)"
+else
+    echo "   command topic: $base/$ct"
+fi
 echo "   reply topic:   $base/$ot"
 echo "   WARNING: every command sent with this code runs here, as you."
 echo "   Ctrl-C to stop. Do not leave it running."
@@ -206,7 +223,14 @@ while [ "$i" -lt "$max" ]; do
     # meantime queues several commands and they all arrive at once on resume.
     # Taking only the latest silently dropped the rest, which looks from the
     # far end like commands vanishing.
-    if ! batch=$(net_get "$base/$ct/json?poll=1&since=all"); then
+    if [ -n "$cmd_url" ]; then
+        # Cache-busted: a CDN in front of the file will otherwise serve a
+        # stale copy for minutes, which reads as the channel being dead.
+        fetch_url="$cmd_url?cb=$(date +%s 2>/dev/null || echo $i)"
+    else
+        fetch_url="$base/$ct/json?poll=1&since=all"
+    fi
+    if ! batch=$(net_get "$fetch_url"); then
         # Three failed tries in a row. Say it once per stretch rather than
         # every poll, and keep going: connectivity usually comes back.
         [ "$net_fails" -eq 1 ] && echo "!! poll failed: $net_error" >&2
@@ -222,9 +246,14 @@ while [ "$i" -lt "$max" ]; do
     while IFS= read -r msg; do
         [ -n "$msg" ] || continue
 
-    # The payload is "ISH-REMOTE <code> <id> <base64>", all JSON-safe
-    # characters, so a plain field extraction is enough -- no JSON parser.
-    payload=$(printf '%s' "$msg" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
+    # The relay wraps each command in JSON; a plain URL serves the line as-is.
+    # Telling them apart on the leading brace avoids needing to know which
+    # source this is, and a JSON parser is not required either way because the
+    # payload is deliberately all JSON-safe characters.
+    case "$msg" in
+        \{*) payload=$(printf '%s' "$msg" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p') ;;
+        *)   payload="$msg" ;;
+    esac
     set -- $payload
     [ "${1:-}" = "ISH-REMOTE" ] || continue
     [ "${2:-}" = "$code" ] || continue          # wrong code: not for us
