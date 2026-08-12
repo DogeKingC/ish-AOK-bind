@@ -188,3 +188,60 @@ no second chance and would sleep forever with a transaction queued. It has never
 reproduced: `binder_ipc`'s poll phase drives delivery purely through epoll and
 passes consistently. Fixing it properly means deferring the wakeup until after
 `binder_lock` is released, which is why it has not been done on a hunch.
+
+## arm64 tagged pointers (TBI): fixed, and one open case
+
+AArch64 discards bits 56-63 of a data address on dereference, and bionic's
+Scudo puts a heap tag there even with no MTE hardware (`AT_HWCAP2` is 0 here).
+So under Android essentially every pointer libc touches is tagged, and an
+emulator that treats the tag as part of the address rejects a good pointer.
+The symptom is `SEGV_MAPERR` on an address that is genuinely mapped.
+
+`tests/manual/arm64/tagged_pointer.c` covers this. `/AOK/tools/ish-remote.sh`
+is what made it practical to iterate: the reproduction is on a device, and
+each experiment costs seconds rather than a build cycle.
+
+**Fixed.** The tag was stripped in exactly one place, the JIT's TLB fast path
+(`jit/guest-arm64/gadgets.h`, `read_prep`/`write_prep`). Everything else saw
+it raw:
+
+- `jit/guest-arm64/atomics.S` -- every gadget there builds its own address
+  instead of going through the prep macros, because an exclusive must keep the
+  guest address for the monitor and hand it to `arm64_cas` itself. All six
+  (`ldxr`, `stxr`, `cas`, `casp`, `ldxp`, `stxp`) were unmasked. Confirmed on
+  device from a precisely-attributed fault on `STLXR W15, X17, [X1]`: an
+  `__atomic_fetch_add` on a tagged pointer died while `__atomic_store_n` and
+  `__atomic_load_n` on the same address passed, because those lower to
+  STLR/LDAR, which do go through the prep macros. The monitor address is
+  masked too -- on hardware an LDXR tagged A pairs with an STXR tagged B, so
+  keeping the tag in `excl_addr` would make them miss and spin.
+- `kernel/user.c` and `emu/arm64_interp.c` -- untagged at the boundaries
+  Linux applies `untagged_addr()` to, via `guest_abi_untag_addr()`
+  (`kernel/abi.h`). NOT applied to mmap/munmap/mprotect, which Linux leaves
+  to the caller: silently mapping at a tagged address would be worse than the
+  fault it replaced.
+
+**Open: libc `memset`/`memcpy` on a tagged pointer.** The test's bulk probes
+still die at every size. What is known:
+
+- It is not the tag reaching an unmasked instruction. `strb`, `ldrb`, `dup`,
+  `str q0` and `stp q0,q0` all pass in isolation against the same tagged
+  address in the same process.
+- It is not the build flags. The real test fails built plainly and built with
+  `-pthread -lm -ldl`; a minimal repro passes either way.
+- It is not `dc zva`, the size of a preceding memset, a `printf` between, or
+  the parent writing the page before forking. Each was tested and cleared.
+- `memset` resolves to the same address in a passing and a failing binary, so
+  it is the same code being executed.
+- A near-verbatim standalone replica of the failing probe DOES crash, while a
+  bisected version of that same replica does not -- so it is sensitive to the
+  binary's layout rather than to any element of the source.
+
+The fault is always reported at the callee's FIRST instruction -- `dup
+v0.16b, w1` for memset, `add x4, x1, x2` for memcpy -- neither of which has a
+memory operand. `memory.S`'s fault-restart contract says the reported PC
+should name the faulting sub-instruction, so either that contract is not
+holding here or the fault is raised at a block boundary rather than by an
+access. Resolving that is the next step: an attribution that names an
+arithmetic instruction as the faulting one has misled this hunt repeatedly,
+and it is worth trusting only after it has been checked.
