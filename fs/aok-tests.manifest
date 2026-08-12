@@ -72,12 +72,16 @@ getpeername_smallbuf.c
 netlink_route.c
 netlink_audit.c
 mount_flags.c
+devtmpfs_mount.c
 clone_error_cleanup.c
 uts_namespace.c
 posix_timer_fork.c
 vfork_fatal_signal.c
+vfork_exec_stale_jit.c
+vfork_exec_stale_jit_peer.c
 getppid_thread.c
 concurrent_exec_tlb.c
+exec_i386_fault_addr.c
 random_seed.c
 getrusage_group.c
 pty_line_discipline.c
@@ -134,6 +138,7 @@ ftruncate_fd_mode.c
 syscall_wiring.c
 sysfs_cpu_topology.c
 x86/amd64_regress.c
+x86/amd64_incdec.c
 x86/avx_regress.c
 x86/avx32_smoke.c
 x86/amd64_jit_bench.sh

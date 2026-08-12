@@ -799,20 +799,23 @@ static bool gen_arm64_fits_block(struct gen_state *state, uint64_t end_ip) {
     return end_ip - state->block->addr <= PAGE_SIZE;
 }
 
-// Bisection escape hatch: ISH_ARM64_NO_FUSE=1 disables the arm64 lookahead
-// fusion passes (compare+branch, load+store RMW, load+compare) so a
-// deterministic miscompilation can be pinned to a fusion vs. the base
-// gadgets. Evaluated once; no hot-path cost.
-static bool arm64_fusion_disabled(void) {
-    static int cached = -1;
-    if (cached < 0)
-        cached = getenv("ISH_ARM64_NO_FUSE") != NULL ? 1 : 0;
-    return cached == 1;
+// Bisection escape hatch AND measurement switch: ISH_ARM64_NO_FUSE=1 disables all
+// three arm64 lookahead fusion passes (compare+branch, load+store RMW,
+// load+compare) so a deterministic miscompilation can be pinned to a fusion vs.
+// the base gadgets, and /proc/ish/arm64_jit_fuse turns each pass on and off
+// INDIVIDUALLY at runtime so one can be sized without rebuilding.
+//
+// The `static int cached` this replaced was a correctness hazard for the proc
+// node, not just a missed feature: it would have frozen the answer at the first
+// translated block and silently ignored every later write. Read live instead --
+// one relaxed atomic load per fusion attempt, at translation time.
+static bool arm64_fuse_pass_enabled(unsigned bit) {
+    return (arm64_jit_fuse_mask() & bit) != 0;
 }
 
 static void *gen_arm64_peek_bcond(struct gen_state *state, struct tlb *tlb,
         void *const table[14], uint64_t *taken_out, uint64_t *fallthrough_out) {
-    if (arm64_fusion_disabled())
+    if (!arm64_fuse_pass_enabled(JIT_FUSE_A64_BCOND))
         return NULL;
     uint32_t next;
     if (!tlb_read(tlb, state->arm64_ip, &next, sizeof(next)))
@@ -892,7 +895,7 @@ __attribute__((constructor)) static void arm64_probe_host_caps(void) {
 // extra instructions are consumed); false leaves state untouched.
 static bool gen_arm64_try_ldst_fusion(struct gen_state *state, struct tlb *tlb,
         unsigned size, unsigned rt, unsigned rn, uint64_t off) {
-    if (arm64_fusion_disabled())
+    if (!arm64_fuse_pass_enabled(JIT_FUSE_A64_LDST))
         return false;
     extern void gadget_arm64_rmw_addi_fast64(void), gadget_arm64_rmw_subi_fast64(void);
     extern void gadget_arm64_rmw_addi_fast32(void), gadget_arm64_rmw_subi_fast32(void);
@@ -1012,7 +1015,7 @@ try_rmw:
 // fused block. Returns true with the block ended (caller returns 0).
 static bool gen_arm64_try_ld_cmp_fusion(struct gen_state *state, struct tlb *tlb,
         unsigned size, unsigned rt, unsigned rn, uint64_t off) {
-    if (arm64_fusion_disabled())
+    if (!arm64_fuse_pass_enabled(JIT_FUSE_A64_LDCMP))
         return false;
     extern void gadget_arm64_mov_const(void);
     extern void *const arm64_fused_ldcmpr64_table[14];
@@ -4804,6 +4807,103 @@ static void gen_riscv64_mov_const(struct gen_state *state, unsigned rd, uint64_t
     gen(state, value);
 }
 
+// Fetch (but do not consume) the instruction at state->riscv64_ip.
+// Returns its length in bytes (2 or 4) with the RVC-expanded encoding in
+// *insn_out, or 0 if it can't be fetched, expanded, or isn't a standard
+// 2/4-byte encoding. Mirrors the main fetch's split halfword reads so a
+// peek never touches the page after a trailing compressed instruction.
+static unsigned gen_riscv64_peek(struct gen_state *state, struct tlb *tlb,
+        uint32_t *insn_out) {
+    uint16_t low16;
+    if (!tlb_read(tlb, state->riscv64_ip, &low16, sizeof(low16)))
+        return 0;
+    unsigned length = riscv64_insn_length(low16);
+    if (length == 2) {
+        uint32_t expanded = riscv64_expand_rvc(low16);
+        if (expanded == 0)
+            return 0;
+        *insn_out = expanded;
+        return 2;
+    }
+    if (length != 4)
+        return 0;
+    uint16_t high16;
+    if (!tlb_read(tlb, state->riscv64_ip + 2, &high16, sizeof(high16)))
+        return 0;
+    *insn_out = (uint32_t) low16 | ((uint32_t) high16 << 16);
+    return 4;
+}
+
+// lui/auipc + {addi, addiw, load} same-register pairs fold into a single
+// gadget: the first instruction's result is compile-time known (gen knows
+// the guest pc), so the pair costs one dispatch instead of two, and the
+// load form (auipc+ld = GOT loads and other PC-relative accesses) also
+// skips the runtime add by loading from an absolute address through the
+// always-zero x0 slot. Measured on Alpine riscv64 busybox + musl + apk:
+// auipc+addi covers 5.4% of static instructions, auipc+load 3.6%,
+// lui+addi 0.7%.
+//
+// Consuming the second instruction is safe under the same rules as the
+// arm64 guest fusions: a jump landing on the consumed instruction just
+// compiles a fresh block that decodes it standalone, and the fused
+// result/pc equal exactly what the unfused pair leaves. For the load
+// form the fault-restart pc is the PAIR START: the folded constant has
+// no runtime state, so replaying from the first instruction after a
+// kernel-resolved fault recomputes the identical address.
+static bool gen_riscv64_fold_const(struct gen_state *state, struct tlb *tlb,
+        unsigned rd, uint64_t value) {
+    uint32_t next;
+    unsigned len = gen_riscv64_peek(state, tlb, &next);
+    if (len == 0)
+        return false;
+    // Same page budget as gen_arm64_fits_block: consumed instructions
+    // must not push the decoded range past one page from block start
+    // (jit.c only enforces its cap between gen_step calls).
+    if (state->riscv64_ip + len - state->block->addr > PAGE_SIZE)
+        return false;
+    if (riscv64_rd(next) != rd || riscv64_rs1(next) != rd)
+        return false;
+    unsigned opcode = riscv64_opcode(next);
+    unsigned funct3 = riscv64_funct3(next);
+    if (opcode == RISCV64_OP_OP_IMM && funct3 == 0) { // addi
+        gen_riscv64_mov_const(state, rd,
+                value + (uint64_t) riscv64_imm_i(next));
+        state->riscv64_ip += len;
+        return true;
+    }
+    if (opcode == RISCV64_OP_OP_IMM_32 && funct3 == 0) { // addiw (sext.w)
+        gen_riscv64_mov_const(state, rd, (uint64_t) (int64_t) (int32_t)
+                (value + (uint64_t) riscv64_imm_i(next)));
+        state->riscv64_ip += len;
+        return true;
+    }
+    if (opcode == RISCV64_OP_LOAD) {
+        extern void gadget_riscv64_lb(void);
+        extern void gadget_riscv64_lh(void);
+        extern void gadget_riscv64_lw(void);
+        extern void gadget_riscv64_ld(void);
+        extern void gadget_riscv64_lbu(void);
+        extern void gadget_riscv64_lhu(void);
+        extern void gadget_riscv64_lwu(void);
+        static void (*const load_gadgets[8])(void) = {
+            gadget_riscv64_lb, gadget_riscv64_lh, gadget_riscv64_lw,
+            gadget_riscv64_ld, gadget_riscv64_lbu, gadget_riscv64_lhu,
+            gadget_riscv64_lwu, NULL,
+        };
+        void (*gadget)(void) = load_gadgets[funct3];
+        if (gadget == NULL)
+            return false;
+        gen(state, (unsigned long) gadget);
+        gen(state, riscv64_rd_off(rd));
+        gen(state, riscv64_rs_off(0)); // always-zero slot: absolute address
+        gen(state, value + (uint64_t) riscv64_imm_i(next));
+        gen(state, state->riscv64_orig_ip); // pair start; ALWAYS last
+        state->riscv64_ip += len;
+        return true;
+    }
+    return false;
+}
+
 // Unconditional compile-time branch: ends the block. Target is tagged with
 // bit 63 (unchained) for riscv64_branch_dispatch; gen_end turns the stream
 // slot recorded in jump_ip[0] into a chainable word.
@@ -5086,13 +5186,18 @@ int gen_step_riscv64(struct gen_state *state, struct tlb *tlb) {
 
     switch (riscv64_opcode(insn)) {
     case RISCV64_OP_LUI:
-        gen_riscv64_mov_const(state, rd, (uint64_t) riscv64_imm_u(insn));
+    case RISCV64_OP_AUIPC: {
+        uint64_t value = (uint64_t) riscv64_imm_u(insn);
+        if (riscv64_opcode(insn) == RISCV64_OP_AUIPC)
+            value += state->riscv64_orig_ip;
+        // rd == x0: the value is discarded, so a same-rd fold can't match
+        // (rd_off is the zero sink but rs_off(0) is the real zero slot).
+        if (rd != 0 && (riscv64_jit_fuse_mask() & JIT_FUSE_RV_FOLD) &&
+                gen_riscv64_fold_const(state, tlb, rd, value))
+            return 1;
+        gen_riscv64_mov_const(state, rd, value);
         return 1;
-
-    case RISCV64_OP_AUIPC:
-        gen_riscv64_mov_const(state, rd,
-                state->riscv64_orig_ip + (uint64_t) riscv64_imm_u(insn));
-        return 1;
+    }
 
     case RISCV64_OP_OP_IMM: {
         int64_t imm = riscv64_imm_i(insn);
@@ -5342,9 +5447,29 @@ int gen_step_riscv64(struct gen_state *state, struct tlb *tlb) {
 
     case RISCV64_OP_JAL: {
         int64_t offset = riscv64_imm_j(insn);
-        if (rd != 0)
-            gen_riscv64_mov_const(state, rd, state->riscv64_ip); // link = pc + length
-        return gen_riscv64_branch_to(state, state->riscv64_orig_ip + offset);
+        guest_addr_t target = state->riscv64_orig_ip + offset;
+        if (rd != 0 && !(riscv64_jit_fuse_mask() & JIT_FUSE_RV_JAL)) {
+            // Fusion switched off: emit the link write separately, as this used
+            // to. This branch is NOT dead code -- it is the control arm of every
+            // A/B -- and omitting it is a miscompile, not a slowdown: `jal ra`
+            // that never writes ra sends the callee's `ret` to garbage. Caught
+            // exactly that way, by testing the OFF arm.
+            gen_riscv64_mov_const(state, rd, state->riscv64_ip);
+        } else if (rd != 0) {
+            // A call. One fused gadget instead of mov_const + b; see jal_link in
+            // jit/guest-riscv64/alu.S. Emits the same tagged target word in the
+            // same chainable position as gen_riscv64_branch_to, and records
+            // jump_ip[0] the same way, so the frontend's edge patching is
+            // unaffected by the fusion.
+            extern void gadget_riscv64_jal_link(void);
+            gen(state, (unsigned long) gadget_riscv64_jal_link);
+            gen(state, riscv64_rd_off(rd));
+            gen(state, state->riscv64_ip);  // link = pc + length
+            gen(state, target | 0x8000000000000000ULL);
+            state->jump_ip[0] = state->size - 1;
+            return 0;
+        }
+        return gen_riscv64_branch_to(state, target);
     }
 
     case RISCV64_OP_MADD: case RISCV64_OP_MSUB:
@@ -8062,6 +8187,52 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
             }
             return false;
         }
+#if defined(__aarch64__)
+        // Native INC (/0) / DEC (/1) on a REGISTER (mod==3), 32/64-bit. The
+        // counterpart of the incdec-mem path above, and the hotter one: long mode
+        // reuses the one-byte 0x40+r inc/dec encodings as the REX prefixes, so
+        // every `incq %rax` in compiled code arrives here as FF /0 mod==3. It was
+        // the last hot FF form still bridging to amd64_jit_ff_group, which is the
+        // single largest amd64 bridge helper (1.85% self time, measured in
+        // 2abe9a1f); the bridge additionally forced a gadget_amd64_set_rip
+        // dispatch on every execution, because the helper re-decodes its own
+        // instruction out of guest memory at CPU_amd64_rip.
+        //
+        // Register-only, so the gadget cannot fault and the rip may be DEFERRED
+        // rather than published -- that deferral is where the set_rip saving comes
+        // from, and it is only sound because there is no #PF re-execution path
+        // through this instruction.
+        //
+        // Declined (the bridge stays the oracle): 0x66, because 16-bit OF needs a
+        // width-correct sub-32 overflow, exactly as for the mem form; lock, which
+        // is #UD on a register operand and must keep raising it from the helper;
+        // and rex.r, which amd64_decode_modrm folds into modrm.reg -- that would
+        // make the helper see a group of 8/9 where this path would execute an
+        // INC, so it must not be claimed here. rex.b is fine: it extends rm, and
+        // the hybrid gadget accessors cover r8-r15 out of CPU_amd64_regs. The FS
+        // prefix has no effect on a register operand, but is declined too rather
+        // than reasoned about. Gated by /proc/ish/amd64_jit_fuse incdec_reg.
+        if (group <= 1 && amd64_modrm_mod(insn.modrm) == 3 &&
+                !insn.lock_prefix && !insn.operand_size_prefix &&
+                !insn.fs_prefix && !insn.rex.r &&
+                (amd64_jit_fuse_mask() & JIT_FUSE_AMD64_INCDEC_REG)) {
+            unsigned long rm = amd64_modrm_rm(insn.modrm);
+            if (insn.rex.b)
+                rm |= 8;
+            unsigned size = insn.rex.w ? 64 : 32;
+            amd64_jit_debug("incdec-reg ip=%llx grp=%u rm=%lu size=%u next=%llx",
+                    (unsigned long long) insn.start_ip, group, rm, size,
+                    (unsigned long long) next_ip);
+            extern void gadget_amd64_incdec_reg32(void), gadget_amd64_incdec_reg64(void);
+            gen_amd64_ensure_reg_cache(state);
+            gen(state, (unsigned long) (size == 64
+                        ? gadget_amd64_incdec_reg64 : gadget_amd64_incdec_reg32));
+            gen(state, rm | ((unsigned long) group << 8));   // group 1 == is_dec
+            gen_amd64_mark_reg_cache_dirty(state);
+            gen_amd64_defer_rip(state, next_ip);
+            return true;
+        }
+#endif
         amd64_jit_debug("ff-group-helper ip=%llx modrm=%02x next=%llx",
                 (unsigned long long) insn.start_ip,
                 insn.modrm,
@@ -10135,16 +10306,160 @@ bool gen_addr(struct gen_state *state, struct modrm *modrm, bool seg_tls) {
 // The op is identified by pointer-matching the caller's table, the same trick
 // gen_try_fuse_jcc uses. Note gen_op has already been handed the UNADJUSTED
 // table base here, before the size stride is applied.
+// ---- Live fusion mask (see jit/jit.h and /proc/ish/i386_jit_fuse) ----------
+//
+// -1 means "not yet seeded from the environment". Every gate below reads this
+// through i386_jit_fuse_mask() on each call rather than caching the answer in a
+// per-site `static`, which is the whole point: a cached gate would consult a
+// stale value after the first block compiled and silently ignore every later
+// write to the proc node, turning the knob into a liar. That is exactly the
+// silent-plumbing failure mode this facility exists to eliminate, so it must not
+// be reintroduced here for the sake of one relaxed atomic load per translated
+// operand (translation-time, not execution-time).
+static atomic_int i386_fuse_mask = -1;
+static atomic_int arm64_fuse_mask = -1;
+static atomic_int riscv64_fuse_mask = -1;
+static atomic_int amd64_fuse_mask = -1;
+
+// One table-driven implementation for all three guests. Each domain carries its
+// live mask, its full-on value, its name table, and a seeder that reads the
+// arch's existing env vars so their documented behaviour is untouched.
+//
+// -1 means "not yet seeded". Every gate reads through jit_fuse_mask_get() on each
+// call and NEVER caches the answer in a per-site static. A cached gate consults a
+// stale value after the first block compiles and then silently ignores every later
+// write to the proc node -- the knob becomes a liar, which is the exact failure
+// class this facility exists to remove. arm64's old arm64_fusion_disabled() had
+// precisely that cache. Worth one relaxed atomic load per translated instruction,
+// which is translation time, not execution time.
+struct jit_fuse_entry { const char *name; unsigned bit; };
+struct jit_fuse_domain {
+    atomic_int *mask;
+    unsigned all;
+    const struct jit_fuse_entry *names;
+    unsigned n_names;
+    unsigned (*seed)(void);
+};
+
+static unsigned i386_fuse_seed(void) {
+    unsigned v = JIT_FUSE_ALL;
+    // Existing semantics preserved exactly: set to ANY value disables.
+    // ISH_NO_MOVMR_FUSE still covers LEA, which shared movmr's gate before LEA
+    // was given its own bit for independent A/B.
+    if (getenv("ISH_NO_ADDR_FUSE") != NULL)    v &= ~JIT_FUSE_ADDR;
+    if (getenv("ISH_NO_MOVMR_FUSE") != NULL)   v &= ~(JIT_FUSE_MOVMR | JIT_FUSE_LEA);
+    if (getenv("ISH_NO_ALU_FUSE") != NULL)     v &= ~JIT_FUSE_ALU;
+    if (getenv("ISH_NO_PUSHPOP_FUSE") != NULL) v &= ~JIT_FUSE_PUSHPOP;
+    return v;
+}
+static unsigned arm64_fuse_seed(void) {
+    // ISH_ARM64_NO_FUSE was the single bisection hatch for all three passes and
+    // keeps that meaning; the per-pass bits are new granularity, not a change.
+    return getenv("ISH_ARM64_NO_FUSE") != NULL ? 0 : JIT_FUSE_A64_ALL;
+}
+static unsigned riscv64_fuse_seed(void) {
+    return getenv("ISH_RISCV64_NO_FUSE") != NULL ? 0 : JIT_FUSE_RV_ALL;
+}
+static unsigned amd64_fuse_seed(void) {
+    // New namespace, so ISH_AMD64_NO_FUSE has no prior meaning to preserve; it
+    // clears every native-vs-bridge switch, i.e. sends all of them back through
+    // the C helpers, which is the bisection hatch.
+    return getenv("ISH_AMD64_NO_FUSE") != NULL ? 0 : JIT_FUSE_AMD64_ALL;
+}
+
+static const struct jit_fuse_entry i386_fuse_names[] = {
+    {"addr", JIT_FUSE_ADDR}, {"movmr", JIT_FUSE_MOVMR}, {"lea", JIT_FUSE_LEA},
+    {"alu", JIT_FUSE_ALU}, {"pushpop", JIT_FUSE_PUSHPOP},
+};
+static const struct jit_fuse_entry arm64_fuse_names[] = {
+    {"bcond", JIT_FUSE_A64_BCOND}, {"ldst", JIT_FUSE_A64_LDST},
+    {"ldcmp", JIT_FUSE_A64_LDCMP},
+};
+static const struct jit_fuse_entry riscv64_fuse_names[] = {
+    {"fold", JIT_FUSE_RV_FOLD}, {"jal", JIT_FUSE_RV_JAL},
+};
+static const struct jit_fuse_entry amd64_fuse_names[] = {
+    {"incdec_reg", JIT_FUSE_AMD64_INCDEC_REG},
+};
+
+static const struct jit_fuse_domain jit_fuse_domains[] = {
+    [JIT_FUSE_ARCH_I386] = {&i386_fuse_mask, JIT_FUSE_ALL, i386_fuse_names,
+        sizeof(i386_fuse_names) / sizeof(i386_fuse_names[0]), i386_fuse_seed},
+    [JIT_FUSE_ARCH_ARM64] = {&arm64_fuse_mask, JIT_FUSE_A64_ALL, arm64_fuse_names,
+        sizeof(arm64_fuse_names) / sizeof(arm64_fuse_names[0]), arm64_fuse_seed},
+    [JIT_FUSE_ARCH_RISCV64] = {&riscv64_fuse_mask, JIT_FUSE_RV_ALL, riscv64_fuse_names,
+        sizeof(riscv64_fuse_names) / sizeof(riscv64_fuse_names[0]), riscv64_fuse_seed},
+    [JIT_FUSE_ARCH_AMD64] = {&amd64_fuse_mask, JIT_FUSE_AMD64_ALL, amd64_fuse_names,
+        sizeof(amd64_fuse_names) / sizeof(amd64_fuse_names[0]), amd64_fuse_seed},
+};
+#define JIT_FUSE_N_DOMAINS (sizeof(jit_fuse_domains) / sizeof(jit_fuse_domains[0]))
+
+unsigned jit_fuse_mask_get(enum jit_fuse_arch arch) {
+    if ((unsigned) arch >= JIT_FUSE_N_DOMAINS)
+        return 0;
+    const struct jit_fuse_domain *d = &jit_fuse_domains[arch];
+    int m = atomic_load_explicit(d->mask, memory_order_relaxed);
+    if (m < 0) {
+        // Benign race: concurrent seeders derive the same value from the same
+        // environment, so whoever wins stores an identical mask.
+        m = (int) d->seed();
+        atomic_store_explicit(d->mask, m, memory_order_relaxed);
+    }
+    return (unsigned) m;
+}
+
+void jit_fuse_mask_set(enum jit_fuse_arch arch, unsigned mask) {
+    if ((unsigned) arch >= JIT_FUSE_N_DOMAINS)
+        return;
+    const struct jit_fuse_domain *d = &jit_fuse_domains[arch];
+    atomic_store_explicit(d->mask, (int) (mask & d->all), memory_order_relaxed);
+}
+
+const char *jit_fuse_name(enum jit_fuse_arch arch, unsigned index, unsigned *bit_out) {
+    if ((unsigned) arch >= JIT_FUSE_N_DOMAINS)
+        return NULL;
+    const struct jit_fuse_domain *d = &jit_fuse_domains[arch];
+    if (index >= d->n_names)
+        return NULL;
+    if (bit_out != NULL)
+        *bit_out = d->names[index].bit;
+    return d->names[index].name;
+}
+
+bool jit_fuse_set_by_name(enum jit_fuse_arch arch, const char *name, bool on) {
+    if ((unsigned) arch >= JIT_FUSE_N_DOMAINS)
+        return false;
+    const struct jit_fuse_domain *d = &jit_fuse_domains[arch];
+    if (strcmp(name, "all") == 0) {
+        jit_fuse_mask_set(arch, on ? d->all : 0);
+        return true;
+    }
+    for (unsigned i = 0; i < d->n_names; i++) {
+        if (strcmp(name, d->names[i].name) != 0)
+            continue;
+        unsigned m = jit_fuse_mask_get(arch);
+        if (on)
+            m |= d->names[i].bit;
+        else
+            m &= ~d->names[i].bit;
+        jit_fuse_mask_set(arch, m);
+        return true;
+    }
+    return false;
+}
+
+unsigned i386_jit_fuse_mask(void) { return jit_fuse_mask_get(JIT_FUSE_ARCH_I386); }
+unsigned arm64_jit_fuse_mask(void) { return jit_fuse_mask_get(JIT_FUSE_ARCH_ARM64); }
+unsigned riscv64_jit_fuse_mask(void) { return jit_fuse_mask_get(JIT_FUSE_ARCH_RISCV64); }
+unsigned amd64_jit_fuse_mask(void) { return jit_fuse_mask_get(JIT_FUSE_ARCH_AMD64); }
+
 static inline bool gen_try_fuse_addr(struct gen_state *state, gadget_t *table,
         struct modrm *modrm, int size, bool seg_tls) {
 #if defined(__aarch64__)
-    // ISH_NO_ADDR_FUSE=1 emits the old two-gadget form, so the fusion can be
-    // A/B'd and bisected from one binary. Cached: this sits in the per-operand
-    // translation path.
-    static int fuse_enabled = -1;
-    if (fuse_enabled == -1)
-        fuse_enabled = getenv("ISH_NO_ADDR_FUSE") == NULL ? 1 : 0;
-    if (!fuse_enabled)
+    // ISH_NO_ADDR_FUSE=1, or `addr=0` written to /proc/ish/i386_jit_fuse, emits
+    // the old two-gadget form so the fusion can be A/B'd and bisected from one
+    // binary. Read live, never cached -- see i386_jit_fuse_mask above.
+    if (!(i386_jit_fuse_mask() & JIT_FUSE_ADDR))
         return false;
     if (seg_tls)
         return false;
@@ -10260,10 +10575,203 @@ static inline bool gen_mov(struct gen_state *state, enum arg src, enum arg dst, 
     }
 #endif
 
+#if defined(__aarch64__)
+    // `mov <reg>, [<base>+disp]` in one gadget instead of two. The most-emitted
+    // shape in the stream: 96709 of 207139 MOVs on a real gcc compile (46.7%).
+    // Even with the address fusion the load still lands in _tmp and needs a
+    // separate store32_reg_<dst> to move it out; this loads straight into the
+    // destination register. See fused_movmr32 in jit/gadgets-aarch64/memory.S.
+    //
+    // The modrm test is deliberately `== modrm_mem`, not `!= modrm_reg`: that
+    // excludes modrm_mem_si (a scaled index needs its own si gadget) in the same
+    // breath, and it excludes arg_mem_addr, whose modrm fields gen_op rewrites
+    // later, so inspecting them here would be reading pre-mutation state.
+    if (sz(size) == size_32 && (i386_jit_fuse_mask() & JIT_FUSE_MOVMR) &&
+            dst_reg != arg_invalid &&
+            src == arg_modrm_val && modrm->type == modrm_mem && !seg_tls &&
+            modrm->base != reg_none && modrm->base < reg_count) {
+        extern gadget_t fused_movmr32_gadgets[];
+        gadget_t g = fused_movmr32_gadgets[(dst_reg - arg_reg_a) * 8 + modrm->base];
+        if (g != NULL) {
+            GEN(g);
+            GEN(modrm->offset);
+            GEN(state->orig_ip | state->orig_ip_extra);
+            return true;
+        }
+    }
+
+    // The mirror: `mov [<base>+disp], <reg>`, 39815 of 207139 MOVs (19.2%).
+    // Same conditions with the operands swapped. Shares ISH_NO_MOVMR_FUSE and the
+    // JIT_FUSE_MOVMR bit, since the two are one change and are measured together.
+    if ((i386_jit_fuse_mask() & JIT_FUSE_MOVMR) && sz(size) == size_32 && src_reg != arg_invalid &&
+            dst == arg_modrm_val && modrm->type == modrm_mem && !seg_tls &&
+            modrm->base != reg_none && modrm->base < reg_count) {
+        extern gadget_t fused_movrm32_gadgets[];
+        gadget_t g = fused_movrm32_gadgets[(src_reg - arg_reg_a) * 8 + modrm->base];
+        if (g != NULL) {
+            GEN(g);
+            GEN(modrm->offset);
+            GEN(state->orig_ip | state->orig_ip_extra);
+            return true;
+        }
+    }
+
+    // LEA: `lea <reg>, [<base>+disp]` in one gadget instead of three. This is the
+    // only i386 MOV site whose src is arg_addr (emu/decode.h:1171), which is why
+    // the movmr fusion above declines it, and it was the unexplained "src=other"
+    // 14.3% of the MOV emission histogram -- 18.4% of instructions reaching
+    // gen_mov in this repo's i386 rootfs.
+    //
+    // Worst work-to-dispatch ratio in the engine: LEA never touches memory, yet it
+    // emitted addr_<base> + load32_addr + store32_reg_<dst>, and load32_addr's
+    // whole body is `mov w0, w3`. No memory access also means the fused gadget
+    // needs no read_prep, no orig_ip word and no fault path -- three instructions
+    // total, and two stream words instead of four.
+    //
+    // 32-bit only: at oz=16 LEA writes just the low half of the destination.
+    // seg_tls declines: gen_addr folds a segment base in via seg_gs, and rather
+    // than decide whether LEA should do that, this leaves that case exactly as it
+    // was. modrm_mem (not != modrm_reg) excludes the scaled-index form, which
+    // needs its own si gadget.
+    // Own bit (JIT_FUSE_LEA) so LEA can be A/B'd independently; ISH_NO_MOVMR_FUSE
+    // still clears it too, preserving the env var's original scope.
+    if ((i386_jit_fuse_mask() & JIT_FUSE_LEA) && sz(size) == size_32 && dst_reg != arg_invalid &&
+            src == arg_addr && modrm->type == modrm_mem && !seg_tls &&
+            modrm->base != reg_none && modrm->base < reg_count) {
+        extern gadget_t fused_lea32_gadgets[];
+        gadget_t g = fused_lea32_gadgets[(dst_reg - arg_reg_a) * 8 + modrm->base];
+        if (g != NULL) {
+            GEN(g);
+            GEN(modrm->offset);
+            return true;
+        }
+    }
+#endif
+
     extern gadget_t load_gadgets[];
     extern gadget_t store_gadgets[];
     return gen_op(state, load_gadgets, src, modrm, imm, size, seg_tls, addr_offset) &&
            gen_op(state, store_gadgets, dst, modrm, imm, size, seg_tls, addr_offset);
+}
+
+// Collapse load(dst_reg) + op(imm) + store(dst_reg) into one fused gadget. See
+// jit/gadgets-aarch64/math.S for the gadget family and why reg,imm rather than
+// reg,reg (measured: reg,imm is ~60% of ALU load-op-store trios and needs 56
+// gadgets; reg,reg is ~21% and would need 448).
+//
+// Deliberately NOT hooked inside gen_op, for two reasons that each cost real
+// performance if ignored:
+//   - gen_op cannot distinguish CMP/TEST from SUB/AND (they share sub_gadgets and
+//     and_gadgets), so hooking there would fuse CMP and silently disable the
+//     cmp/test+jcc fusion, which is worth more than this.
+//   - gen_try_fuse_addr identifies its op by pointer-comparing gen_op's table
+//     argument, so changing what gen_op receives can disable the address fusion.
+// Deciding here, at the los() call site, means both operand kinds are known
+// statically and neither existing fusion is perturbed.
+//
+// Requires BOTH that the source is a true immediate and that the destination
+// resolves to a register: los() also emits load32_mem/op/store32_mem for a MEMORY
+// destination, and fusing that shape would silently drop the memory load and store.
+static inline bool gen_alu_imm_fused(struct gen_state *state, gadget_t *fused,
+        enum arg src, enum arg dst, struct modrm *modrm, uint64_t *imm, int size) {
+#if defined(__aarch64__)
+    // ISH_NO_ALU_FUSE=1, or `alu=0` written to /proc/ish/i386_jit_fuse, falls back
+    // to the three-gadget form so both sides live in one binary for A/B. Read
+    // live, never cached -- see i386_jit_fuse_mask.
+    if (!(i386_jit_fuse_mask() & JIT_FUSE_ALU))
+        return false;
+    if (sz(size) != size_32)
+        return false;
+    if (src != arg_imm)
+        return false;
+    enum arg dst_reg = gen_reg_arg(dst, modrm);
+    if (dst_reg == arg_invalid)
+        return false;
+    gadget_t g = fused[dst_reg - arg_reg_a];
+    if (g == NULL)
+        return false;
+    // Always emits two words. Never short-circuit to zero emission (even for a
+    // no-op immediate): gen_try_fuse_jcc requires state->size to advance past a
+    // flag-setting instruction, and an ALU op emitting nothing would leave a stale
+    // cmp/test fuse note live for the next jcc.
+    GEN(g);
+    GEN(*imm);
+    return true;
+#else
+    (void) state; (void) fused; (void) src; (void) dst;
+    (void) modrm; (void) imm; (void) size;
+    return false;
+#endif
+}
+
+// `push <reg>` / `pop <reg>` in one dispatch instead of two.
+//
+// PUSH and POP move their value through _tmp, so each needs a staging gadget on
+// one side: load32_reg_<r> before push, store32_reg_<r> after pop. Both shapes
+// are extremely common (every call sequence) and the fused table is only ONE
+// dimensional -- 16 gadgets, against the 448 that fusing ALU reg,reg would need
+// for a comparable share. In an i386 profile taken after the earlier fusions
+// landed, push+pop were 4.7% of gadget samples and the load32_reg/store32_reg
+// staging they drive was another 21.1% (shared with other shapes).
+//
+// Register destination only. `push <mem>` and `pop <mem>` keep the generic form:
+// their staging gadget is doing a real memory access, not just moving a value,
+// and fusing that away would drop it.
+static inline bool gen_push_reg_fused(struct gen_state *state, enum arg thing,
+        struct modrm *modrm, int size) {
+#if defined(__aarch64__)
+    // ISH_NO_PUSHPOP_FUSE=1, or `pushpop=0` written to /proc/ish/i386_jit_fuse,
+    // falls back to the two-gadget form so both sides live in one binary for A/B.
+    // Read live, never cached -- see i386_jit_fuse_mask.
+    if (!(i386_jit_fuse_mask() & JIT_FUSE_PUSHPOP))
+        return false;
+    if (sz(size) != size_32)
+        return false;
+    enum arg reg = gen_reg_arg(thing, modrm);
+    if (reg == arg_invalid)
+        return false;
+    extern gadget_t fused_push_gadgets[];
+    gadget_t g = fused_push_gadgets[reg - arg_reg_a];
+    if (g == NULL)
+        return false;
+    GEN(g);
+    GEN(state->orig_ip);
+    return true;
+#else
+    (void) state; (void) thing; (void) modrm; (void) size;
+    return false;
+#endif
+}
+
+static inline bool gen_pop_reg_fused(struct gen_state *state, enum arg thing,
+        struct modrm *modrm, int size) {
+#if defined(__aarch64__)
+    if (!(i386_jit_fuse_mask() & JIT_FUSE_PUSHPOP))
+        return false;
+    if (sz(size) != size_32)
+        return false;
+    enum arg reg = gen_reg_arg(thing, modrm);
+    if (reg == arg_invalid)
+        return false;
+    extern gadget_t fused_pop_gadgets[];
+    // reg_sp is a deliberate 0 in that table: see the comment on fused_pop in
+    // jit/gadgets-aarch64/memory.S. `pop esp` falls back here.
+    gadget_t g = fused_pop_gadgets[reg - arg_reg_a];
+    if (g == NULL)
+        return false;
+    GEN(g);
+    // Plain orig_ip, matching the generic `gg(pop, state->orig_ip)`: the bit-62
+    // "adjust esp on segfault" marker is set AFTER that gadget is emitted, so it
+    // only ever reaches a following memory store's orig_ip word -- i.e. only the
+    // `pop <mem>` form, which is not fused here. Set below anyway so this path
+    // leaves gen_state identical to the generic one.
+    GEN(state->orig_ip);
+    state->orig_ip_extra = 1ul << 62;
+    return true;
+#else
+    (void) state; (void) thing; (void) modrm; (void) size;
+    return false;
+#endif
 }
 
 #define op(type, thing, z) do { \
@@ -10283,23 +10791,45 @@ static inline bool gen_mov(struct gen_state *state, enum arg src, enum arg dst, 
 // xchg must generate in this order to be atomic
 #define XCHG(src, dst,z) load(src, z); op(xchg, dst, z); store(src, z)
 
-#define ADD(src, dst,z) los(add, src, dst, z)
-#define OR(src, dst,z) los(or, src, dst, z)
-#define ADC(src, dst,z) los(adc, src, dst, z)
-#define SBB(src, dst,z) los(sbb, src, dst, z)
-#define AND(src, dst,z) los(and, src, dst, z)
-#define SUB(src, dst,z) los(sub, src, dst, z)
-#define XOR(src, dst,z) los(xor, src, dst, z)
+// load-op-store, but try the fused reg,imm gadget first (one dispatch and two
+// stream words instead of three and four). Falls back to the plain los()
+// expansion for every shape the fused family does not cover: non-32-bit, a
+// memory destination, or a non-immediate source.
+//
+// Applied ONLY to the seven store-back ALU ops. CMP and TEST keep lo() verbatim
+// below -- they have no store to save, and their op word must stay a literal entry
+// of sub_gadgets/and_gadgets for gen_try_fuse_jcc to pointer-match.
+#define losf(o, src, dst, z) do { \
+    extern gadget_t fused_##o##32_imm_gadgets[]; \
+    if (!gen_alu_imm_fused(state, fused_##o##32_imm_gadgets, arg_##src, arg_##dst, &modrm, &imm, z)) { \
+        los(o, src, dst, z); \
+    } \
+} while (0)
+
+#define ADD(src, dst,z) losf(add, src, dst, z)
+#define OR(src, dst,z) losf(or, src, dst, z)
+#define ADC(src, dst,z) losf(adc, src, dst, z)
+#define SBB(src, dst,z) losf(sbb, src, dst, z)
+#define AND(src, dst,z) losf(and, src, dst, z)
+#define SUB(src, dst,z) losf(sub, src, dst, z)
+#define XOR(src, dst,z) losf(xor, src, dst, z)
 #define CMP(src, dst,z) lo(sub, src, dst, z); gen_note_flag_op_fuse(state, z, 1)
 #define TEST(src, dst,z) lo(and, src, dst, z); gen_note_flag_op_fuse(state, z, 2)
 #define NOT(val,z) load(val,z); gz(not, z); store(val,z)
 #define NEG(val,z) imm = 0; load(imm,z); op(sub, val,z); store(val,z)
 
-#define POP(thing,z) \
-    gg(pop, state->orig_ip); \
-    state->orig_ip_extra = 1ul << 62; /* marks that on segfault the stack pointer should be adjusted */\
-    store(thing, z)
-#define PUSH(thing,z) load(thing, z); gg(push, state->orig_ip)
+#define POP(thing,z) do { \
+    if (!gen_pop_reg_fused(state, arg_##thing, &modrm, z)) { \
+        gg(pop, state->orig_ip); \
+        state->orig_ip_extra = 1ul << 62; /* marks that on segfault the stack pointer should be adjusted */\
+        store(thing, z); \
+    } \
+} while (0)
+#define PUSH(thing,z) do { \
+    if (!gen_push_reg_fused(state, arg_##thing, &modrm, z)) { \
+        load(thing, z); gg(push, state->orig_ip); \
+    } \
+} while (0)
 
 #define INC(val,z) load(val, z); gz(inc, z); store(val, z)
 #define DEC(val,z) load(val, z); gz(dec, z); store(val, z)

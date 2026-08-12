@@ -101,6 +101,135 @@ static int proc_ish_show_i386_no_cache_comm(struct proc_entry *UNUSED(entry), st
     return 0;
 }
 
+// /proc/ish/{i386,arm64,riscv64,amd64}_jit_fuse -- read/write that guest's live
+// gadget-fusion mask. One implementation, four nodes; the arch selects both the
+// mask and the set of valid names, so a name from the wrong arch is rejected
+// rather than silently ignored, and `all` means that arch's families only.
+//
+//   cat  /proc/ish/arm64_jit_fuse      -> one "name on|off" line per family
+//   echo pushpop=0 > /proc/ish/i386_jit_fuse
+//   echo "addr=0 alu=1" > /proc/ish/i386_jit_fuse    (space or comma separated)
+//   echo all=1 > /proc/ish/riscv64_jit_fuse
+//
+// Families: i386 addr/movmr/lea/alu/pushpop; arm64 bcond/ldst/ldcmp;
+// riscv64 fold/jal; amd64 incdec_reg (native gadget vs. the C-helper bridge,
+// see jit/jit.h -- same A/B, different mechanism).
+//
+// Exists for measurement: it makes a fusion A/B a file write instead of an app
+// relaunch, so arms can be interleaved rep by rep (the only way to keep thermal
+// drift out of a 1-2% result), and the value written is the same variable gen.c
+// reads, so cat-ing it back is proof the change took effect. Affects newly
+// compiled blocks; run each rep as its own guest process to pick up a change.
+// See jit/jit.h.
+static int proc_ish_show_jit_fuse(enum jit_fuse_arch arch, struct proc_data *buf) {
+    unsigned mask = jit_fuse_mask_get(arch);
+    for (unsigned i = 0;; i++) {
+        unsigned bit;
+        const char *name = jit_fuse_name(arch, i, &bit);
+        if (name == NULL)
+            break;
+        proc_printf(buf, "%s %s\n", name, (mask & bit) ? "on" : "off");
+    }
+    return 0;
+}
+
+static int proc_ish_update_jit_fuse(enum jit_fuse_arch arch, struct proc_data *data) {
+    // Deliberately requires an explicit =0/=1 per name rather than treating a
+    // bare name as "disable": the ISH_NO_*_FUSE env vars use presence-means-off,
+    // and mistaking `FOO=0` for "off" there has already cost one bogus A/B.
+    // Nothing is applied unless the WHOLE input parses, so a typo cannot leave
+    // the mask half-changed.
+    unsigned mask = jit_fuse_mask_get(arch);
+    size_t i = 0;
+    bool saw_one = false;
+    while (i < data->size) {
+        char c = data->data[i];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ',') {
+            i++;
+            continue;
+        }
+        size_t start = i;
+        while (i < data->size) {
+            c = data->data[i];
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ',')
+                break;
+            i++;
+        }
+        size_t len = i - start;
+        // "name=v": at least one name char, an '=', and a single 0 or 1.
+        if (len < 3 || data->data[i - 2] != '=')
+            return _EINVAL;
+        char val = data->data[i - 1];
+        if (val != '0' && val != '1')
+            return _EINVAL;
+        size_t namelen = len - 2;
+        if (namelen >= 32)
+            return _EINVAL;
+        char name[32];
+        memcpy(name, &data->data[start], namelen);
+        name[namelen] = '\0';
+
+        unsigned bit = 0;
+        bool matched = false;
+        if (strcmp(name, "all") == 0) {
+            // Route "all" through the shared setter so each arch gets ITS OWN
+            // full-on value rather than i386's bit set.
+            jit_fuse_set_by_name(arch, "all", val == '1');
+            mask = jit_fuse_mask_get(arch);
+            matched = true;
+        } else {
+            for (unsigned k = 0;; k++) {
+                const char *known = jit_fuse_name(arch, k, &bit);
+                if (known == NULL)
+                    break;
+                if (strcmp(name, known) == 0) {
+                    if (val == '1')
+                        mask |= bit;
+                    else
+                        mask &= ~bit;
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if (!matched)
+            return _EINVAL;
+        saw_one = true;
+    }
+    if (!saw_one)
+        return _EINVAL;
+    jit_fuse_mask_set(arch, mask);
+    return 0;
+}
+
+// One node per guest, named for the arch it controls so nobody expects
+// i386_jit_fuse to touch arm64 (matching the i386_no_cache_comm convention).
+// proc_entry carries no user data, so each node needs a two-line wrapper.
+static int proc_ish_show_i386_jit_fuse(struct proc_entry *UNUSED(e), struct proc_data *buf) {
+    return proc_ish_show_jit_fuse(JIT_FUSE_ARCH_I386, buf);
+}
+static int proc_ish_update_i386_jit_fuse(struct proc_entry *UNUSED(e), struct proc_data *d) {
+    return proc_ish_update_jit_fuse(JIT_FUSE_ARCH_I386, d);
+}
+static int proc_ish_show_arm64_jit_fuse(struct proc_entry *UNUSED(e), struct proc_data *buf) {
+    return proc_ish_show_jit_fuse(JIT_FUSE_ARCH_ARM64, buf);
+}
+static int proc_ish_update_arm64_jit_fuse(struct proc_entry *UNUSED(e), struct proc_data *d) {
+    return proc_ish_update_jit_fuse(JIT_FUSE_ARCH_ARM64, d);
+}
+static int proc_ish_show_riscv64_jit_fuse(struct proc_entry *UNUSED(e), struct proc_data *buf) {
+    return proc_ish_show_jit_fuse(JIT_FUSE_ARCH_RISCV64, buf);
+}
+static int proc_ish_update_riscv64_jit_fuse(struct proc_entry *UNUSED(e), struct proc_data *d) {
+    return proc_ish_update_jit_fuse(JIT_FUSE_ARCH_RISCV64, d);
+}
+static int proc_ish_show_amd64_jit_fuse(struct proc_entry *UNUSED(e), struct proc_data *buf) {
+    return proc_ish_show_jit_fuse(JIT_FUSE_ARCH_AMD64, buf);
+}
+static int proc_ish_update_amd64_jit_fuse(struct proc_entry *UNUSED(e), struct proc_data *d) {
+    return proc_ish_update_jit_fuse(JIT_FUSE_ARCH_AMD64, d);
+}
+
 static int proc_ish_update_amd64_jit(struct proc_entry *UNUSED(entry), struct proc_data *data) {
     size_t start = 0;
     size_t end = data->size;
@@ -475,6 +604,10 @@ static int proc_ish_show_cpu_features(struct proc_entry *UNUSED(entry), struct p
 struct proc_children proc_ish_children = PROC_CHILDREN({
     {"amd64_jit", S_IFREG | 0644, .show = proc_ish_show_amd64_jit, .update = proc_ish_update_amd64_jit},
     {"amd_jit", S_IFREG | 0644, .show = proc_ish_show_amd64_jit, .update = proc_ish_update_amd64_jit},
+    {"amd64_jit_fuse", S_IFREG | 0644, .show = proc_ish_show_amd64_jit_fuse, .update = proc_ish_update_amd64_jit_fuse},
+    {"arm64_jit_fuse", S_IFREG | 0644, .show = proc_ish_show_arm64_jit_fuse, .update = proc_ish_update_arm64_jit_fuse},
+    {"i386_jit_fuse", S_IFREG | 0644, .show = proc_ish_show_i386_jit_fuse, .update = proc_ish_update_i386_jit_fuse},
+    {"riscv64_jit_fuse", S_IFREG | 0644, .show = proc_ish_show_riscv64_jit_fuse, .update = proc_ish_update_riscv64_jit_fuse},
     {"i386_no_cache_comm", S_IFREG | 0644, .show = proc_ish_show_i386_no_cache_comm, .update = proc_ish_update_i386_no_cache_comm},
     {"i386_single_step_comm", S_IFREG | 0644, .show = proc_ish_show_i386_single_step_comm, .update = proc_ish_update_i386_single_step_comm},
     {"BAT0", .show = proc_ish_show_battery},
