@@ -1219,9 +1219,21 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
 
     bool force_safe_i386 = current->abi == GUEST_ABI_I386 &&
             i386_force_safe_exec_comm(current->comm);
-    current->force_single_step = (current->abi == GUEST_ABI_I386 &&
+    // The comm-matched single-step and no-block-cache knobs were built for
+    // the i386 guest, but nothing in them is i386-specific: both are answered
+    // in jit.c by breaking blocks at every instruction boundary, which is
+    // exactly the question you want to ask of any guest whose bug might be in
+    // how instructions are grouped rather than in one of them. The arm64
+    // guest has such a bug open right now (docs/android-bringup.md: libc
+    // memset on a tagged pointer, faulting at an instruction with no memory
+    // operand), and answering it needed a knob that already existed and was
+    // gated off. Unset comm matches nothing, so widening the gate changes no
+    // behaviour until someone deliberately sets it.
+    bool comm_debug_abi = current->abi == GUEST_ABI_I386 ||
+            current->abi == GUEST_ABI_ARM64;
+    current->force_single_step = (comm_debug_abi &&
             i386_single_step_comm_matches(current->comm)) || force_safe_i386;
-    current->force_no_jit_cache = (current->abi == GUEST_ABI_I386 &&
+    current->force_no_jit_cache = (comm_debug_abi &&
             i386_no_cache_comm_matches(current->comm)) || force_safe_i386;
     if (current->force_no_jit_cache) {
         i386_special_trace_reset(current->tgid, current->comm);
