@@ -13,6 +13,12 @@ name: Sync with upstream
 # Nothing lands on `working` unless the merge was clean, this fork's own code
 # is still present afterwards, and the tree still builds and passes tests.
 # Anything else opens an issue and leaves `working` untouched.
+#
+# When a clean merge then fails its checks, the issue also says whether a
+# PRISTINE upstream tree fails the same way. That distinction decides what to
+# do next -- fix the merge, or fix/wait on upstream -- and answering it by
+# hand means building a second tree and comparing, which is exactly the kind
+# of thing that should not be left to whoever reads the issue at 7am.
 
 on:
   schedule:
@@ -77,7 +83,11 @@ jobs:
             echo 'COMMITS_EOF'
           } >> "$GITHUB_OUTPUT"
 
-          if git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then
+          # The incoming subjects go in the merge commit body, not just the
+          # step summary: six months later `git log` is where anyone looks to
+          # find out what a given sync actually brought in, and a step summary
+          # has long since expired.
+          if git merge --no-edit --log=200 "upstream/$UPSTREAM_BRANCH"; then
             echo "clean=true" >> "$GITHUB_OUTPUT"
           else
             echo "conflicted<<FILES_EOF" >> "$GITHUB_OUTPUT"
@@ -154,6 +164,40 @@ jobs:
             echo "$COMMITS"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # A clean merge whose tree then fails is ambiguous, and the two cases
+      # need opposite responses: if the merge broke it, the merge is wrong and
+      # must not land; if upstream was already broken, the merge is fine and
+      # what is needed is a fix on top (or a wait). Answering it by hand means
+      # building a pristine upstream worktree and comparing -- so do that here
+      # instead, while the runner is already warm and the toolchain installed.
+      #
+      # This is not hypothetical: upstream's tree has failed to LINK on x86_64
+      # (fused_<op>32_imm_gadgets are defined only in the aarch64 host gadget
+      # set), which looked exactly like a merge that broke the build.
+      - name: Was upstream already broken, independently of this merge?
+        id: baseline
+        if: failure() && steps.merge.outputs.clean == 'true'
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          git worktree add /tmp/upstream-baseline "upstream/$UPSTREAM_BRANCH"
+          cd /tmp/upstream-baseline
+          # run-guest-tests.sh is this fork's, not upstream's, so bring it.
+          cp "$GITHUB_WORKSPACE/tools/run-guest-tests.sh" tools/ 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE"/alpine-minirootfs-*.tar.xz . 2>/dev/null || true
+          verdict="upstream builds and tests clean; this merge is what broke it"
+          if ! meson setup build -Dengine=jit >/tmp/base-cfg.log 2>&1; then
+            verdict="upstream does not even CONFIGURE; the breakage is not from this merge"
+          elif ! ninja -C build >/tmp/base-build.log 2>&1; then
+            verdict="upstream does not BUILD either; the breakage is not from this merge"
+          elif ! bash tools/run-guest-tests.sh build >/tmp/base-test.log 2>&1; then
+            verdict="upstream builds but fails the guest tests too; the breakage is not from this merge"
+          fi
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+          echo "$verdict"
+        env:
+          CC: clang
+
       # Conflicts and build failures both need a human, so say so somewhere
       # that does not depend on anyone reading Actions logs. One open issue at
       # a time: if the last sync is still unresolved, a new failure comments on
@@ -166,6 +210,7 @@ jobs:
           CONFLICTED: ${{ steps.merge.outputs.conflicted }}
           COMMITS: ${{ steps.merge.outputs.commits }}
           CLEAN: ${{ steps.merge.outputs.clean }}
+          BASELINE: ${{ steps.baseline.outputs.verdict }}
         run: |
           set -euo pipefail
           if [ "$CLEAN" = "false" ]; then
@@ -175,8 +220,15 @@ jobs:
             REASON="The merge was clean, but the merged tree failed its checks."
             DETAIL="One of: this fork's own code did not survive the merge (tools/check-fork-additions.sh), the build failed, the unit/e2e tests failed, or this fork's guest regression tests failed (tools/run-guest-tests.sh -- binder/ashmem behaviour). The run log says which."
           fi
-          BODY=$(printf '%s\n\n%s\n\n`working` was left untouched.\n\nUpstream commits involved:\n\n%s\n\nRun: %s\n' \
-            "$REASON" "$DETAIL" "${COMMITS:-(none recorded)}" "$RUN_URL")
+          # The baseline verdict goes near the top: it decides whether the
+          # next step is "fix the merge" or "fix/wait on upstream", and that
+          # is the first thing anyone opening this issue needs to know.
+          BASE_LINE=""
+          if [ -n "${BASELINE:-}" ]; then
+            BASE_LINE=$'\n\n**Upstream baseline:** '"$BASELINE"
+          fi
+          BODY=$(printf '%s%s\n\n%s\n\n`working` was left untouched.\n\nUpstream commits involved:\n\n%s\n\nRun: %s\n' \
+            "$REASON" "$BASE_LINE" "$DETAIL" "${COMMITS:-(none recorded)}" "$RUN_URL")
 
           EXISTING=$(gh issue list --label upstream-sync --state open \
             --json number --jq '.[0].number // empty')
