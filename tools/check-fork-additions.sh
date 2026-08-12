@@ -147,6 +147,14 @@ need_in fs/aok-tools.manifest ish-report.sh "the one-command diagnostic report"
 need_file opt/AOK/tools/ish-remote.sh
 need_in fs/aok-tools.manifest ish-remote.sh "the code-gated remote command listener"
 
+# --- host CPU feature detection --------------------------------------------
+# One binary ships to every device from an ARMv8.0 iPad up, so "what can this
+# core do" is a runtime question. Losing this turns every ISA decision back
+# into a guess made at compile time for the oldest device.
+need_in kernel/hostinfo.h host_cpu_features "the runtime ARM feature query"
+need_in fs/proc/ish.c     cpu_features      "/proc/ish/cpu_features"
+need_in meson_options.txt ldapr             "the FEAT_LRCPC dispatch variant"
+
 # --- shared ---------------------------------------------------------------
 need_file kernel/ioctl_abi.h
 

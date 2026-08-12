@@ -121,8 +121,27 @@ _addr   .req x7
 // " gret=ldar" in `uname -v`.
 // A future refinement could pick per host at startup, but that needs two full
 // gadget tables, and 1.7x on old devices is worth having now.
+#if defined(ISH_ARM64_GRET_LDAPR)
+// ldapr is an ARMv8.3 extension; the assembler rejects it otherwise.
+.arch_extension rcpc
+#endif
 .macro gret pop=0
-#if defined(ISH_ARM64_GRET_LDAR)
+#if defined(ISH_ARM64_GRET_LDAPR)
+// FEAT_LRCPC's ldapr: acquire against release-stores only, rather than ldar's
+// full acquire against everything. That is exactly the ordering a gadget
+// dispatch needs -- it must not see a stale next-gadget pointer, and nothing
+// more -- and it is the cheaper instruction on cores that implement it.
+//
+// NOT SAFE EVERYWHERE, and this is a build-time choice: ldapr is undefined
+// before ARMv8.3 and a binary using it SIGILLs on an older core rather than
+// running slowly. Never select it for a build that ships to more than one
+// device. Read /proc/ish/cpu_features on the target first: gret_ldapr_possible
+// says whether that device has FEAT_LRCPC at all.
+.if \pop != 0
+    add _ip, _ip, \pop*8
+.endif
+    ldapr x9, [_ip]
+#elif defined(ISH_ARM64_GRET_LDAR)
 .if \pop != 0
     add _ip, _ip, \pop*8
 .endif

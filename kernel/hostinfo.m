@@ -745,6 +745,55 @@ char *copyHostCoreTopology(void) {
     return strdup([summary UTF8String]);
 }
 
+// Apple publishes each optional extension as its own hw.optional.arm.FEAT_*
+// sysctl (0/1). Query by name rather than deriving from a CPU model: a table
+// of "which chip has what" is wrong the day a new one ships, and this is
+// exactly the question the OS will answer directly.
+static bool readSysctlFlag(const char *name) {
+    int value = 0;
+    size_t size = sizeof(value);
+    if (sysctlbyname(name, &value, &size, NULL, 0) != 0)
+        return false;
+    return value != 0;
+}
+
+void hostCpuFeatures(struct host_cpu_features *out) {
+    if (out == NULL)
+        return;
+    *out = (struct host_cpu_features) {0};
+
+    out->flagm  = readSysctlFlag("hw.optional.arm.FEAT_FlagM");
+    out->flagm2 = readSysctlFlag("hw.optional.arm.FEAT_FlagM2");
+    out->lrcpc  = readSysctlFlag("hw.optional.arm.FEAT_LRCPC");
+    out->lrcpc2 = readSysctlFlag("hw.optional.arm.FEAT_LRCPC2");
+    out->lse    = readSysctlFlag("hw.optional.arm.FEAT_LSE");
+    out->lse2   = readSysctlFlag("hw.optional.arm.FEAT_LSE2");
+    out->sve    = readSysctlFlag("hw.optional.arm.FEAT_SVE");
+    out->sme    = readSysctlFlag("hw.optional.arm.FEAT_SME");
+
+    // Older systems predate the per-feature sysctls and answer only the
+    // umbrella hw.optional.armv8_1_atomics style names; treat those as the
+    // floor rather than reporting a modern core as featureless.
+    if (!out->lse)
+        out->lse = readSysctlFlag("hw.optional.armv8_1_atomics");
+
+    // No sysctl names the architecture revision, so derive a floor from what
+    // is present. Reported as a floor, never as an exact claim.
+    const char *isa = "";
+    if (out->sme)          isa = "ARMv9.2-A or later";
+    else if (out->flagm2)  isa = "ARMv8.5-A or later";
+    else if (out->lrcpc2 || out->flagm) isa = "ARMv8.4-A or later";
+    else if (out->lrcpc)   isa = "ARMv8.3-A or later";
+    else if (out->lse)     isa = "ARMv8.1-A or later";
+    else                   isa = "ARMv8.0-A";
+    strlcpy(out->isa, isa, sizeof(out->isa));
+
+    // "Valid" means the host answered something, not that features exist: an
+    // ARMv8.0 device legitimately reports every optional feature false, and
+    // that must not read the same as "we could not ask".
+    out->valid = true;
+}
+
 void hostCacheGeometry(struct host_cache_geometry *out) {
     if (out == NULL)
         return;

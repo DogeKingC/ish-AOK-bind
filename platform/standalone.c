@@ -18,6 +18,10 @@
 #include "jit/jit.h"
 #include "kernel/errno.h"
 #include "kernel/hostinfo.h"
+#if defined(__linux__) && defined(__aarch64__)
+#include <sys/auxv.h>
+#include <asm/hwcap.h>
+#endif
 
 void ISHDiagnosticsRecordGuestFatalSync(const char *kind, const char *summary, const char *detail) {
     if (getenv("ISH_TRACE_GUEST_FATAL") == NULL)
@@ -112,6 +116,68 @@ char *copyHostCoreTopology(void) {
         cpus = 1;
     snprintf(buf, sizeof(buf), "%ld", cpus);
     return strdup(buf);
+}
+
+void hostCpuFeatures(struct host_cpu_features *out) {
+    if (out == NULL)
+        return;
+    *out = (struct host_cpu_features) {0};
+#if defined(__APPLE__)
+    // Same per-feature sysctls as the app build (kernel/hostinfo.m).
+    int v; size_t sz;
+#define ISH_FEAT(field, name) \
+    do { v = 0; sz = sizeof(v); \
+         if (sysctlbyname(name, &v, &sz, NULL, 0) == 0) out->field = v != 0; } while (0)
+    ISH_FEAT(flagm,  "hw.optional.arm.FEAT_FlagM");
+    ISH_FEAT(flagm2, "hw.optional.arm.FEAT_FlagM2");
+    ISH_FEAT(lrcpc,  "hw.optional.arm.FEAT_LRCPC");
+    ISH_FEAT(lrcpc2, "hw.optional.arm.FEAT_LRCPC2");
+    ISH_FEAT(lse,    "hw.optional.arm.FEAT_LSE");
+    ISH_FEAT(lse2,   "hw.optional.arm.FEAT_LSE2");
+    ISH_FEAT(sve,    "hw.optional.arm.FEAT_SVE");
+    ISH_FEAT(sme,    "hw.optional.arm.FEAT_SME");
+#undef ISH_FEAT
+    out->valid = true;
+#elif defined(__linux__) && defined(__aarch64__)
+    // Linux answers through the aux vector rather than sysctl.
+    unsigned long cap = getauxval(AT_HWCAP);
+    unsigned long cap2 = getauxval(AT_HWCAP2);
+#ifdef HWCAP_ATOMICS
+    out->lse = (cap & HWCAP_ATOMICS) != 0;
+#endif
+#ifdef HWCAP_LRCPC
+    out->lrcpc = (cap & HWCAP_LRCPC) != 0;
+#endif
+#ifdef HWCAP_ILRCPC
+    out->lrcpc2 = (cap & HWCAP_ILRCPC) != 0;
+#endif
+#ifdef HWCAP_FLAGM
+    out->flagm = (cap & HWCAP_FLAGM) != 0;
+#endif
+#ifdef HWCAP2_FLAGM2
+    out->flagm2 = (cap2 & HWCAP2_FLAGM2) != 0;
+#endif
+#ifdef HWCAP_SVE
+    out->sve = (cap & HWCAP_SVE) != 0;
+#endif
+#ifdef HWCAP2_SME
+    out->sme = (cap2 & HWCAP2_SME) != 0;
+#endif
+    (void) cap; (void) cap2;
+    out->valid = true;
+#else
+    // Not an ARM host: every field stays false, and valid stays false so the
+    // reader can tell "no ARM extensions here" from "an ARM core with none".
+#endif
+    if (out->valid) {
+        const char *isa = "ARMv8.0-A";
+        if (out->sme) isa = "ARMv9.2-A or later";
+        else if (out->flagm2) isa = "ARMv8.5-A or later";
+        else if (out->lrcpc2 || out->flagm) isa = "ARMv8.4-A or later";
+        else if (out->lrcpc) isa = "ARMv8.3-A or later";
+        else if (out->lse) isa = "ARMv8.1-A or later";
+        snprintf(out->isa, sizeof(out->isa), "%s", isa);
+    }
 }
 
 void hostCacheGeometry(struct host_cache_geometry *out) {

@@ -433,6 +433,45 @@ static int proc_ish_show_host_info(struct proc_entry *UNUSED(entry), struct proc
     return 0;
 }
 
+// What the host CPU can actually do, as opposed to what the build assumed.
+// One binary ships to every device from an ARMv8.0 iPad up, so "which
+// extensions exist here" is a per-device question and has to be answered on
+// the device -- and the dispatch A/B in jit/gadgets-aarch64/gadgets.h is the
+// standing proof that the right answer differs by 2x across that range.
+static int proc_ish_show_cpu_features(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    struct host_cpu_features f;
+    hostCpuFeatures(&f);
+    if (!f.valid) {
+        proc_printf(buf, "host CPU features unavailable (not an ARM host, or the OS would not say)\n");
+        return 0;
+    }
+    proc_printf(buf, "isa_floor %s\n", f.isa[0] != '\0' ? f.isa : "unknown");
+    proc_printf(buf, "flagm %s\n",  f.flagm  ? "yes" : "no");
+    proc_printf(buf, "flagm2 %s\n", f.flagm2 ? "yes" : "no");
+    proc_printf(buf, "lrcpc %s\n",  f.lrcpc  ? "yes" : "no");
+    proc_printf(buf, "lrcpc2 %s\n", f.lrcpc2 ? "yes" : "no");
+    proc_printf(buf, "lse %s\n",    f.lse    ? "yes" : "no");
+    proc_printf(buf, "lse2 %s\n",   f.lse2   ? "yes" : "no");
+    proc_printf(buf, "sve %s\n",    f.sve    ? "yes" : "no");
+    proc_printf(buf, "sme %s\n",    f.sme    ? "yes" : "no");
+
+    // The build's dispatch choice next to what the CPU supports, because the
+    // pair is the actionable part: a build using the cheaper spelling on a
+    // core that implements it conservatively is the 2x regression this
+    // project already measured once, and it is invisible otherwise.
+#if defined(ISH_ARM64_GRET_LDAPR)
+    proc_printf(buf, "gret ldapr\n");
+    if (!f.lrcpc)
+        proc_printf(buf, "gret_MISMATCH this build needs FEAT_LRCPC and this CPU lacks it\n");
+#elif defined(ISH_ARM64_GRET_LDAR)
+    proc_printf(buf, "gret ldar\n");
+#else
+    proc_printf(buf, "gret dmb\n");
+#endif
+    proc_printf(buf, "gret_ldapr_possible %s\n", f.lrcpc ? "yes" : "no");
+    return 0;
+}
+
 struct proc_children proc_ish_children = PROC_CHILDREN({
     {"amd64_jit", S_IFREG | 0644, .show = proc_ish_show_amd64_jit, .update = proc_ish_update_amd64_jit},
     {"amd_jit", S_IFREG | 0644, .show = proc_ish_show_amd64_jit, .update = proc_ish_update_amd64_jit},
@@ -444,6 +483,7 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"UIDevice", .show = proc_ish_show_uidevice},
     {"binder", .show = binder_show_state},
     {"colors", .show = proc_ish_show_colors},
+    {"cpu_features", .show = proc_ish_show_cpu_features},
     {".defaults", S_IFDIR, .readdir = proc_ish_underlying_defaults_readdir},
     {"defaults", S_IFDIR, .readdir = proc_ish_defaults_readdir},
     {"documents", .show = proc_ish_show_documents},
