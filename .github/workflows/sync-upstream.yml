@@ -11,7 +11,11 @@ name: Sync with upstream
 # conflict, which stops the run rather than resolving it blind.
 #
 # Nothing lands on `working` unless the merge was clean, this fork's own code
-# is still present afterwards, and the tree still builds and passes tests.
+# is still present afterwards, and the tree still builds and passes tests --
+# for BOTH engines. The i386 tests run natively; the arm64 ones run under
+# qemu-user against a cross-built emulator, because the arm64 gadget set is
+# aarch64-host-only and is otherwise not even compiled on this runner, which
+# would let an upstream commit break it invisibly and surface only on a phone.
 # Anything else opens an issue and leaves `working` untouched.
 #
 # When a clean merge then fails its checks, the issue also says whether a
@@ -142,6 +146,70 @@ jobs:
           sudo apt-get install -y gcc-multilib
           bash tools/run-guest-tests.sh build
 
+      # The i386 tests above run the i386 engine. They say nothing at all about
+      # the arm64 one, which is aarch64-host-only -- on this x86_64 runner the
+      # entire arm64 gadget set is not even compiled, so an upstream commit
+      # that broke it would merge, build, pass everything here, and only
+      # surface as a crash on someone's phone. Upstream edits jit/gen.c and the
+      # gadget sets constantly, so that is the likeliest way for a sync to
+      # break this fork's actual target.
+      #
+      # tools/run-arm64-guest-tests.sh closes that: it cross-builds iSH for
+      # aarch64-linux and runs the guest tests under qemu-user. Slower than the
+      # i386 pass but well inside the job timeout, and it is the only automated
+      # coverage the arm64 engine has anywhere.
+      - name: Set up the aarch64 cross toolchain
+        if: steps.merge.outputs.clean == 'true'
+        run: |
+          set -euo pipefail
+          # arm64 packages come from ports.ubuntu.com, not archive.ubuntu.com,
+          # so the existing sources have to be pinned to amd64 first or apt
+          # 404s on every arm64 index.
+          sudo python3 - <<'PY'
+          import glob, os
+          for path in glob.glob('/etc/apt/sources.list.d/ubuntu.sources'):
+              stanzas = open(path).read().split('\n\n')
+              out = []
+              for s in stanzas:
+                  if 'Types:' in s and 'Architectures:' not in s:
+                      s = s.replace('Types: deb', 'Types: deb\nArchitectures: amd64', 1)
+                  out.append(s)
+              open(path, 'w').write('\n\n'.join(out))
+          if os.path.exists('/etc/apt/sources.list'):
+              lines = open('/etc/apt/sources.list').read().splitlines()
+              open('/etc/apt/sources.list', 'w').write('\n'.join(
+                  l.replace('deb ', 'deb [arch=amd64] ', 1)
+                  if l.startswith('deb ') and '[arch=' not in l else l
+                  for l in lines) + '\n')
+          open('/etc/apt/sources.list.d/ports-arm64.sources', 'w').write(
+              "Types: deb\nArchitectures: arm64\n"
+              "URIs: http://ports.ubuntu.com/ubuntu-ports/\n"
+              "Suites: noble noble-updates\nComponents: main universe\n"
+              "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n")
+          PY
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm qemu-user-static \
+              gcc-aarch64-linux-gnu libsqlite3-dev:arm64
+          # Installing a gcc cross package can take /usr/include/asm with it,
+          # which silently breaks every -m32 compile (i.e. the i386 guest tests
+          # above, if the step order ever changes). Cheap to re-assert.
+          if [ ! -e /usr/include/asm ]; then
+            sudo ln -sfn x86_64-linux-gnu/asm /usr/include/asm
+          fi
+
+      # tagged_pointer is deliberately excluded: its `atomics` probe fails
+      # under qemu-user and passes on device, because qemu clears the exclusive
+      # monitor far more eagerly than a real core (see the script's header).
+      # Gating an automated push on a known host artifact would mean a red sync
+      # every morning, which is how a gate stops being read.
+      - name: Run the arm64 guest tests under qemu-user
+        if: steps.merge.outputs.clean == 'true'
+        run: |
+          bash tools/run-arm64-guest-tests.sh \
+            ands_bcond_fusion arm64_regress atomics64 hle_loop \
+            ptrace_singlestep smc_stale_block stlr_ldar_publish vector_smoke
+
       - name: Push to working
         if: steps.merge.outputs.clean == 'true'
         run: git push origin working
@@ -182,8 +250,17 @@ jobs:
           set -uo pipefail
           git worktree add /tmp/upstream-baseline "upstream/$UPSTREAM_BRANCH"
           cd /tmp/upstream-baseline
-          # run-guest-tests.sh is this fork's, not upstream's, so bring it.
+          # The test harnesses are this fork's, not upstream's, so bring them --
+          # including the arm64 one, whose whole point is that upstream has no
+          # equivalent and so cannot be asked about arm64 any other way. It
+          # needs the cross file and the meson.build gate that builds a CLI
+          # executable for a Linux cross target, neither of which upstream has;
+          # without the gate the cross build produces no `ish` and the arm64
+          # verdict would be a toolchain artifact rather than a fact about
+          # upstream, so it is skipped rather than guessed at.
           cp "$GITHUB_WORKSPACE/tools/run-guest-tests.sh" tools/ 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE/tools/run-arm64-guest-tests.sh" tools/ 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE/tools/cross-aarch64.ini" tools/ 2>/dev/null || true
           cp "$GITHUB_WORKSPACE"/alpine-minirootfs-*.tar.xz . 2>/dev/null || true
           verdict="upstream builds and tests clean; this merge is what broke it"
           if ! meson setup build -Dengine=jit >/tmp/base-cfg.log 2>&1; then
@@ -191,7 +268,13 @@ jobs:
           elif ! ninja -C build >/tmp/base-build.log 2>&1; then
             verdict="upstream does not BUILD either; the breakage is not from this merge"
           elif ! bash tools/run-guest-tests.sh build >/tmp/base-test.log 2>&1; then
-            verdict="upstream builds but fails the guest tests too; the breakage is not from this merge"
+            verdict="upstream builds but fails the i386 guest tests too; the breakage is not from this merge"
+          elif grep -q "host_machine.system() == 'linux'" meson.build 2>/dev/null &&
+               ! ISH_ARM64_WORK=/tmp/base-arm64 bash tools/run-arm64-guest-tests.sh \
+                   ands_bcond_fusion arm64_regress atomics64 hle_loop \
+                   ptrace_singlestep smc_stale_block stlr_ldar_publish vector_smoke \
+                   >/tmp/base-arm64.log 2>&1; then
+            verdict="upstream builds but fails the arm64 guest tests too; the breakage is not from this merge"
           fi
           echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
           echo "$verdict"
@@ -218,7 +301,7 @@ jobs:
             DETAIL=$'Conflicting files:\n\n```\n'"$CONFLICTED"$'\n```'
           else
             REASON="The merge was clean, but the merged tree failed its checks."
-            DETAIL="One of: this fork's own code did not survive the merge (tools/check-fork-additions.sh), the build failed, the unit/e2e tests failed, or this fork's guest regression tests failed (tools/run-guest-tests.sh -- binder/ashmem behaviour). The run log says which."
+            DETAIL="One of: this fork's own code did not survive the merge (tools/check-fork-additions.sh), the build failed, the unit/e2e tests failed, this fork's i386 guest regression tests failed (tools/run-guest-tests.sh -- binder/ashmem behaviour), or the arm64 guest tests failed under qemu-user (tools/run-arm64-guest-tests.sh -- the arm64 gadget set, which nothing else here compiles). The run log says which."
           fi
           # The baseline verdict goes near the top: it decides whether the
           # next step is "fix the merge" or "fix/wait on upstream", and that
