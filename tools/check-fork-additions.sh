@@ -95,6 +95,18 @@ need_in kernel/user.c  guest_abi_untag_addr "syscall pointers are untagged"
 need_in emu/arm64_interp.c guest_abi_untag_addr "interpreter loads/stores are untagged"
 need_in fs/aok-tests.manifest             arm64/tagged_pointer.c
 need_in tests/manual/setup-regressions.sh tagged_pointer
+need_in kernel/calls.c guest_abi_untag_addr \
+    "the fault handler resolves arm64 faults untagged, as Linux's do_page_fault does"
+
+# --- arm64 guest: testable without a device ---------------------------------
+# The arm64 engine is aarch64-host-only, so on an x86_64 dev box every gadget
+# in it is unreachable and the only feedback loop is building an IPA. This
+# harness cross-builds iSH for aarch64-linux and runs the guest tests under
+# qemu-user instead. Losing it silently puts that loop back to hours.
+need_file tools/cross-aarch64.ini
+need_file tools/run-arm64-guest-tests.sh
+need_in meson.build "host_machine.system() == 'linux'" \
+    "a Linux cross build still produces the CLI executable to run"
 
 # --- permissive SELinux stub ----------------------------------------------
 need_file fs/selinuxfs.c

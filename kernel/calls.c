@@ -4835,7 +4835,43 @@ static guest_addr_t current_fault_ip(const struct cpu_state *cpu) {
 }
 
 void handle_page_fault_interrupt(struct cpu_state *cpu) {
-    void *ptr = mem_ptr_fault(current->mem, cpu->segfault_addr,
+    // AArch64 TBI: bits 56-63 are not part of the address, so the fault has to
+    // be RESOLVED against the untagged one. This is not a workaround for a
+    // missing mask somewhere upstream of here -- it is what Linux's own
+    // do_page_fault does, on its very first line, before it has any idea which
+    // vma the access belongs to (`addr = untagged_addr(far)`). A tagged
+    // address that reaches this function is a perfectly ordinary event on a
+    // guest whose allocator tags pointers: every copy-on-write break and every
+    // first touch of a lazily-backed page arrives here, and resolving the
+    // literal 64-bit value would fail every one of them.
+    //
+    // si_addr still reports what the guest computed, tag and all -- also what
+    // Linux reports, because it hands the raw FAR to the signal frame.
+    guest_addr_t fault_addr = cpu->segfault_addr;
+    if (current->abi == GUEST_ABI_ARM64) {
+        fault_addr = (guest_addr_t)
+            guest_abi_untag_addr(GUEST_ABI_ARM64, cpu->segfault_addr);
+        // Still worth saying out loud, rate-limited: everything BELOW this
+        // function is supposed to have stripped the tag already (the JIT's
+        // read_prep/write_prep do it before the TLB index, the syscall
+        // helpers before the range check), so a tagged address surfacing here
+        // means one path did not, and the recovery above is hiding it.
+        static unsigned tagged_fault_log_count;
+        enum { TAGGED_FAULT_LOG_BUDGET = 8 };
+        if (fault_addr != cpu->segfault_addr &&
+                tagged_fault_log_count < TAGGED_FAULT_LOG_BUDGET) {
+            tagged_fault_log_count++;
+            printk("arm64: fault address %#llx carries a TBI tag (%#x); "
+                   "resolving %#llx at pc %#llx -- the tag should have been "
+                   "stripped before it got this far\n",
+                   (unsigned long long) cpu->segfault_addr,
+                   (unsigned) (cpu->segfault_addr >> 56),
+                   (unsigned long long) fault_addr,
+                   (unsigned long long) current_fault_ip(cpu));
+        }
+    }
+
+    void *ptr = mem_ptr_fault(current->mem, fault_addr,
                               cpu->segfault_was_write ? MEM_WRITE : MEM_READ);
 
     if (ptr == NULL) {
@@ -4860,16 +4896,16 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
             // costs one line and is the difference between "a wild pointer"
             // and "one missing mask" -- which is exactly how long the first
             // one of these took to work out.
-            guest_addr_t untagged =
-                (guest_addr_t) guest_abi_untag_addr(GUEST_ABI_ARM64, cpu->segfault_addr);
-            if (untagged != cpu->segfault_addr)
-                printk("  TAGGED POINTER: tag=%#x untagged=%#llx (%s) -- "
-                       "this address should have been untagged before it got here\n",
+            //
+            // Reaching here with a tag now means the UNTAGGED address is
+            // unmapped too (the resolution above already retried it), so this
+            // is a genuine wild pointer rather than a missing mask -- say
+            // which, so the next reader does not re-run the same hunt.
+            if (fault_addr != cpu->segfault_addr)
+                printk("  TAGGED POINTER: tag=%#x untagged=%#llx (unmapped "
+                       "as well, so the tag is not what killed it)\n",
                        (unsigned) (cpu->segfault_addr >> 56),
-                       (unsigned long long) untagged,
-                       mem_ptr_fault(current->mem, untagged,
-                                     cpu->segfault_was_write ? MEM_WRITE : MEM_READ) != NULL
-                           ? "mapped" : "unmapped");
+                       (unsigned long long) fault_addr);
             dump_addr_backing("  pc-backing", current_fault_ip(cpu));
             dump_arm64_fault_memdump(cpu);
             arm64_watch_dump();
@@ -4896,7 +4932,7 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
         }
         record_guest_fault_event("page-fault", cpu, cpu->segfault_addr, cpu->segfault_was_write);
         struct siginfo_ info = {
-            .code = mem_segv_reason(current->mem, cpu->segfault_addr),
+            .code = mem_segv_reason(current->mem, fault_addr),
             .fault.addr = cpu->segfault_addr,
         };
         dump_stack(8);

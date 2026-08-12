@@ -402,7 +402,7 @@ static void check_literal_loads(void) {
         "1: .dword 0x0123456789abcdef\n"
         "   .dword 0xfedcba9876543210\n"
         "2:\n"
-        : "=m"(qgot) :: "q0");
+        : "=m"(qgot) :: "v0");  // "v0", not "q0": clang only knows the v-name, gcc knows both
     if (qgot[0] != 0x0123456789abcdefULL || qgot[1] != 0xfedcba9876543210ULL)
         failf("ldr q (literal)", qgot[0], qgot[1], 0, 0x0123456789abcdefULL, 0xfedcba9876543210ULL, 0);
     else

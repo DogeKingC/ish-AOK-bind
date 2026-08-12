@@ -221,27 +221,68 @@ it raw:
   to the caller: silently mapping at a tagged address would be worse than the
   fault it replaced.
 
-**Open: libc `memset`/`memcpy` on a tagged pointer.** The test's bulk probes
-still die at every size. What is known:
+**Handled, with the leak itself still unidentified: libc `memset`/`memcpy` on
+a tagged pointer.** The test's bulk probes died at every size, on device,
+with `si_addr` equal to the tagged pointer and a fault address that
+`handle_page_fault_interrupt` could not resolve.
+
+`handle_page_fault_interrupt` now resolves an arm64 fault against the
+UNTAGGED address. That is not a workaround bolted on to hide a missing mask;
+it is the first thing Linux's own `do_page_fault` does (`addr =
+untagged_addr(far)`), before it has any idea which vma the access belongs to.
+A guest whose allocator tags pointers takes ordinary copy-on-write and
+first-touch faults through tagged addresses all day, and resolving the literal
+64-bit value fails every one of them. `si_addr` still carries the tag, which
+is also what Linux reports, because it hands the raw FAR to the signal frame.
+
+Something below that function is still handing it a tagged address, and that
+is a real bug worth finding. Two probes now say where it is not:
+
+- `emu/tlb.c`'s `tlb_handle_miss` logs (rate-limited, with the calling gadget's
+  return address) if a tagged address reaches the TLB layer. It firing means a
+  gadget skipped its prep macro; it staying silent means the TLB layer was
+  clean and `cpu->segfault_addr` picked the tag up elsewhere.
+- The fault handler logs, rate-limited, every tagged fault address it had to
+  untag, with the pc.
+
+What is known, and what turned out to be worth less than it looked:
 
 - It is not the tag reaching an unmasked instruction. `strb`, `ldrb`, `dup`,
   `str q0` and `stp q0,q0` all pass in isolation against the same tagged
   address in the same process.
-- It is not the build flags. The real test fails built plainly and built with
-  `-pthread -lm -ldl`; a minimal repro passes either way.
-- It is not `dc zva`, the size of a preceding memset, a `printf` between, or
-  the parent writing the page before forking. Each was tested and cleared.
-- `memset` resolves to the same address in a passing and a failing binary, so
-  it is the same code being executed.
-- A near-verbatim standalone replica of the failing probe DOES crash, while a
-  bisected version of that same replica does not -- so it is sensitive to the
-  binary's layout rather than to any element of the source.
+- It is not the build flags, `dc zva` (`DCZID_EL0` advertises `DZP=1`, so musl
+  never takes that path), a `printf` between, or the parent writing the page
+  before forking.
+- **The fusion A/B was not a real A/B.** `/proc/ish/arm64_jit_fuse` arrived
+  with upstream's `0f26b25`, which postdates the IPA the device run used, so
+  `all=0` wrote to a file that did not exist and changed nothing. JIT fusion
+  is back on the list of things not ruled out, and a build with the knob
+  present can now test it properly.
+- The one probe that passes, `libc memset(tagged, 1)`, differs from the ten
+  that fail only in the size of the UNTAGGED memset it does first -- 8 bytes
+  rather than a full page. So the tagged access is poisoned by what ran before
+  it, not by anything about itself.
 
 The fault is always reported at the callee's FIRST instruction -- `dup
 v0.16b, w1` for memset, `add x4, x1, x2` for memcpy -- neither of which has a
-memory operand. `memory.S`'s fault-restart contract says the reported PC
-should name the faulting sub-instruction, so either that contract is not
-holding here or the fault is raised at a block boundary rather than by an
-access. Resolving that is the next step: an attribution that names an
-arithmetic instruction as the faulting one has misled this hunt repeatedly,
-and it is worth trusting only after it has been checked.
+memory operand, and both of which are block-entry pcs. `memory.S`'s
+fault-restart contract says the reported PC names the faulting
+sub-instruction, so either that contract is not holding here or the fault is
+raised at a block boundary rather than by an access.
+
+### Reproducing arm64-guest bugs without a device
+
+`tools/run-arm64-guest-tests.sh` cross-builds iSH for aarch64-linux (clang,
+`tools/cross-aarch64.ini`) and runs `tests/manual/arm64/*` under qemu-user
+against a real Alpine aarch64 rootfs, so the arm64 gadget set executes for
+real on an x86_64 development machine. Eight of the nine tests pass there
+today.
+
+It does NOT reproduce this bug, which is itself a data point: qemu-user is
+*stricter* about tags than real hardware (an arm64 core ignores bits 56-63 on
+a dereference, so a gadget that forgets to mask still works on device and
+faults here), and the memset probes pass under it at both the pre-merge and
+current trees. `tagged_pointer`'s own `atomics` probe fails there and passes
+on device -- qemu clears the exclusive monitor far more eagerly than a real
+core, so LDXR/STXR sequences with interleaved accesses are not comparable.
+Read a failure there as a lead and a pass as one host's worth of evidence.

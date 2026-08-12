@@ -501,7 +501,36 @@ bool __tlb_write_cross_page(struct tlb *tlb, guest_addr_t addr, const char *valu
     return true;
 }
 
+// AArch64 TBI leak probe. Every arm64-guest path that can reach this function
+// is supposed to have stripped the top byte already -- the JIT's
+// read_prep/write_prep (jit/guest-arm64/gadgets.h) mask before they compute
+// the TLB index, the interpreter masks in arm64_mem_read/write, and the
+// syscall helpers mask in kernel/user.c. So a tagged address arriving HERE
+// says the leak is below the kernel, in whichever caller is one frame up,
+// and a tagged address that reaches handle_page_fault_interrupt WITHOUT this
+// firing says the opposite: the TLB layer was fine and cpu->segfault_addr
+// picked the tag up somewhere else.
+//
+// That one bit is the difference between searching the gadget set and
+// searching the fault plumbing, which is worth a branch on a path that
+// already calls mmu_translate. The return address narrows it further: the
+// arm64 gadget helpers (arm64_handle_read_miss, arm64_handle_write_miss,
+// arm64_resolve_write_ptr, arm64_crosspage_load/store, memory.S) are each a
+// dozen instructions, so the printed value lands inside exactly one of them.
+static void tlb_note_tagged_miss(guest_addr_t addr, int type, void *from) {
+    enum { TAGGED_MISS_LOG_BUDGET = 8 };
+    static unsigned tagged_miss_log_count;
+    if (tagged_miss_log_count >= TAGGED_MISS_LOG_BUDGET)
+        return;
+    tagged_miss_log_count++;
+    printk("arm64: TLB miss on TAGGED address %#llx (%s), called from %p -- "
+           "the tag survived past the gadget's prep macro\n",
+           (unsigned long long) addr, type == MEM_WRITE ? "write" : "read", from);
+}
+
 __no_instrument void *tlb_handle_miss(struct tlb *tlb, guest_addr_t addr, int type) {
+    if (unlikely((addr >> 56) != 0))
+        tlb_note_tagged_miss(addr, type, __builtin_return_address(0));
     char *ptr = mmu_translate(tlb->mmu, TLB_PAGE(addr), type);
     if (atomic_load_explicit(&tlb->mmu->changes, memory_order_relaxed) != tlb->mem_changes)
         tlb_flush(tlb);

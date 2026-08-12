@@ -262,7 +262,12 @@ static void check_builtins(void) {
 
 static uint64_t stress_counter;
 static uint32_t stress_or_field;
-static _Atomic int mp_flag;
+// Plain int, not _Atomic: the accesses below are all __atomic_* builtins,
+// which clang rejects outright when handed an _Atomic operand ("address
+// argument to atomic operation must be a pointer to integer or pointer").
+// gcc accepts both spellings, so the qualifier bought nothing and cost the
+// clang build -- which is the one tools/run-arm64-guest-tests.sh uses.
+static int mp_flag;
 static uint64_t mp_data;
 static unsigned mp_bad;
 

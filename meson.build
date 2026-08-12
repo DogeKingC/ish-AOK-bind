@@ -331,7 +331,14 @@ if get_option('kernel') == 'ish'
         dependencies: dependencies,
         include_directories: includes)
 
-    if not meson.is_cross_build()
+    # The CLI executable is skipped for the iOS cross build because Xcode links
+    # the app itself from these libraries (xcode-meson.sh, system = 'darwin').
+    # A cross build targeting LINUX is a different thing entirely -- it is how
+    # tools/run-arm64-guest-tests.sh gets an aarch64-host `ish` to run under
+    # qemu-user from an x86_64 machine, which is the only way to exercise the
+    # arm64-GUEST gadget set without a physical arm64 box. Nothing links it for
+    # us there, so build it.
+    if not meson.is_cross_build() or host_machine.system() == 'linux'
         executable('ish', ['main.c'], dependencies: ish,
             c_args: ['-DISH_SOURCE_ROOT="' + meson.project_source_root() + '"'])
     endif
