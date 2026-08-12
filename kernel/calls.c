@@ -4871,8 +4871,45 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
         }
     }
 
-    void *ptr = mem_ptr_fault(current->mem, fault_addr,
-                              cpu->segfault_was_write ? MEM_WRITE : MEM_READ);
+    // A fault that RESOLVES and then immediately re-faults at the same pc and
+    // the same address is not progress, it is a loop -- and an emulator that
+    // loops is strictly worse than one that crashes. A crash names a pc and
+    // leaves a log; a loop wedges the app until iOS kills it, taking the
+    // kernel log with it, and every measurement after that is guesswork.
+    //
+    // Observed for real, and caused by the untagging above: the tagged fault
+    // resolved, the guest re-executed the faulting instruction, the access
+    // presented the same tagged address again, and the pair spun. Resolution
+    // succeeding is not the same as the access being able to complete, and
+    // where it isn't, falling back to the signal is the honest answer -- it is
+    // also exactly what happened before the untagging existed.
+    static __thread guest_addr_t last_fault_addr;
+    static __thread guest_addr_t last_fault_ip;
+    static __thread unsigned same_fault_count;
+    enum { SAME_FAULT_LIMIT = 16 };
+    guest_addr_t fault_ip = current_fault_ip(cpu);
+    bool looping = false;
+    if (cpu->segfault_addr == last_fault_addr && fault_ip == last_fault_ip) {
+        if (++same_fault_count > SAME_FAULT_LIMIT) {
+            looping = true;
+            same_fault_count = 0;
+            printk("ERROR: %d(%s) [%s] fault on %#llx at %#llx keeps resolving "
+                   "and re-faulting (%d times); delivering SIGSEGV rather than "
+                   "spinning -- the access cannot complete even though the page "
+                   "is there\n",
+                   current->pid, current->comm, guest_abi_desc(current->abi).name,
+                   (unsigned long long) cpu->segfault_addr,
+                   (unsigned long long) fault_ip, SAME_FAULT_LIMIT);
+        }
+    } else {
+        last_fault_addr = cpu->segfault_addr;
+        last_fault_ip = fault_ip;
+        same_fault_count = 0;
+    }
+
+    void *ptr = looping ? NULL
+                        : mem_ptr_fault(current->mem, fault_addr,
+                                        cpu->segfault_was_write ? MEM_WRITE : MEM_READ);
 
     if (ptr == NULL) {
         printk("ERROR: %d(%s) [%s] page fault on %#llx at %#llx%s\n",
@@ -4897,15 +4934,21 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
             // and "one missing mask" -- which is exactly how long the first
             // one of these took to work out.
             //
-            // Reaching here with a tag now means the UNTAGGED address is
-            // unmapped too (the resolution above already retried it), so this
-            // is a genuine wild pointer rather than a missing mask -- say
-            // which, so the next reader does not re-run the same hunt.
+            // Two very different things end up here now, and confusing them
+            // costs a session: the untagged address being unmapped too (a
+            // genuine wild pointer, the tag is not what killed it), or the
+            // untagged address being perfectly fine and the access still not
+            // completing (the loop cap above tripped -- a real emulator bug,
+            // and the tag IS implicated). Say which.
             if (fault_addr != cpu->segfault_addr)
-                printk("  TAGGED POINTER: tag=%#x untagged=%#llx (unmapped "
-                       "as well, so the tag is not what killed it)\n",
+                printk("  TAGGED POINTER: tag=%#x untagged=%#llx (%s)\n",
                        (unsigned) (cpu->segfault_addr >> 56),
-                       (unsigned long long) fault_addr);
+                       (unsigned long long) fault_addr,
+                       looping
+                           ? "MAPPED -- resolved and re-faulted until the loop "
+                             "cap tripped, so something below here is still "
+                             "seeing the tag"
+                           : "unmapped as well, so the tag is not what killed it");
             dump_addr_backing("  pc-backing", current_fault_ip(cpu));
             dump_arm64_fault_memdump(cpu);
             arm64_watch_dump();
