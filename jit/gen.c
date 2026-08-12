@@ -10799,12 +10799,27 @@ static inline bool gen_pop_reg_fused(struct gen_state *state, enum arg thing,
 // Applied ONLY to the seven store-back ALU ops. CMP and TEST keep lo() verbatim
 // below -- they have no store to save, and their op word must stay a literal entry
 // of sub_gadgets/and_gadgets for gen_try_fuse_jcc to pointer-match.
+//
+// HOST-GATED: the fused reg,imm gadget family is implemented only in the
+// aarch64 host gadget set (jit/gadgets-aarch64/math.S). Referencing it
+// unconditionally does not fail to compile -- the extern declaration is
+// happily accepted -- it fails to LINK, and only on hosts that build the
+// other gadget set. That is the x86_64 Linux build, which is both this
+// project's CI and the harness tools/run-guest-tests.sh runs the guest
+// regression suite under, so the breakage lands on the machine least likely
+// to be the one you are developing on.
+#if defined(__aarch64__)
 #define losf(o, src, dst, z) do { \
     extern gadget_t fused_##o##32_imm_gadgets[]; \
     if (!gen_alu_imm_fused(state, fused_##o##32_imm_gadgets, arg_##src, arg_##dst, &modrm, &imm, z)) { \
         los(o, src, dst, z); \
     } \
 } while (0)
+#else
+// Fusion is an optimisation, so a host without the gadgets takes the plain
+// expansion and is merely slower, never wrong.
+#define losf(o, src, dst, z) los(o, src, dst, z)
+#endif
 
 #define ADD(src, dst,z) losf(add, src, dst, z)
 #define OR(src, dst,z) losf(or, src, dst, z)
