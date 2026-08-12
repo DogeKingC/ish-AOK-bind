@@ -513,19 +513,63 @@ bool __tlb_write_cross_page(struct tlb *tlb, guest_addr_t addr, const char *valu
 //
 // That one bit is the difference between searching the gadget set and
 // searching the fault plumbing, which is worth a branch on a path that
-// already calls mmu_translate. The return address narrows it further: the
-// arm64 gadget helpers (arm64_handle_read_miss, arm64_handle_write_miss,
-// arm64_resolve_write_ptr, arm64_crosspage_load/store, memory.S) are each a
-// dozen instructions, so the printed value lands inside exactly one of them.
+// already calls mmu_translate.
+//
+// The caller is named, not just printed. A bare return address is useless on
+// the device this reproduces on: the image is position-independent, there is
+// no symbol table to hand, and nobody is going to subtract a load address off
+// a phone screen. The arm64 gadget helpers that can reach here are a handful
+// of hand-written stubs of a dozen instructions each (memory.S), so comparing
+// the return address against their entry points identifies the path exactly,
+// and the answer arrives already in words.
+#if defined(__aarch64__) && defined(ISH_JIT_ARM64_GUEST)
+extern void arm64_handle_read_miss(void), arm64_handle_write_miss(void),
+        arm64_resolve_write_ptr(void), arm64_crosspage_load(void),
+        arm64_crosspage_store(void);
+
+static const char *tlb_arm64_caller_name(void *from) {
+    static const struct { void (*fn)(void); const char *name; } helpers[] = {
+        {arm64_handle_read_miss,  "arm64_handle_read_miss"},
+        {arm64_handle_write_miss, "arm64_handle_write_miss"},
+        {arm64_resolve_write_ptr, "arm64_resolve_write_ptr"},
+        {arm64_crosspage_load,    "arm64_crosspage_load"},
+        {arm64_crosspage_store,   "arm64_crosspage_store"},
+    };
+    // Nearest entry point at or below the return address, within a stub's
+    // worth of instructions. These are `bl`-then-return stubs, so the return
+    // address sits a few instructions past the entry, never far.
+    enum { STUB_SPAN = 256 };
+    const char *best = NULL;
+    uintptr_t best_delta = STUB_SPAN;
+    for (unsigned i = 0; i < sizeof(helpers) / sizeof(helpers[0]); i++) {
+        uintptr_t entry = (uintptr_t) helpers[i].fn;
+        uintptr_t ret = (uintptr_t) from;
+        if (ret < entry)
+            continue;
+        if (ret - entry < best_delta) {
+            best_delta = ret - entry;
+            best = helpers[i].name;
+        }
+    }
+    return best != NULL ? best : "not one of the arm64 gadget helpers (C caller?)";
+}
+#else
+static const char *tlb_arm64_caller_name(void *from) {
+    (void) from;
+    return "n/a on this host";
+}
+#endif
+
 static void tlb_note_tagged_miss(guest_addr_t addr, int type, void *from) {
     enum { TAGGED_MISS_LOG_BUDGET = 8 };
     static unsigned tagged_miss_log_count;
     if (tagged_miss_log_count >= TAGGED_MISS_LOG_BUDGET)
         return;
     tagged_miss_log_count++;
-    printk("arm64: TLB miss on TAGGED address %#llx (%s), called from %p -- "
-           "the tag survived past the gadget's prep macro\n",
-           (unsigned long long) addr, type == MEM_WRITE ? "write" : "read", from);
+    printk("arm64: TLB miss on TAGGED address %#llx (%s), called from %p = %s "
+           "-- the tag survived past the gadget's prep macro\n",
+           (unsigned long long) addr, type == MEM_WRITE ? "write" : "read",
+           from, tlb_arm64_caller_name(from));
 }
 
 __no_instrument void *tlb_handle_miss(struct tlb *tlb, guest_addr_t addr, int type) {
