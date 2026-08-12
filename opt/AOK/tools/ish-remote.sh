@@ -162,6 +162,9 @@ code="${1:-${ISH_REMOTE_CODE:-}}"
 ct=$(cmd_topic "$code")
 ot=$(out_topic "$code")
 seen="${TMPDIR:-/tmp}/ish-remote.$code.seen"
+# The id currently being run, removed once it finishes. Its whole job is to
+# survive the listener NOT finishing -- see the startup report below.
+inflight="${TMPDIR:-/tmp}/ish-remote.$code.inflight"
 stopflag="${TMPDIR:-/tmp}/ish-remote.$code.stop"
 rm -f "$stopflag"
 # Ids already run. Kept across restarts so resuming does not replay the topic's
@@ -206,9 +209,25 @@ if [ "$keepalive" -eq 1 ]; then
     fi
 fi
 
+# A command is marked seen BEFORE it runs, deliberately: one that kills this
+# listener (or the whole app) must not be retried forever on every restart.
+# The cost of that is silence -- the far end sees a command it sent simply
+# never answered, and cannot tell it apart from one that was never delivered.
+# That happened for real: iSH was suspended mid-command, the listener came
+# back, skipped the id as already-seen, and the answer was just missing.
+# Reporting it on restart costs one message and turns "vanished" into "died
+# running this".
+if [ -s "$inflight" ]; then
+    dead_id=$(cat "$inflight" 2>/dev/null)
+    rm -f "$inflight"
+    startup_note=" -- NOTE: id $dead_id did not finish (the listener died or was suspended running it); it will NOT be retried, resend it with a new id if you still want it"
+else
+    startup_note=""
+fi
+
 # Announce readiness on the reply topic, so the far end knows the listener is
 # actually up before it starts sending into the void.
-if ! net_post_str "ish-remote up on $(uname -m 2>/dev/null): waiting for commands" \
+if ! net_post_str "ish-remote up on $(uname -m 2>/dev/null): waiting for commands$startup_note" \
         "$base/$ot" >/dev/null; then
     die "cannot use the relay: $net_error"
 fi
@@ -287,8 +306,12 @@ while [ "$i" -lt "$max" ]; do
     fi
     # stdin from /dev/null: a command that reads stdin must not consume the
     # queue, and an interactive one must fail rather than hang the listener.
+    # Note what is running before running it, so a listener that does not come
+    # back from this can say so next time it starts (see the startup note).
+    printf '%s\n' "$id" > "$inflight" 2>/dev/null
     sh -c "$cmd" > "$out" 2>&1 < /dev/null
     rc=$?
+    rm -f "$inflight" 2>/dev/null
     echo "rc=$rc" >> "$out"
     cat "$out"
 
