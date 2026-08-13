@@ -278,6 +278,79 @@ struct binder_proc {
 // ---------------------------------------------------------------------------
 
 static lock_t binder_lock = LOCK_INITIALIZER;
+
+// Pollers to poke once binder_lock is dropped.
+//
+// The wakeup cannot be done inline. binder_wakeup_* runs under binder_lock,
+// and a blocking poll_wakeup() from there takes fd->poll_lock -> poll->lock,
+// while a poll scan calling binder_poll takes poll->lock -> binder_lock: the
+// reverse order, so two threads hitting both paths at once AB-BA deadlock.
+//
+// The old answer was poll_wakeup_trylock(), which DISCARDS the wakeup when it
+// loses that race. For a thread blocked in BINDER_WRITE_READ that is
+// invisible -- it also gets notify() and wakes anyway -- which is why this
+// survived so long. An epoll-driven receiver has no second chance: it sleeps
+// in epoll_wait with a transaction already sitting in its queue, and nothing
+// will ever poke it again. Real Android receives exactly that way;
+// servicemanager epolls its binder fd.
+//
+// So record the fd here instead, and poke it with the blocking, non-lossy
+// poll_wakeup() the moment the lock is dropped. Recorded under binder_lock;
+// flushed by binder_unlock(), which is what every unlock site calls.
+#define BINDER_DEFERRED_WAKEUPS_MAX 8
+static struct {
+    struct fd *fds[BINDER_DEFERRED_WAKEUPS_MAX];
+    unsigned n;
+} binder_deferred_wakeups;
+
+// Records `fd` to be woken after the lock is dropped. Deduplicated, because a
+// single critical section routinely wakes the same process more than once
+// (work queued plus a completion), and the retain is what keeps the fd alive
+// between here and the flush -- _if_live because a concurrent last close may
+// already have taken the refcount to zero, and resurrecting it there would
+// race that close's free.
+static void binder_defer_wakeup(struct fd *fd) {
+    if (fd == NULL)
+        return;
+    for (unsigned i = 0; i < binder_deferred_wakeups.n; i++)
+        if (binder_deferred_wakeups.fds[i] == fd)
+            return;
+    if (binder_deferred_wakeups.n == BINDER_DEFERRED_WAKEUPS_MAX) {
+        // More distinct pollers in one critical section than this holds.
+        // Fall back to the old best-effort poke rather than dropping it
+        // outright: no worse than the behaviour this replaces, and the
+        // dedupe above makes reaching it very unlikely.
+        poll_wakeup_trylock(fd, POLL_READ);
+        return;
+    }
+    struct fd *held = fd_retain_if_live(fd);
+    if (held == NULL)
+        return; // already being closed; nothing there to wake
+    binder_deferred_wakeups.fds[binder_deferred_wakeups.n++] = held;
+}
+
+static bool binder_have_deferred_wakeups(void) {
+    return binder_deferred_wakeups.n > 0;
+}
+
+// Releases binder_lock and then delivers whatever accumulated under it.
+// Every unlock of binder_lock goes through here; the wakeups must happen
+// after the release, which is the entire point.
+static void binder_unlock(void) {
+    struct fd *fds[BINDER_DEFERRED_WAKEUPS_MAX];
+    unsigned n = binder_deferred_wakeups.n;
+    for (unsigned i = 0; i < n; i++)
+        fds[i] = binder_deferred_wakeups.fds[i];
+    binder_deferred_wakeups.n = 0;
+
+    unlock(&binder_lock);
+
+    for (unsigned i = 0; i < n; i++) {
+        poll_wakeup(fds[i], POLL_READ);
+        fd_close(fds[i]);
+    }
+}
+
 static struct list binder_procs = LIST_INITIALIZER(binder_procs);
 // Number of live binder_procs. Read without the lock by binder_task_exit to
 // keep do_exit free of binder cost on guests that never use it.
@@ -365,15 +438,13 @@ static void binder_wakeup_proc(struct binder_proc *proc) {
         if (thread->waiting && thread->wait_for_proc_work)
             notify(&thread->wait);
     }
-    if (proc->fd != NULL)
-        poll_wakeup_trylock(proc->fd, POLL_READ);
+    binder_defer_wakeup(proc->fd);
 }
 
 static void binder_wakeup_thread(struct binder_thread *thread) {
     if (thread->waiting)
         notify(&thread->wait);
-    if (thread->proc->fd != NULL)
-        poll_wakeup_trylock(thread->proc->fd, POLL_READ);
+    binder_defer_wakeup(thread->proc->fd);
 }
 
 static void binder_enqueue_thread_work(struct binder_thread *thread, struct binder_work *work) {
@@ -1663,6 +1734,22 @@ static int binder_thread_read(struct binder_proc *proc, struct binder_thread *th
         if (work == NULL) {
             if (cursor->consumed > sizeof(uint32_t) || non_block)
                 return 0;
+
+            // Deliver anything this pass queued for someone else BEFORE
+            // parking. wait_for drops binder_lock only once we are already
+            // committed to sleeping, so a wakeup still sitting in the deferred
+            // list would not go out until we ourselves were woken -- and the
+            // process waiting on it may be the only one who could do the
+            // waking. Dropping the lock here can change everything, so re-run
+            // the loop rather than falling through to the wait.
+            if (binder_have_deferred_wakeups()) {
+                binder_unlock();
+                lock(&binder_lock, 0);
+                if (thread->is_dead)
+                    return _EBADF;
+                continue;
+            }
+
             // Nothing to do: park until someone queues work for us.
             //
             // wait_for drops binder_lock while blocked, so the thread (and the
@@ -2111,7 +2198,7 @@ static int binder_open(int UNUSED(major), int minor, struct fd *fd) {
     lock(&binder_lock, 0);
     list_add_tail(&binder_procs, &proc->link);
     atomic_fetch_add(&binder_live_procs, 1);
-    unlock(&binder_lock);
+    binder_unlock();
 
     fd->data = proc;
     return 0;
@@ -2124,7 +2211,7 @@ static int binder_close(struct fd *fd) {
     lock(&binder_lock, 0);
     proc->fd = NULL;
     binder_deferred_release(proc);
-    unlock(&binder_lock);
+    binder_unlock();
     fd->data = NULL;
     return 0;
 }
@@ -2149,19 +2236,19 @@ static int binder_mmap(struct fd *fd, struct mem *mem, page_t start, pages_t pag
 
     lock(&binder_lock, 0);
     if (proc->kernel_map != NULL) {
-        unlock(&binder_lock);
+        binder_unlock();
         return _EBUSY; // one mapping per open, as on Linux
     }
 
     int host_fd = host_unlinked_tmpfd();
     if (host_fd < 0) {
-        unlock(&binder_lock);
+        binder_unlock();
         return host_fd;
     }
     if (ftruncate(host_fd, size) < 0) {
         int err = errno_map();
         close(host_fd);
-        unlock(&binder_lock);
+        binder_unlock();
         return err;
     }
 
@@ -2170,7 +2257,7 @@ static int binder_mmap(struct fd *fd, struct mem *mem, page_t start, pages_t pag
     if (kernel_map == MAP_FAILED) {
         int err = errno_map();
         close(host_fd);
-        unlock(&binder_lock);
+        binder_unlock();
         return err;
     }
 
@@ -2184,7 +2271,7 @@ static int binder_mmap(struct fd *fd, struct mem *mem, page_t start, pages_t pag
     if (err < 0) {
         munmap(kernel_map, size);
         close(host_fd);
-        unlock(&binder_lock);
+        binder_unlock();
         return err;
     }
 
@@ -2200,13 +2287,13 @@ static int binder_mmap(struct fd *fd, struct mem *mem, page_t start, pages_t pag
         close(host_fd);
         proc->kernel_map = NULL;
         proc->host_fd = -1;
-        unlock(&binder_lock);
+        binder_unlock();
         return _ENOMEM;
     }
     *buffer = (struct binder_buffer) { .offset = 0, .size = size, .free = true };
     list_add_tail(&proc->buffers, &buffer->link);
 
-    unlock(&binder_lock);
+    binder_unlock();
     return 0;
 }
 
@@ -2223,7 +2310,7 @@ static int binder_poll(struct fd *fd) {
         if (binder_has_work(thread, do_proc_work))
             events |= POLL_READ;
     }
-    unlock(&binder_lock);
+    binder_unlock();
     return events;
 }
 
@@ -2331,13 +2418,13 @@ static int binder_ioctl(struct fd *fd, int cmd, void *arg) {
 
     lock(&binder_lock, 0);
     if (proc->is_dead) {
-        unlock(&binder_lock);
+        binder_unlock();
         return _EBADF;
     }
 
     struct binder_thread *thread = binder_get_thread(proc);
     if (thread == NULL) {
-        unlock(&binder_lock);
+        binder_unlock();
         return _ENOMEM;
     }
 
@@ -2469,7 +2556,7 @@ static int binder_ioctl(struct fd *fd, int cmd, void *arg) {
             break;
     }
 
-    unlock(&binder_lock);
+    binder_unlock();
     return ret;
 }
 
@@ -2484,7 +2571,7 @@ static int binder_flush(struct fd *fd) {
     list_for_each_entry(&proc->threads, thread, proc_link) {
         notify(&thread->wait);
     }
-    unlock(&binder_lock);
+    binder_unlock();
     return 0;
 }
 
@@ -2519,7 +2606,7 @@ void binder_task_exit(struct task *task) {
                 binder_thread_release(proc, thread);
         }
     }
-    unlock(&binder_lock);
+    binder_unlock();
 }
 
 int binder_alloc_minor(const char *name) {
@@ -2532,16 +2619,16 @@ int binder_alloc_minor(const char *name) {
         if (context == NULL || copy == NULL) {
             free(context);
             free(copy);
-            unlock(&binder_lock);
+            binder_unlock();
             return _ENOMEM;
         }
         context->name = copy;
         binder_minor_context[minor] = context;
         binder_minor_name[minor] = copy;
-        unlock(&binder_lock);
+        binder_unlock();
         return minor;
     }
-    unlock(&binder_lock);
+    binder_unlock();
     return _ENOSPC;
 }
 
@@ -2681,6 +2768,6 @@ int binder_show_state(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     if (list_empty(&binder_procs))
         proc_printf(buf, "no processes have the driver open\n");
 
-    unlock(&binder_lock);
+    binder_unlock();
     return 0;
 }

@@ -406,16 +406,52 @@ build the socket at `/dev/socket/property_service` -- and it will need the
 in-place value update with the dirty-serial protocol, which the read-only area
 does not implement.
 
-## Known latent issue
+## The dropped poll wakeup: fixed, and the scare was half real
 
-`binder_wakeup_proc` and `binder_wakeup_thread` reach pollers through
-`poll_wakeup_trylock`, which discards the wakeup when it cannot take the lock.
-That is harmless for a client blocking in `BINDER_WRITE_READ`, which also gets
-`notify()`, but an epoll-driven receiver -- which is what real Android is -- has
-no second chance and would sleep forever with a transaction queued. It has never
-reproduced: `binder_ipc`'s poll phase drives delivery purely through epoll and
-passes consistently. Fixing it properly means deferring the wakeup until after
-`binder_lock` is released, which is why it has not been done on a hunch.
+`binder_wakeup_proc` and `binder_wakeup_thread` used to reach pollers through
+`poll_wakeup_trylock`, which **discards** the wakeup when it cannot take the
+lock. The trylock was not gratuitous: these run under `binder_lock`, and a
+blocking `poll_wakeup()` there takes `fd->poll_lock -> poll->lock` while a poll
+scan calling `binder_poll` takes `poll->lock -> binder_lock` -- the reverse
+order, so two threads hitting both at once AB-BA deadlock.
+
+**Fixed** by deferring instead of discarding: `binder_defer_wakeup()` records
+the fd under the lock, and `binder_unlock()` -- which every one of the 19
+unlock sites now calls -- delivers it with the blocking, non-lossy
+`poll_wakeup()` immediately after the release. The subtle part is
+`binder_thread_read`: `wait_for` only drops `binder_lock` once the thread is
+already committed to sleeping, so a wakeup still queued at that point would
+not go out until this thread was itself woken -- and the process waiting on it
+may be the only one who could do the waking. It flushes and re-runs the loop
+before parking, which is the difference between this fix and a deadlock.
+
+**What the measurements actually showed**, because the doc used to assert more
+than was known ("would sleep forever ... has never reproduced"):
+
+- **The discard is real and easy to provoke.** With `poll_wakeup_trylock`
+  instrumented, `tests/manual/binder_poll_wakeup_probe.c` drops roughly 3,100
+  of 12,000 wakeups per run.
+- **It never produced a stall.** Not in any of four configurations, including
+  single-transaction trials where the wakeup was dropped on *every* one of 12
+  runs and the transaction still arrived every time.
+- **The reason is the awkward part.** To make the trylock fail you need a
+  concurrent holder of `poll->lock`, and in this design any such holder is
+  itself scanning. epoll here is level-triggered, so that scan recomputes
+  readiness from `binder_poll` and finds the queued work regardless of the lost
+  poke. Remove the scanner and the contention goes with it -- 0 failures. The
+  thing that breaks the wakeup is also the thing that covers for it.
+
+So the honest status is: the old code was **unsound** (a discarded wakeup with
+no guaranteed second chance) and demonstrably discarded wakeups in bulk, but no
+sequence was found that strands a receiver. The fix is cheap, removes the
+mechanism rather than the symptom, and costs nothing at 8/8 and 9/9 -- worth
+having on those grounds alone. It should not be described as having fixed an
+observed hang, because it did not.
+
+The probe is kept as a diagnostic rather than a test, precisely because it
+passes either way. Anyone revisiting this should start by trying to build the
+one case the argument above does not cover: contention arriving from a scan
+that has *already passed* the binder fd, and then stopping, so nothing rescans.
 
 ## arm64 tagged pointers (TBI): fixed, and one open case
 

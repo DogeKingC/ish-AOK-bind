@@ -42,6 +42,8 @@ need_file kernel/binder.h
 need_file fs/binderfs.c
 need_file tests/manual/binder_ipc.c
 need_file tests/manual/binder_ping.c
+need_file tests/manual/binder_poll_wakeup_probe.c
+need_file tests/manual/binder_object_align_probe.c
 need_file docs/binder.md
 need_in app/AppDelegate.m binder_create_device_nodes "creates /dev/binder at boot"
 need_in xX_main_Xx.h      binder_create_device_nodes "creates /dev/binder at boot (CLI)"
@@ -148,6 +150,17 @@ need_in kernel/exec.c  'security.exec'               "execve consumes the setexe
 need_in kernel/binder.c BR_TRANSACTION_SEC_CTX \
     "binder delivers the sender's context to a node that asked for one"
 need_in kernel/binder.c binder_show_state "the /proc/ish/binder state dump"
+# Binder must not use poll_wakeup_trylock for its own wakeups: it discards them
+# when it loses the lock, and an epoll-driven receiver (which real Android is)
+# has no guaranteed second chance. Measured at ~3100 discards per 12000 under
+# contention. The deferred list plus binder_unlock() is what replaces it, and
+# the flush before binder_thread_read parks is the half that a well-meaning
+# refactor would drop -- without it the wakeup waits on the thread it is
+# supposed to wake.
+need_in kernel/binder.c binder_defer_wakeup \
+    "poll wakeups are deferred past binder_lock, not discarded on a lost trylock"
+need_in kernel/binder.c binder_have_deferred_wakeups \
+    "and flushed before a reader parks, or the wakeup waits on its own target"
 # Object offsets inside a parcel are 4-aligned, not 8: Parcel packs to 4, so
 # libbinder's checkService reply (int32 status, then the binder) puts its
 # object at offset 4. Requiring the buffer's own 8-byte alignment here looks
