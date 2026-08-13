@@ -590,6 +590,29 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, guest_addr_t addr, int ty
     if (atomic_load_explicit(&tlb->mmu->changes, memory_order_relaxed) != tlb->mem_changes)
         tlb_flush(tlb);
     if (ptr == NULL) {
+        // The other half of the TBI leak probe above, and the half that turned
+        // out to matter. tlb->segfault_addr is assigned HERE and nowhere else
+        // in the tree, so every INT_PF the arm64 gadgets raise carries a value
+        // that passed through this line. Logging the failures says whether a
+        // reported fault came through this path at all -- and on the device it
+        // has to be reconciled with a kernel that reports a TAGGED fault
+        // address while the probe above (which would have caught a tagged
+        // address arriving here) stays silent. Exactly one of those two
+        // observations can be true of the same fault, and this line is what
+        // tells them apart: an address logged here that matches the reported
+        // fault means the tag was added after this point, and no line at all
+        // means the fault never came through the TLB.
+        enum { MISS_FAIL_LOG_BUDGET = 12 };
+        static unsigned miss_fail_log_count;
+        if (miss_fail_log_count < MISS_FAIL_LOG_BUDGET) {
+            miss_fail_log_count++;
+            printk("arm64: TLB miss FAILED for %#llx (%s), called from %p = %s "
+                   "-- this is the address the fault will report\n",
+                   (unsigned long long) addr,
+                   type == MEM_WRITE ? "write" : "read",
+                   __builtin_return_address(0),
+                   tlb_arm64_caller_name(__builtin_return_address(0)));
+        }
         tlb->segfault_addr = addr;
         return NULL;
     }
