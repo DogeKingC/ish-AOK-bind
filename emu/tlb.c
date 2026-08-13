@@ -523,9 +523,20 @@ bool __tlb_write_cross_page(struct tlb *tlb, guest_addr_t addr, const char *valu
 // the return address against their entry points identifies the path exactly,
 // and the answer arrives already in words.
 #if defined(__aarch64__) && defined(ISH_JIT_ARM64_GUEST)
-extern void arm64_handle_read_miss(void), arm64_handle_write_miss(void),
-        arm64_resolve_write_ptr(void), arm64_crosspage_load(void),
-        arm64_crosspage_store(void);
+// Explicit asm labels, and they are load-bearing on Apple platforms. A C
+// symbol is emitted with a leading underscore there, so a plain `extern void
+// arm64_handle_read_miss(void)` asks the linker for _arm64_handle_read_miss --
+// which does not exist, because memory.S declares these with BARE names (only
+// assembly calls them, so they never needed the NAME() macro that the gadget
+// symbols use for exactly this reason). Caught by the iOS build failing to
+// link; the ELF cross build is happy either way, since there is no underscore
+// to add. Naming them here rather than rewriting memory.S keeps the change out
+// of hot hand-written assembly.
+extern void arm64_handle_read_miss(void) __asm__("arm64_handle_read_miss");
+extern void arm64_handle_write_miss(void) __asm__("arm64_handle_write_miss");
+extern void arm64_resolve_write_ptr(void) __asm__("arm64_resolve_write_ptr");
+extern void arm64_crosspage_load(void) __asm__("arm64_crosspage_load");
+extern void arm64_crosspage_store(void) __asm__("arm64_crosspage_store");
 
 static const char *tlb_arm64_caller_name(void *from) {
     static const struct { void (*fn)(void); const char *name; } helpers[] = {
