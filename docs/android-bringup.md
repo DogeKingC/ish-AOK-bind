@@ -137,13 +137,33 @@ servicemanager actually sends. That is the next thing to chase.
 Two other things the daemon sweep established, both about the image rather
 than the emulator:
 
-- **Most daemons cannot link.** `mediametrics`, `storaged`, `credstore`,
-  `gatekeeperd`, `netd`, `vold` and `usbd` all die at the linker on a missing
-  AIDL or HAL library (`android.hardware.health-V5-ndk.so`,
-  `netd_aidl_interface-V18-cpp.so`, and so on). Those files are not anywhere
-  in the tree -- `find` finds nothing -- so this is an incomplete image, not a
-  namespace or linkerconfig problem. 38 APEXes are extracted and
-  `system/lib64` has 687 libraries; the missing ones simply were not shipped.
+- **Most daemons cannot link, and re-extracting will not fix it.**
+  `mediametrics`, `storaged`, `credstore`, `gatekeeperd`, `netd`, `vold` and
+  `usbd` each die at the linker on a missing library, and the full list is of
+  one kind:
+
+  ```
+  netd_aidl_interface-V18-cpp.so        android.hardware.health-V5-ndk.so
+  android.system.keystore2-V6-ndk.so    android.hardware.usb.gadget-V2-ndk.so
+  android.hardware.security.keymint-V5-ndk.so
+  mediametricsservice-aidl-V1-cpp.so
+  ```
+
+  These are vendor-side HAL and AIDL interface libraries. A GSI ships `system`
+  only, by design -- it is meant to pair with the phone's own vendor
+  partition -- so they are absent from a correct, complete extraction, not just
+  a careless one. This was first written up here as an incomplete image, which
+  was wrong: re-extracting with `.github/workflows/extract-android-system.yml`,
+  which copies the entire system root including `system_ext` and `product`,
+  changed nothing about them. Even with the libraries these daemons would then
+  want the HAL *services* behind them, which need real hardware, so they are
+  not a route forward under emulation and no extraction workflow will make
+  them one.
+
+  What that same re-extraction DID fix is `build.prop`, which the previous
+  extraction dropped: the property area went from 1 property to 111. The
+  daemons that need no HAL -- servicemanager and incidentd -- are the working
+  set.
 - **`/data` did not exist.** A skeleton (`data/local/tmp`, `data/misc`,
   `data/system`, `data/resource-cache`, `data/user/0`) is enough for
   incidentd. `idmap2d` still dies with a null write (`page fault on 0x4`,
