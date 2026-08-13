@@ -230,8 +230,20 @@ anything.
 **`/AOK/tools/ish-remote.sh <code>` drives the device over ntfy**, which is
 much faster than round-tripping commands through a human: each experiment costs
 seconds instead of a build-and-install cycle. It is what made the tagged-pointer
-work tractable. One caveat that looks like a hang: ntfy rate-limits large
-messages, so chunk anything long rather than sending it in one shot.
+work tractable.
+
+Two things about it that used to cost rounds and no longer should:
+
+- **The relay rate-limits, and it used to look like large replies vanishing.**
+  The listener now paces its chunk posts, honours the relay's `Retry-After` on
+  a 429 instead of retrying faster than the limit replenishes, and truncates
+  absurd output with a note rather than firing fifty messages that cannot
+  land. Still: keep commands narrow. `head`, `grep` and `tail` at the far end
+  beat twenty parts every time.
+- **Keepalive is now the default.** It used to be opt-in, and forgetting it
+  meant the listener stopped answering the moment iSH left the foreground --
+  which reads exactly like the channel being dead. `--no-keepalive` if you
+  want the old behaviour. Stop the listener when you are done either way.
 
 `binder_ping` still exists and is still the cheapest probe:
 `PING_TRANSACTION` depends on no property, no logd and no init, so it isolates

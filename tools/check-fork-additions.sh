@@ -193,6 +193,16 @@ need_file opt/AOK/tools/ish-remote.sh
 need_in fs/aok-tools.manifest ish-remote.sh "the code-gated remote command listener"
 need_in opt/AOK/tools/ish-remote.sh inflight \
     "a command that killed the listener is reported, not silently swallowed"
+# The relay rate-limits, and every one of these is a bug that presented as
+# "the channel is broken" rather than as an error.
+need_in opt/AOK/tools/ish-remote.sh 'sleep "$_ra"' \
+    "429 backs off as long as the relay asks, not faster than it replenishes"
+need_in opt/AOK/tools/ish-remote.sh net_limited \
+    "a rate limit abandons the remaining chunks instead of deepening it"
+need_in opt/AOK/tools/ish-remote.sh 'exit "$_st"' \
+    "the EXIT trap preserves the status, so die does not report success"
+need_in opt/AOK/tools/ish-remote.sh resume_from \
+    "a listener with no state starts from now, rather than re-running 12h of topic"
 
 # --- host CPU feature detection --------------------------------------------
 # One binary ships to every device from an ARMv8.0 iPad up, so "what can this
