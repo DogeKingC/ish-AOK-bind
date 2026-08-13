@@ -606,6 +606,13 @@ extern void arm64_crosspage_store(void) __asm__("arm64_crosspage_store");
 // the tens of kilobytes says the caller is in some other translation unit
 // entirely, which is itself worth knowing and cannot be mistaken for a match.
 extern void *tlb_write_ptr_slow(struct tlb *tlb, guest_addr_t addr);
+// Anchors from OTHER translation units. The device answered
+// "tlb_handle_miss+0x873b0" -- 553KB past the nearest anchor, i.e. every name
+// on the list was in this file and the caller is not. Under LTO the final
+// layout bears no relation to any local build, so the only way to narrow it is
+// to spread the anchors across the image.
+extern void *mem_ptr(struct mem *mem, guest_addr_t addr, int type);
+extern void tlb_flush(struct tlb *tlb);
 
 struct tlb_caller_anchor { const void *addr; const char *name; };
 
@@ -624,6 +631,9 @@ static const char *tlb_arm64_caller_name(void *from, uintptr_t *delta_out) {
         {(const void *) __tlb_write_cross_page,  "__tlb_write_cross_page"},
         {(const void *) arm64_lse_rmw,           "arm64_lse_rmw"},
         {(const void *) tlb_handle_miss,         "tlb_handle_miss (recursed?)"},
+        {(const void *) tlb_flush,               "tlb_flush (emu/tlb.c)"},
+        // other TUs
+        {(const void *) mem_ptr,                 "mem_ptr (emu/memory.c)"},
     };
     const char *best = NULL;
     uintptr_t best_delta = (uintptr_t) -1;
@@ -650,7 +660,7 @@ static const char *tlb_arm64_caller_name(void *from, uintptr_t *delta_out) {
 }
 #endif
 
-static void tlb_note_tagged_miss(guest_addr_t addr, int type, void *from) {
+static void tlb_note_tagged_miss(guest_addr_t addr, int type, void *from, void *ptr) {
     enum { TAGGED_MISS_LOG_BUDGET = 8 };
     static unsigned tagged_miss_log_count;
     if (tagged_miss_log_count >= TAGGED_MISS_LOG_BUDGET)
@@ -658,16 +668,24 @@ static void tlb_note_tagged_miss(guest_addr_t addr, int type, void *from) {
     tagged_miss_log_count++;
     uintptr_t delta = 0;
     const char *name = tlb_arm64_caller_name(from, &delta);
-    printk("arm64: TLB miss on TAGGED address %#llx (%s), called from %p = "
-           "%s+%#lx -- the tag survived past the gadget's prep macro\n",
+    // ptr is the whole point of the second round. The device reported eight of
+    // these and ZERO failing misses, which cannot both be true if the tagged
+    // page is unmapped: PAGE(0x0200'7fff'bdff'd000) is far past any page_limit
+    // this guest can have, so mem_pt_raw should reject it and the miss should
+    // fail. Printing the translate result settles which half of that is wrong
+    // instead of reasoning about it a third time.
+    printk("arm64: TLB miss on TAGGED address %#llx (%s) -> translate %s (%p), "
+           "called from %p = %s+%#lx\n",
            (unsigned long long) addr, type == MEM_WRITE ? "write" : "read",
+           ptr != NULL ? "SUCCEEDED" : "failed", ptr,
            from, name, (unsigned long) delta);
 }
 
 __no_instrument void *tlb_handle_miss(struct tlb *tlb, guest_addr_t addr, int type) {
-    if (unlikely((addr >> 56) != 0))
-        tlb_note_tagged_miss(addr, type, __builtin_return_address(0));
+    bool tagged = unlikely((addr >> 56) != 0);
     char *ptr = mmu_translate(tlb->mmu, TLB_PAGE(addr), type);
+    if (tagged)
+        tlb_note_tagged_miss(addr, type, __builtin_return_address(0), ptr);
     if (atomic_load_explicit(&tlb->mmu->changes, memory_order_relaxed) != tlb->mem_changes)
         tlb_flush(tlb);
     if (ptr == NULL) {
