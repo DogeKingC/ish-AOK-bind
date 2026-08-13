@@ -35,7 +35,16 @@
 # REQUIREMENTS (Debian/Ubuntu)
 #   clang lld qemu-user-static
 #   dpkg --add-architecture arm64 + an arm64 apt source (ports.ubuntu.com),
-#   then: apt-get install libsqlite3-dev:arm64
+#   then: apt-get install libsqlite3-dev:arm64 libgcc-13-dev:arm64 \
+#                         libstdc++-13-dev:arm64
+#
+#   The two gcc-dev packages are not optional and their absence does not look
+#   like a missing package: clang finds the arm64 libc through the multiarch
+#   layout but not crtbeginS.o or libgcc, so meson reports the compiler
+#   "cannot compile programs" and names nothing. lld is selected by
+#   tools/cross-aarch64.ini; without that -fuse-ld=lld clang falls back to the
+#   host binutils ld, which fails earlier still with "unrecognised emulation
+#   mode: aarch64linux" during linker detection.
 # Plus, downloaded on first run into the work dir: an Alpine aarch64 minirootfs
 # and the matching musl-dev, which is what the guest test binaries link against
 # (they must be musl binaries -- musl's memset/memcpy are the SIMD routines the
@@ -127,11 +136,19 @@ fi
 # include them.
 
 # musl's libc.a wants the soft-float128 helpers (__multf3, __netf2) that the
-# compiler runtime provides; clang's own aarch64 builtins are not installed on
-# a typical x86_64 box, so borrow libgcc from the gcc cross toolchain if it is
-# there. Without it only the printf/strtod paths fail to link, so this is a
-# soft requirement.
-LIBGCC=$(ls /usr/lib/gcc-cross/aarch64-linux-gnu/*/libgcc.a 2>/dev/null | head -1 || true)
+# compiler runtime provides, and the tests' own _Atomic operations lower to
+# libgcc's LSE outline atomics (__aarch64_ldadd8_acq_rel and friends); clang's
+# own aarch64 builtins are not installed on a typical x86_64 box, so borrow
+# libgcc from whichever aarch64 toolchain is present.
+#
+# Two layouts, because the two ways of getting an aarch64 toolchain put it in
+# different places: gcc-aarch64-linux-gnu installs under gcc-cross/, while
+# libgcc-13-dev:arm64 -- what the requirements above ask for, since it is also
+# what clang needs for crtbeginS.o -- installs under the multiarch gcc/ path.
+# Checking only the first is why this used to report "did not compile" on a
+# box that had a perfectly good libgcc.
+LIBGCC=$(ls /usr/lib/gcc-cross/aarch64-linux-gnu/*/libgcc.a \
+            /usr/lib/gcc/aarch64-linux-gnu/*/libgcc.a 2>/dev/null | head -1 || true)
 
 fail=0
 for test_name in "${TESTS[@]}"; do
