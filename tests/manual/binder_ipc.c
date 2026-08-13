@@ -723,6 +723,408 @@ static void test_transaction(const char *dev) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2b: a handle relayed through a third process
+//
+// This is the servicemanager shape, and it is precisely what the two-process
+// phase above does NOT cover. There the object's owner replies to its own
+// caller, so the driver only ever turns BINDER_TYPE_BINDER into a handle for
+// one other process. What servicemanager does is hold a handle to somebody
+// else's node and hand it on to a THIRD process -- HANDLE -> HANDLE between
+// two processes that are both strangers to the node's owner -- after which the
+// recipient has to be able to call that owner directly through the handle it
+// was given.
+//
+// It earns its own phase because on a device `service check <name>` returns
+// null for every service while `service list` works, and those two differ by
+// exactly this: listing returns names out of servicemanager's own map, while
+// checking has to pass a binder reference back through a reply.
+// ---------------------------------------------------------------------------
+
+#define RELAY_REGISTER_CODE 0x51
+#define RELAY_LOOKUP_CODE 0x52
+#define RELAY_CALL_CODE 0x53
+#define PROVIDER_OBJECT_PTR UINT64_C(0xbeef000000004000)
+#define PROVIDER_OBJECT_COOKIE UINT64_C(0xbeef000000005000)
+#define RELAY_CALL_MAGIC UINT64_C(0x0f0f0f0f0000600d)
+#define RELAY_REPLY_MAGIC UINT64_C(0xa1a1a1a100007001)
+
+static void relay_free_buffer(struct binder *b, binder_uintptr_t buffer) {
+    struct {
+        uint32_t cmd;
+        binder_uintptr_t buffer;
+    } __attribute__((packed)) freebuf = { BC_FREE_BUFFER, buffer };
+    (void) binder_wr(b, &freebuf, sizeof(freebuf), NULL, 0, NULL);
+}
+
+// Pulls the single flat_binder_object out of a transaction, if it carries one.
+static int relay_get_object(const struct binder_transaction_data *tr,
+                            struct flat_binder_object *out) {
+    if (tr->offsets_size != sizeof(binder_size_t))
+        return -1;
+    binder_size_t off;
+    memcpy(&off, (void *) (uintptr_t) tr->data.ptr.offsets, sizeof(off));
+    memcpy(out, (uint8_t *) (uintptr_t) tr->data.ptr.buffer + off, sizeof(*out));
+    return 0;
+}
+
+struct relay_mgr_ctx {
+    struct binder *b;
+    uint32_t provider_handle;
+    int registered;
+    int served_lookup;
+};
+
+static int relay_mgr_handler(uint32_t cmd, const void *payload, void *vctx) {
+    struct relay_mgr_ctx *ctx = vctx;
+    if (cmd != BR_TRANSACTION)
+        return 0;
+    struct binder_transaction_data tr;
+    memcpy(&tr, payload, sizeof(tr));
+
+    if (tr.code == RELAY_REGISTER_CODE) {
+        struct flat_binder_object obj;
+        int got = relay_get_object(&tr, &obj) == 0;
+        check(got, "manager: the register transaction carries one object");
+        if (got) {
+            check(obj.type == BINDER_TYPE_HANDLE,
+                  "manager: the provider's own node arrives as a handle");
+            ctx->provider_handle = obj.handle;
+        }
+        // Take a reference of our own BEFORE releasing the buffer: freeing it
+        // drops the one the transaction granted. servicemanager does the same
+        // thing through libbinder's refcounting, and without it the handle
+        // stashed here would be dangling by the time anyone asked for it.
+        struct {
+            uint32_t cmd;
+            uint32_t handle;
+        } __attribute__((packed)) acquire = { BC_ACQUIRE, ctx->provider_handle };
+        check(binder_wr(ctx->b, &acquire, sizeof(acquire), NULL, 0, NULL) >= 0,
+              "manager: BC_ACQUIRE on the relayed handle");
+
+        static uint64_t ack;
+        ack = RELAY_REPLY_MAGIC;
+        struct {
+            uint32_t cmd;
+            struct binder_transaction_data tr;
+        } __attribute__((packed)) out;
+        memset(&out, 0, sizeof(out));
+        out.cmd = BC_REPLY;
+        out.tr.data_size = sizeof(ack);
+        out.tr.data.ptr.buffer = (binder_uintptr_t) (uintptr_t) &ack;
+
+        relay_free_buffer(ctx->b, tr.data.ptr.buffer);
+        (void) binder_wr(ctx->b, &out, sizeof(out), NULL, 0, NULL);
+        ctx->registered = 1;
+        return 1;
+    }
+
+    if (tr.code == RELAY_LOOKUP_CODE) {
+        // The path under test: hand a handle we hold to a third process.
+        static struct {
+            uint64_t magic;
+            struct flat_binder_object obj;
+        } reply_data;
+        static binder_size_t reply_offsets[1];
+
+        reply_data.magic = RELAY_REPLY_MAGIC;
+        memset(&reply_data.obj, 0, sizeof(reply_data.obj));
+        reply_data.obj.type = BINDER_TYPE_HANDLE;
+        reply_data.obj.flags = FLAT_BINDER_FLAG_ACCEPTS_FDS;
+        reply_data.obj.handle = ctx->provider_handle;
+        reply_offsets[0] = offsetof(typeof(reply_data), obj);
+
+        struct {
+            uint32_t cmd;
+            struct binder_transaction_data tr;
+        } __attribute__((packed)) out;
+        memset(&out, 0, sizeof(out));
+        out.cmd = BC_REPLY;
+        out.tr.data_size = sizeof(reply_data);
+        out.tr.offsets_size = sizeof(reply_offsets);
+        out.tr.data.ptr.buffer = (binder_uintptr_t) (uintptr_t) &reply_data;
+        out.tr.data.ptr.offsets = (binder_uintptr_t) (uintptr_t) reply_offsets;
+
+        relay_free_buffer(ctx->b, tr.data.ptr.buffer);
+        check(binder_wr(ctx->b, &out, sizeof(out), NULL, 0, NULL) >= 0,
+              "manager: a reply carrying a relayed handle is accepted");
+        ctx->served_lookup = 1;
+        return 1;
+    }
+    return 0;
+}
+
+// The provider: registers its own node with the manager, then answers calls
+// that arrive on it -- from a process it has never heard of.
+struct relay_provider_ctx {
+    struct binder *b;
+    int got_call;
+    int registered_ack;
+};
+
+static int relay_provider_handler(uint32_t cmd, const void *payload, void *vctx) {
+    struct relay_provider_ctx *ctx = vctx;
+    if (cmd == BR_FAILED_REPLY || cmd == BR_DEAD_REPLY)
+        return -1;
+    if (cmd == BR_REPLY) {
+        struct binder_transaction_data tr;
+        memcpy(&tr, payload, sizeof(tr));
+        relay_free_buffer(ctx->b, tr.data.ptr.buffer);
+        ctx->registered_ack = 1;
+        return 1;
+    }
+    if (cmd != BR_TRANSACTION)
+        return 0;
+
+    struct binder_transaction_data tr;
+    memcpy(&tr, payload, sizeof(tr));
+    if (tr.code != RELAY_CALL_CODE)
+        return 0;
+    // Arriving here at all is the point: a stranger reached us through a
+    // handle that only ever existed inside the manager.
+    if (tr.target.ptr == PROVIDER_OBJECT_PTR)
+        ctx->got_call = 1;
+
+    static uint64_t reply;
+    reply = RELAY_REPLY_MAGIC;
+    struct {
+        uint32_t cmd;
+        struct binder_transaction_data tr;
+    } __attribute__((packed)) out;
+    memset(&out, 0, sizeof(out));
+    out.cmd = BC_REPLY;
+    out.tr.data_size = sizeof(reply);
+    out.tr.data.ptr.buffer = (binder_uintptr_t) (uintptr_t) &reply;
+
+    relay_free_buffer(ctx->b, tr.data.ptr.buffer);
+    (void) binder_wr(ctx->b, &out, sizeof(out), NULL, 0, NULL);
+    return 1;
+}
+
+// The client: asks the manager for the provider, then calls it directly.
+struct relay_client_ctx {
+    struct binder *b;
+    uint32_t handle;
+    int got_lookup_reply;
+    int got_call_reply;
+};
+
+static int relay_client_handler(uint32_t cmd, const void *payload, void *vctx) {
+    struct relay_client_ctx *ctx = vctx;
+    if (cmd == BR_FAILED_REPLY || cmd == BR_DEAD_REPLY || cmd == BR_ERROR)
+        return -1;
+    if (cmd != BR_REPLY)
+        return 0;
+
+    struct binder_transaction_data tr;
+    memcpy(&tr, payload, sizeof(tr));
+    if (!ctx->got_lookup_reply) {
+        struct flat_binder_object obj;
+        if (relay_get_object(&tr, &obj) == 0 && obj.type == BINDER_TYPE_HANDLE) {
+            ctx->handle = obj.handle;
+            // Acquire before the buffer goes back, or the handle is dead on
+            // arrival: the reference the transaction granted belongs to the
+            // buffer, and BC_FREE_BUFFER drops it. libbinder does exactly this
+            // inside Parcel::readStrongBinder -> getStrongProxyForHandle, which
+            // is why a real client never notices the rule exists. A transaction
+            // sent on a handle whose strong count fell to zero comes back
+            // BR_FAILED_REPLY, which is what this originally did.
+            struct {
+                uint32_t cmd;
+                uint32_t handle;
+            } __attribute__((packed)) acquire = { BC_ACQUIRE, ctx->handle };
+            (void) binder_wr(ctx->b, &acquire, sizeof(acquire), NULL, 0, NULL);
+        }
+        ctx->got_lookup_reply = 1;
+    } else {
+        uint64_t magic = 0;
+        if (tr.data_size >= sizeof(magic))
+            memcpy(&magic, (void *) (uintptr_t) tr.data.ptr.buffer, sizeof(magic));
+        if (magic == RELAY_REPLY_MAGIC)
+            ctx->got_call_reply = 1;
+    }
+    relay_free_buffer(ctx->b, tr.data.ptr.buffer);
+    return 1;
+}
+
+// Sends one synchronous transaction and pumps until its reply arrives.
+static int relay_call(struct binder *b, uint32_t handle, uint32_t code,
+                      void *data, size_t data_size, binder_size_t *offsets,
+                      size_t offsets_size, br_handler handler, void *ctx,
+                      const int *done) {
+    struct {
+        uint32_t cmd;
+        struct binder_transaction_data tr;
+    } __attribute__((packed)) out;
+    memset(&out, 0, sizeof(out));
+    out.cmd = BC_TRANSACTION;
+    out.tr.target.handle = handle;
+    out.tr.code = code;
+    out.tr.data_size = data_size;
+    out.tr.offsets_size = offsets_size;
+    out.tr.data.ptr.buffer = (binder_uintptr_t) (uintptr_t) data;
+    out.tr.data.ptr.offsets = (binder_uintptr_t) (uintptr_t) offsets;
+
+    uint8_t readbuf[512];
+    size_t consumed = 0;
+    if (binder_wr(b, &out, sizeof(out), readbuf, sizeof(readbuf), &consumed) < 0)
+        return -1;
+    if (br_parse(readbuf, consumed, handler, ctx) < 0)
+        return -1;
+    while (!*done) {
+        consumed = 0;
+        if (binder_wr(b, NULL, 0, readbuf, sizeof(readbuf), &consumed) < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (br_parse(readbuf, consumed, handler, ctx) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+static void test_handle_relay(const char *dev) {
+    struct binder mgr = { .fd = -1 };
+    if (binder_open_dev(&mgr, dev) < 0) {
+        check(0, "relay: manager open+mmap");
+        return;
+    }
+    int32_t zero = 0;
+    if (ioctl(mgr.fd, BINDER_SET_CONTEXT_MGR, &zero) < 0) {
+        printf("SKIP handle relay: context manager already claimed (errno=%d)\n", errno);
+        binder_close_dev(&mgr);
+        return;
+    }
+
+    int prov_pipe[2], cli_pipe[2];
+    check(pipe(prov_pipe) == 0 && pipe(cli_pipe) == 0, "relay: sync pipes");
+
+    pid_t provider = fork();
+    check(provider >= 0, "relay: fork provider");
+    if (provider == 0) {
+        close(prov_pipe[0]);
+        close(cli_pipe[0]);
+        close(cli_pipe[1]);
+        struct binder b = { .fd = -1 };
+        if (binder_open_dev(&b, dev) < 0) {
+            fflush(NULL);
+            _exit(70);
+        }
+        static struct {
+            uint64_t magic;
+            struct flat_binder_object obj;
+        } reg;
+        static binder_size_t reg_offsets[1];
+        reg.magic = RELAY_CALL_MAGIC;
+        memset(&reg.obj, 0, sizeof(reg.obj));
+        reg.obj.type = BINDER_TYPE_BINDER;
+        reg.obj.flags = FLAT_BINDER_FLAG_ACCEPTS_FDS;
+        reg.obj.binder = PROVIDER_OBJECT_PTR;
+        reg.obj.cookie = PROVIDER_OBJECT_COOKIE;
+        reg_offsets[0] = offsetof(typeof(reg), obj);
+
+        struct relay_provider_ctx ctx = { .b = &b };
+        int rc = relay_call(&b, 0, RELAY_REGISTER_CODE, &reg, sizeof(reg),
+                            reg_offsets, sizeof(reg_offsets),
+                            relay_provider_handler, &ctx, &ctx.registered_ack);
+        // Registered: let the client go, then serve the call it makes.
+        (void) write(prov_pipe[1], "g", 1);
+        close(prov_pipe[1]);
+
+        uint8_t readbuf[512];
+        while (rc == 0 && !ctx.got_call) {
+            size_t consumed = 0;
+            if (binder_wr(&b, NULL, 0, readbuf, sizeof(readbuf), &consumed) < 0) {
+                if (errno == EINTR)
+                    continue;
+                rc = -1;
+                break;
+            }
+            if (br_parse(readbuf, consumed, relay_provider_handler, &ctx) < 0)
+                break;
+        }
+        binder_close_dev(&b);
+        fflush(NULL);
+        _exit(rc == 0 && ctx.got_call ? 0 : 73);
+    }
+
+    pid_t client = fork();
+    check(client >= 0, "relay: fork client");
+    if (client == 0) {
+        close(prov_pipe[1]);
+        close(cli_pipe[0]);
+        char go;
+        (void) read(prov_pipe[0], &go, 1);   // wait until the provider registered
+        close(prov_pipe[0]);
+
+        struct binder b = { .fd = -1 };
+        if (binder_open_dev(&b, dev) < 0) {
+            fflush(NULL);
+            _exit(70);
+        }
+        static uint64_t ask;
+        ask = RELAY_CALL_MAGIC;
+        struct relay_client_ctx ctx = { .b = &b };
+        int rc = relay_call(&b, 0, RELAY_LOOKUP_CODE, &ask, sizeof(ask), NULL, 0,
+                            relay_client_handler, &ctx, &ctx.got_lookup_reply);
+        int got_handle = rc == 0 && ctx.handle != 0;
+        if (got_handle) {
+            static uint64_t call;
+            call = RELAY_CALL_MAGIC;
+            rc = relay_call(&b, ctx.handle, RELAY_CALL_CODE, &call, sizeof(call),
+                            NULL, 0, relay_client_handler, &ctx, &ctx.got_call_reply);
+        }
+        (void) write(cli_pipe[1], got_handle ? "h" : "x", 1);
+        close(cli_pipe[1]);
+        binder_close_dev(&b);
+        fflush(NULL);
+        _exit(got_handle && rc == 0 && ctx.got_call_reply ? 0 : 74);
+    }
+
+    close(prov_pipe[0]);
+    close(prov_pipe[1]);
+    close(cli_pipe[1]);
+
+    // Serve both the registration and the lookup.
+    struct relay_mgr_ctx ctx = { .b = &mgr };
+    uint8_t readbuf[1024];
+    while (!(ctx.registered && ctx.served_lookup)) {
+        size_t consumed = 0;
+        if (binder_wr(&mgr, NULL, 0, readbuf, sizeof(readbuf), &consumed) < 0) {
+            if (errno == EINTR)
+                continue;
+            check(0, "relay: manager BINDER_WRITE_READ");
+            break;
+        }
+        if (br_parse(readbuf, consumed, relay_mgr_handler, &ctx) < 0)
+            break;
+    }
+    check(ctx.registered, "relay: manager saw the registration");
+    check(ctx.served_lookup, "relay: manager answered the lookup");
+
+    char verdict = 0;
+    (void) read(cli_pipe[0], &verdict, 1);
+    close(cli_pipe[0]);
+    check(verdict == 'h', "relay: the client received a usable handle");
+
+    int status = 0;
+    check(waitpid(provider, &status, 0) == provider, "relay: reap provider");
+    check(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "relay: the provider was called by a process it never met");
+    if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+        printf("       provider exit status %d\n", WEXITSTATUS(status));
+
+    status = 0;
+    check(waitpid(client, &status, 0) == client, "relay: reap client");
+    check(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "relay: the client called through the relayed handle");
+    if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+        printf("       client exit status %d\n", WEXITSTATUS(status));
+
+    binder_close_dev(&mgr);
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3: death notification, on a second context
 // ---------------------------------------------------------------------------
 
@@ -1192,6 +1594,7 @@ int main(int argc, char **argv) {
 
     test_basics(binder_path);
     test_transaction(binder_path);
+    test_handle_relay(binder_path);
     test_death_notification(vndbinder_path);
     test_security_context(binder_dev_named("hwbinder"));
     test_poll_delivery(binder_dev_named("hwbinder"));
