@@ -108,10 +108,51 @@ property area itself: bionic tags every heap pointer, so before that was fixed
 an Android process died in libc long before it reached a property or a binder
 call.
 
-What is still missing above this line is everything that registers a service.
-Only servicemanager is running, so `service list` finds only servicemanager --
-the next step is starting a second Android process that calls `addService` and
-seeing a real name appear in that list.
+A second process registers too. `incidentd` starts, calls `addService`, and
+appears in the list:
+
+```
+$ chroot /root/android-sys /system/bin/service list
+Found 2 services:
+0	incident: []
+1	manager: []
+```
+
+`/proc/ish/binder` confirms it is real rather than a name in a map:
+servicemanager holds `ref handle 3 -> node 33 (proc 5031) strong 1 weak 1
+death-requested` -- a strong reference to incidentd's node, with death
+notification requested.
+
+**The next blocker: `checkService` returns null for everything.** `service
+list` works; `service check <name>` reports "not found" for *every* service,
+including `manager` itself, so it is not about any particular service. The two
+take different paths -- `listServices` returns names out of servicemanager's
+own map, while `checkService` has to hand a binder reference back through a
+transaction reply. `kernel/binder.c` does implement that translation
+(`binder_translate_object`, both BINDER->HANDLE and HANDLE->HANDLE) and
+`tests/manual/binder_ipc.c` covers an object sent in a reply and passes, so
+the gap is narrower than "unimplemented" and worth bisecting against what
+servicemanager actually sends. That is the next thing to chase.
+
+Two other things the daemon sweep established, both about the image rather
+than the emulator:
+
+- **Most daemons cannot link.** `mediametrics`, `storaged`, `credstore`,
+  `gatekeeperd`, `netd`, `vold` and `usbd` all die at the linker on a missing
+  AIDL or HAL library (`android.hardware.health-V5-ndk.so`,
+  `netd_aidl_interface-V18-cpp.so`, and so on). Those files are not anywhere
+  in the tree -- `find` finds nothing -- so this is an incomplete image, not a
+  namespace or linkerconfig problem. 38 APEXes are extracted and
+  `system/lib64` has 687 libraries; the missing ones simply were not shipped.
+- **`/data` did not exist.** A skeleton (`data/local/tmp`, `data/misc`,
+  `data/system`, `data/resource-cache`, `data/user/0`) is enough for
+  incidentd. `idmap2d` still dies with a null write (`page fault on 0x4`,
+  twice, from a binder thread), which looks like an ordinary guest-side null
+  dereference on missing configuration rather than an emulator fault.
+
+**Re-run `chroot-setup.sh` after every iSH restart.** Mounts do not survive
+one, and the symptom is not obviously a mount problem: `Bad boot_id: ''` and a
+servicemanager that exits without logging why. It cost two rounds here.
 
 `binder_ping` still exists and is still the cheapest probe:
 `PING_TRANSACTION` depends on no property, no logd and no init, so it isolates
