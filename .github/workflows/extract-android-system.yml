@@ -1,0 +1,227 @@
+name: Extract Android system
+
+# Turns a GSI zip (or a bare system.img) into the tree layout this fork's
+# Android bring-up expects, as a downloadable artifact.
+#
+# Unpack the artifact into an iSH root -- /root/android-sys, or /AOK/roots/<name>
+# -- then run tools/android/chroot-setup.sh against it. See
+# docs/android-bringup.md for what that sets up and why.
+#
+# Manual dispatch only. It never runs on a push and costs nothing sitting here.
+#
+# THREE THINGS THIS GETS RIGHT that a naive extraction does not, each of which
+# cost a real debugging session before it did:
+#
+#   build.prop         lives at the SYSTEM ROOT, not in etc/. Copying only
+#                      bin/lib64/etc drops it, and then the property area that
+#                      kernel/property_area.c builds contains nothing but the
+#                      servicemanager.ready key iSH seeds itself. Android then
+#                      logs "Using old property service protocol" and every
+#                      ro.* lookup a daemon makes comes back empty.
+#   system_ext/product a GSI keeps a large share of its AIDL and HAL interface
+#                      libraries there, alongside bin/lib64 rather than inside
+#                      them. Without those directories the tree links busybox
+#                      fine and cannot link netd, vold, storaged, credstore,
+#                      gatekeeperd, usbd or mediametrics -- all of which fail
+#                      identically, at the linker, naming a different library
+#                      each time.
+#   DT_NEEDED closure  a "critical paths" check that looks for libc and the
+#                      linker passes happily on an image where not one daemon
+#                      can start. The real question is whether every soname
+#                      any binary needs exists somewhere in the tree, and that
+#                      is answerable here in seconds instead of one chroot at
+#                      a time on a phone.
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Direct URL to an arm64 GSI zip or system.img"
+        required: true
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq android-sdk-libsparse-utils erofs-utils \
+              unzip file rsync binutils
+
+      # The URL goes through the environment, never through ${{ }} inside the
+      # script. Interpolating it directly builds the shell command out of the
+      # input, so a URL containing a quote and a semicolon runs as a command.
+      # Only someone who can dispatch the workflow can supply it, which makes
+      # this small rather than nonexistent.
+      - name: Fetch and unpack
+        env:
+          URL: ${{ inputs.url }}
+        run: |
+          set -eux
+          curl -fL --retry 3 -o payload "$URL"
+          file payload
+          if file payload | grep -qi 'zip archive'; then
+            unzip -o payload
+            IMG=$(find . -name 'system.img' -size +200M | head -1)
+            [ -n "$IMG" ] || IMG=$(find . -name 'system.img' | head -1)
+          else
+            IMG=payload
+          fi
+          [ -n "$IMG" ] || { echo "no system.img found"; exit 1; }
+          echo "using $IMG"
+          if file "$IMG" | grep -qi sparse; then simg2img "$IMG" raw.img; else cp "$IMG" raw.img; fi
+          sudo mkdir -p /mnt/sys
+          sudo mount -o loop,ro raw.img /mnt/sys || sudo mount -t erofs -o loop,ro raw.img /mnt/sys
+          ls /mnt/sys
+
+      - name: Copy the whole system root
+        run: |
+          set -eux
+          if [ -d /mnt/sys/system/bin ]; then R=/mnt/sys/system; else R=/mnt/sys; fi
+          echo "R=$R" > root.env
+          mkdir -p out/system
+          # Everything, minus what is large and useless without a running
+          # framework. APKs and fonts are most of the size and none of the
+          # value here; apex/ is handled separately below because the payloads
+          # have to be mounted. Trim or extend this list as needed -- the
+          # default errs towards keeping things, since a missing library is
+          # expensive to diagnose and a spare one costs only bytes.
+          sudo rsync -a \
+              --exclude 'apex/' \
+              --exclude 'app/' --exclude 'priv-app/' \
+              --exclude 'fonts/' --exclude 'media/' \
+              --exclude '**/*.apk' \
+              "$R/" out/system/
+          echo "--- system root, top level ---"
+          ls out/system
+          echo "--- build.prop present? ---"
+          # Not decoration: this is the file whose absence leaves the guest
+          # with an empty property area.
+          for P in build.prop system_ext/etc/build.prop product/etc/build.prop; do
+            [ -f "out/system/$P" ] && echo "OK   $P" || echo "MISS $P"
+          done
+          echo "system files: $(sudo find out/system -type f | wc -l)"
+
+      - name: Extract all apexes
+        run: |
+          set -eux
+          . ./root.env
+          sudo mkdir -p /mnt/ap
+          WORK=$PWD
+          COUNT=0
+          # Some images ship apexes already flattened as directories; take
+          # those as-is rather than looking for a payload that is not there.
+          for D in $(sudo find "$R/apex" -maxdepth 1 -mindepth 1 -type d | sort); do
+            N=$(basename "$D")
+            sudo mkdir -p "$WORK/out/apex/$N"
+            sudo cp -a "$D/." "$WORK/out/apex/$N/"
+            COUNT=$((COUNT+1))
+          done
+          for A in $(sudo find "$R/apex" -maxdepth 1 \( -name '*.apex' -o -name '*.capex' \) | sort); do
+            N=$(basename "$A" | sed -e 's/\.capex$//' -e 's/\.apex$//')
+            echo "=== $N ==="
+            sudo rm -rf "$WORK/ax"
+            mkdir -p "$WORK/ax"
+            cd "$WORK/ax"
+            sudo cp "$A" a.apex
+            if ! unzip -qo a.apex; then cd "$WORK"; continue; fi
+            # A .capex wraps the real .apex; unpack that too.
+            if [ -f original_apex ]; then unzip -qo original_apex || true; fi
+            if [ ! -f apex_payload.img ]; then
+              echo "no apex_payload.img in $N"
+              cd "$WORK"
+              continue
+            fi
+            if sudo mount -o loop,ro apex_payload.img /mnt/ap 2>/dev/null ||
+               sudo mount -t erofs -o loop,ro apex_payload.img /mnt/ap 2>/dev/null; then
+              cd "$WORK"
+              sudo mkdir -p "out/apex/$N"
+              sudo cp -a /mnt/ap/. "out/apex/$N/"
+              sudo umount /mnt/ap
+              COUNT=$((COUNT+1))
+            else
+              echo "mount failed for $N"
+              cd "$WORK"
+            fi
+          done
+          cd "$WORK"
+          echo "extracted $COUNT apexes"
+          ls out/apex || echo "NO APEXES EXTRACTED"
+
+      # /data has to exist before several daemons will start, and creating it
+      # here means the artifact is usable without a second setup step. incidentd
+      # needs no more than this; anything touching packages will want more.
+      - name: Seed a /data skeleton
+        run: |
+          set -eux
+          sudo mkdir -p out/data/local/tmp out/data/misc out/data/system \
+                        out/data/resource-cache out/data/user/0
+          sudo chmod 771 out/data
+
+      # The check that actually predicts whether a daemon can start. A soname
+      # present somewhere in the tree is not proof bionic's namespaces will let
+      # a given binary reach it -- but a soname present NOWHERE is proof it
+      # cannot, and that is the failure this image class keeps hitting.
+      - name: Check every binary's libraries are present
+        run: |
+          set -eu
+          sudo find out -name '*.so' -printf '%f\n' | sort -u > have.txt
+          : > need.txt
+          for B in out/system/bin/* out/apex/*/bin/*; do
+            [ -f "$B" ] || continue
+            readelf -d "$B" 2>/dev/null | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' >> need.txt
+          done
+          sort -u need.txt -o need.txt
+          comm -13 have.txt need.txt > missing.txt || true
+          MISSING=$(wc -l < missing.txt)
+          {
+            echo "### Android system extraction"
+            echo ""
+            echo "- libraries in the tree: $(wc -l < have.txt)"
+            echo "- sonames binaries ask for: $(wc -l < need.txt)"
+            echo "- **missing: $MISSING**"
+            if [ "$MISSING" -gt 0 ]; then
+              echo ""
+              echo "Binaries needing these cannot start; they die at the linker."
+              echo ""
+              echo '```'
+              head -40 missing.txt
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "missing sonames: $MISSING"
+          head -40 missing.txt
+          # Deliberately not a failure. A GSI legitimately expects some vendor
+          # libraries it does not ship, so a nonzero count is information about
+          # which daemons will not run, not a broken extraction.
+
+      - name: Sanity check
+        run: |
+          set -eu
+          echo "--- critical paths ---"
+          for P in system/bin/bootstrap/linker64 system/lib64/bootstrap/libc.so \
+                   system/build.prop \
+                   apex/com.android.runtime/lib64/bionic/libc.so \
+                   apex/com.android.art/bin/dalvikvm \
+                   apex/com.android.conscrypt/lib64/libcrypto.so; do
+            if [ -e "out/$P" ]; then echo "OK   $P"; else echo "MISS $P"; fi
+          done
+          echo "--- total ---"
+          sudo find out -type f | wc -l
+          sudo du -sh out
+
+      - name: Package
+        run: |
+          set -eux
+          sudo chown -R "$USER" out
+          tar -czf android-sys.tar.gz -C out .
+          ls -lh android-sys.tar.gz
+          tar -tzf android-sys.tar.gz | wc -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-sys
+          path: android-sys.tar.gz
+          retention-days: 7

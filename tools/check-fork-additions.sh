@@ -172,6 +172,10 @@ need_file opt/AOK/tools/android/chroot-setup.sh
 need_file opt/AOK/tools/android/root-profile.sh
 need_in fs/aok-tools.manifest android/chroot-setup.sh "shipped to /AOK/tools on the device"
 need_file docs/android-bringup.md
+# Builds the tree everything above is tested against. Its DT_NEEDED closure
+# check is the only thing that says, before a device is involved, which Android
+# daemons cannot start because the image never shipped their libraries.
+need_file .github/workflows/extract-android-system.yml
 need_file opt/AOK/tools/ish-report.sh
 need_in fs/aok-tools.manifest ish-report.sh "the one-command diagnostic report"
 need_file opt/AOK/tools/ish-remote.sh
