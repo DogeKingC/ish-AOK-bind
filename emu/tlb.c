@@ -661,6 +661,14 @@ static const char *tlb_arm64_caller_name(void *from, uintptr_t *delta_out) {
 #endif
 
 static void tlb_note_tagged_miss(guest_addr_t addr, int type, void *from, void *ptr) {
+    // Budget is per emulator lifetime, and that is the point: a tagged address
+    // reaching here should never happen at all, so eight of them is plenty to
+    // name the culprit and few enough that nothing else in the log is pushed
+    // out. Its short-lived companion -- a probe that logged every FAILING miss,
+    // tagged or not -- had to be removed for exactly that reason: ordinary
+    // demand-paging failures spent the whole budget during boot, and a later
+    // reading of "zero failing misses" was then taken as evidence the miss had
+    // SUCCEEDED. It had not; the log had simply stopped talking.
     enum { TAGGED_MISS_LOG_BUDGET = 8 };
     static unsigned tagged_miss_log_count;
     if (tagged_miss_log_count >= TAGGED_MISS_LOG_BUDGET)
@@ -689,30 +697,6 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, guest_addr_t addr, int ty
     if (atomic_load_explicit(&tlb->mmu->changes, memory_order_relaxed) != tlb->mem_changes)
         tlb_flush(tlb);
     if (ptr == NULL) {
-        // The other half of the TBI leak probe above, and the half that turned
-        // out to matter. tlb->segfault_addr is assigned HERE and nowhere else
-        // in the tree, so every INT_PF the arm64 gadgets raise carries a value
-        // that passed through this line. Logging the failures says whether a
-        // reported fault came through this path at all -- and on the device it
-        // has to be reconciled with a kernel that reports a TAGGED fault
-        // address while the probe above (which would have caught a tagged
-        // address arriving here) stays silent. Exactly one of those two
-        // observations can be true of the same fault, and this line is what
-        // tells them apart: an address logged here that matches the reported
-        // fault means the tag was added after this point, and no line at all
-        // means the fault never came through the TLB.
-        enum { MISS_FAIL_LOG_BUDGET = 12 };
-        static unsigned miss_fail_log_count;
-        if (miss_fail_log_count < MISS_FAIL_LOG_BUDGET) {
-            miss_fail_log_count++;
-            uintptr_t fdelta = 0;
-            const char *fname = tlb_arm64_caller_name(__builtin_return_address(0), &fdelta);
-            printk("arm64: TLB miss FAILED for %#llx (%s), called from %p = "
-                   "%s+%#lx -- this is the address the fault will report\n",
-                   (unsigned long long) addr,
-                   type == MEM_WRITE ? "write" : "read",
-                   __builtin_return_address(0), fname, (unsigned long) fdelta);
-        }
         tlb->segfault_addr = addr;
         return NULL;
     }
