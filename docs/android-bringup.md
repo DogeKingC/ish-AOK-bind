@@ -12,7 +12,18 @@ the binder context manager, and answers a transaction:
 ```
 $ binder_ping --external -v
 ok handle 0 replied to PING_TRANSACTION
+
+$ chroot /root/android-sys /system/bin/service list
+Found 1 services:
+0	manager: []
 ```
+
+`service list` is the whole path in one command, and it is the command this
+work started from: it used to spin forever on `WaitForProperty` without ever
+opening the driver. It now gets past the property wait, opens binder,
+transacts with a real Android `servicemanager` running from a real system
+image, and prints what came back. One service, because only servicemanager is
+registered.
 
 That is libbinder on one side, `kernel/binder.c` in the middle, and
 `BBinder::onTransact` on the other. Everything below it works under real
@@ -27,7 +38,7 @@ Android userspace, not just under our own tests:
 | `getcon` / process contexts | `fs/proc/pid.c` | `/proc/self/attr/current` reads `u:r:init:s0` |
 | ashmem, DMA-BUF heaps | `kernel/ashmem.c`, `kernel/dma_heap.c` | guest tests; not yet exercised by Android |
 | guest-writable `/dev/kmsg` | `fs/mem.c`, `kernel/log.c` | Android's fatal messages appear in `dmesg` |
-| system properties | `kernel/property_area.c` | bionic's own reader parses the area; not yet driven by a live client |
+| system properties | `kernel/property_area.c` | `service list` gets past `WaitForProperty` and goes on to transact |
 
 ## The property area
 
@@ -84,13 +95,23 @@ one keeps it -- restart the process, not the session.
 matters because from inside the guest "the property is not set" and "the area
 was never built" look identical and call for opposite next steps.
 
-**What has not been shown yet** is a live Android client getting past
-`WaitForProperty` and going on to make a real call. What has been shown is that
-bionic's own unmodified `prop_area.cpp` maps the area and finds every property
-in it by name, long out-of-line values included, and that
-`tests/manual/property_area.c` -- an independent transcription of the read side
--- agrees. The next person with a device should point `service list` at a
-running servicemanager and see how far it gets.
+**This has now been shown end to end.** `service list`, an unmodified Android
+binary from the system image, gets past `WaitForProperty`, opens the driver and
+transacts with a live `servicemanager` (`/proc/ish/binder` reports `manager pid
+1995`, `secctx yes`). Independently, bionic's own unmodified `prop_area.cpp`
+maps the area and finds every property in it by name, long out-of-line values
+included, and `tests/manual/property_area.c` -- a separate transcription of the
+read side -- agrees.
+
+Getting there needed the arm64 tagged-pointer work below as much as the
+property area itself: bionic tags every heap pointer, so before that was fixed
+an Android process died in libc long before it reached a property or a binder
+call.
+
+What is still missing above this line is everything that registers a service.
+Only servicemanager is running, so `service list` finds only servicemanager --
+the next step is starting a second Android process that calls `addService` and
+seeing a real name appear in that list.
 
 `binder_ping` still exists and is still the cheapest probe:
 `PING_TRANSACTION` depends on no property, no logd and no init, so it isolates
