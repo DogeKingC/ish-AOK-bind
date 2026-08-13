@@ -42,8 +42,16 @@ need_file kernel/binder.h
 need_file fs/binderfs.c
 need_file tests/manual/binder_ipc.c
 need_file tests/manual/binder_ping.c
+# The two binder diagnostics. They are NOT in setup-regressions.sh's test list
+# and must not be: they answer questions ("which alignment rule does the driver
+# I am talking to implement", "are wakeups being discarded") rather than
+# passing or failing. They ARE in fs/aok-tests.manifest, so they land on a
+# device -- which is the whole point, since the device is where the questions
+# get asked and gcc is already there.
 need_file tests/manual/binder_poll_wakeup_probe.c
 need_file tests/manual/binder_object_align_probe.c
+need_in fs/aok-tests.manifest binder_object_align_probe.c "shipped to /AOK/tests"
+need_in fs/aok-tests.manifest binder_poll_wakeup_probe.c  "shipped to /AOK/tests"
 need_file docs/binder.md
 need_in app/AppDelegate.m binder_create_device_nodes "creates /dev/binder at boot"
 need_in xX_main_Xx.h      binder_create_device_nodes "creates /dev/binder at boot (CLI)"

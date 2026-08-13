@@ -97,6 +97,8 @@ selinuxfs.c
 kmsg.c
 proc_random.c
 binder_ping.c
+binder_object_align_probe.c
+binder_poll_wakeup_probe.c
 property_area.c
 mount_stdev.c
 mmap_truncate_sigbus.c

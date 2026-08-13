@@ -189,8 +189,24 @@ jobs:
           PY
           sudo dpkg --add-architecture arm64
           sudo apt-get update
+          # lld is load-bearing, not a nicety: tools/cross-aarch64.ini passes
+          # -fuse-ld=lld, because without it clang falls back to the host
+          # binutils ld, which rejects the target during meson's LINKER
+          # DETECTION ("unrecognised emulation mode: aarch64linux") -- before
+          # compiling anything, so the error names no source file.
+          #
+          # Two sources of the target's libgcc/crt files are installed on
+          # purpose. gcc-aarch64-linux-gnu puts them under gcc-cross/, the
+          # libgcc-13-dev:arm64 pair under the multiarch gcc/ path, and
+          # run-arm64-guest-tests.sh looks in both. Either alone is enough
+          # today; having both means a change to that glob, or a runner image
+          # that drops one layout, cannot quietly turn the arm64 gate into
+          # "did not compile". Missing them entirely does not look like a
+          # missing package -- meson just reports that the compiler "cannot
+          # compile programs" and names nothing.
           sudo apt-get install -y clang lld llvm qemu-user-static \
-              gcc-aarch64-linux-gnu libsqlite3-dev:arm64
+              gcc-aarch64-linux-gnu libsqlite3-dev:arm64 \
+              libgcc-13-dev:arm64 libstdc++-13-dev:arm64
           # Installing a gcc cross package can take /usr/include/asm with it,
           # which silently breaks every -m32 compile (i.e. the i386 guest tests
           # above, if the step order ever changes). Cheap to re-assert.
@@ -252,25 +268,36 @@ jobs:
           set -uo pipefail
           git worktree add /tmp/upstream-baseline "upstream/$UPSTREAM_BRANCH"
           cd /tmp/upstream-baseline
-          # The test harnesses are this fork's, not upstream's, so bring them --
-          # including the arm64 one, whose whole point is that upstream has no
-          # equivalent and so cannot be asked about arm64 any other way. It
-          # needs the cross file and the meson.build gate that builds a CLI
+          # The arm64 harness is this fork's, so bring it: upstream has no
+          # equivalent and cannot be asked about arm64 any other way. It needs
+          # the cross file and the meson.build gate that builds a CLI
           # executable for a Linux cross target, neither of which upstream has;
           # without the gate the cross build produces no `ish` and the arm64
           # verdict would be a toolchain artifact rather than a fact about
           # upstream, so it is skipped rather than guessed at.
-          cp "$GITHUB_WORKSPACE/tools/run-guest-tests.sh" tools/ 2>/dev/null || true
           cp "$GITHUB_WORKSPACE/tools/run-arm64-guest-tests.sh" tools/ 2>/dev/null || true
           cp "$GITHUB_WORKSPACE/tools/cross-aarch64.ini" tools/ 2>/dev/null || true
-          cp "$GITHUB_WORKSPACE"/alpine-minirootfs-*.tar.xz . 2>/dev/null || true
-          verdict="upstream builds and tests clean; this merge is what broke it"
+          # NOT the i386 guest tests, and this used to be wrong in a way that
+          # inverted the answer. They were copied and run here, but the tests
+          # they run (binder_ipc, ashmem, dma_heap, selinuxfs, ...) are fork
+          # sources under tests/manual that upstream does not have, so
+          # run-guest-tests.sh hit its own "no such test" path and failed --
+          # every time, on every upstream tree. The verdict that produced was
+          # "upstream fails the i386 guest tests too; the breakage is not from
+          # this merge", which is precisely the wrong thing to tell someone at
+          # 7am: it exonerates the merge unconditionally.
+          #
+          # Copying the test sources as well would not rescue it. They exercise
+          # drivers only this fork has -- there is no /dev/binder on an upstream
+          # build -- so they can say nothing about upstream either way. If they
+          # fail after a merge, that IS the merge's problem (upstream changed
+          # something our drivers rest on), which is exactly the default verdict
+          # below. So the honest baseline is configure, build, and arm64.
+          verdict="upstream configures, builds, and passes what can be asked of it; this merge is what broke it"
           if ! meson setup build -Dengine=jit >/tmp/base-cfg.log 2>&1; then
             verdict="upstream does not even CONFIGURE; the breakage is not from this merge"
           elif ! ninja -C build >/tmp/base-build.log 2>&1; then
             verdict="upstream does not BUILD either; the breakage is not from this merge"
-          elif ! bash tools/run-guest-tests.sh build >/tmp/base-test.log 2>&1; then
-            verdict="upstream builds but fails the i386 guest tests too; the breakage is not from this merge"
           elif grep -q "host_machine.system() == 'linux'" meson.build 2>/dev/null &&
                ! ISH_ARM64_WORK=/tmp/base-arm64 bash tools/run-arm64-guest-tests.sh \
                    >/tmp/base-arm64.log 2>&1; then
