@@ -221,54 +221,53 @@ it raw:
   to the caller: silently mapping at a tagged address would be worse than the
   fault it replaced.
 
-**Handled, with the leak itself still unidentified: libc `memset`/`memcpy` on
-a tagged pointer.** The test's bulk probes died at every size, on device,
-with `si_addr` equal to the tagged pointer and a fault address that
-`handle_page_fault_interrupt` could not resolve.
+**Fixed: libc `memset`/`memcpy` on a tagged pointer, and it was not in the
+JIT at all.** `jit/hle.c` -- the high-level emulation that recognises hot libc
+functions and runs them natively in C instead of emulating them -- took its
+pointer arguments straight out of the guest register file and used them as
+guest addresses. The file contained no untagging whatsoever. So every HLE'd
+`memset`, `memcpy`, `strlen` and friend faulted on an address the JIT itself
+would have handled without complaint, and `hle_loop_exec` did the same with the
+recognised copy/set loop's pointer registers.
 
-`handle_page_fault_interrupt` now resolves an arm64 fault against the
-UNTAGGED address. That is not a workaround bolted on to hide a missing mask;
-it is the first thing Linux's own `do_page_fault` does (`addr =
-untagged_addr(far)`), before it has any idea which vma the access belongs to.
-A guest whose allocator tags pointers takes ordinary copy-on-write and
-first-touch faults through tagged addresses all day, and resolving the literal
-64-bit value fails every one of them. `si_addr` still carries the tag, which
-is also what Linux reports, because it hands the raw FAR to the signal frame.
+`a2` is left alone deliberately: it is a length, and `~0ull` for the unbounded
+string forms. Pointer-valued results get the tag put back, because hardware
+never strips it and a caller comparing `memchr`'s result against the pointer it
+passed in must still see them equal.
 
-Something below that function is still handing it a tagged address, and that
-is a real bug worth finding. Two probes now say where it is not:
+Two smaller leaks of the same shape were fixed on the way, and both were real:
 
-- `emu/tlb.c`'s `tlb_handle_miss` logs (rate-limited, with the calling gadget's
-  return address) if a tagged address reaches the TLB layer. It firing means a
-  gadget skipped its prep macro; it staying silent means the TLB layer was
-  clean and `cpu->segfault_addr` picked the tag up elsewhere.
-- The fault handler logs, rate-limited, every tagged fault address it had to
-  untag, with the pc.
+- the seven arm64 C helpers in `emu/tlb.c` (`arm64_vldst_multi`,
+  `arm64_vldst_struct`, `arm64_lse_rmw`, `arm64_cas`, `arm64_casp`,
+  `arm64_ldxp`, `arm64_stxp`), which exist *because* they bypass the prep
+  macros -- and so bypassed the only thing that strips the tag
+- `handle_page_fault_interrupt`, which now resolves an arm64 fault against the
+  untagged address, as Linux's `do_page_fault` does on its first line, with a
+  cap so that a fault which resolves and immediately re-faults is delivered as
+  SIGSEGV instead of spinning the app into a wedge
 
-What is known, and what turned out to be worth less than it looked:
+**Why it took a day, which is the part worth keeping.** HLE hooks a function AT
+ITS ENTRY POINT, so the fault was always reported at the first instruction of
+`memset` (`dup v0.16b, w1`) or `memcpy` (`add x4, x1, x2`) -- neither of which
+touches memory. That one fact sent the investigation into the SIMD gadgets, the
+fault-restart contract, instruction fusion and the TLB prep macros, all
+innocent. It also explains the two results that should have been the clue and
+could not be accounted for at the time: an inline copy of musl's memset body
+passed against the same tagged pointer in the same process (not hooked, so
+genuinely executed), and a minimal standalone repro never failed (HLE
+recognition needs the function to be hot, and a short-lived forked child never
+gets there).
 
-- It is not the tag reaching an unmasked instruction. `strb`, `ldrb`, `dup`,
-  `str q0` and `stp q0,q0` all pass in isolation against the same tagged
-  address in the same process.
-- It is not the build flags, `dc zva` (`DCZID_EL0` advertises `DZP=1`, so musl
-  never takes that path), a `printf` between, or the parent writing the page
-  before forking.
-- **The fusion A/B was not a real A/B.** `/proc/ish/arm64_jit_fuse` arrived
-  with upstream's `0f26b25`, which postdates the IPA the device run used, so
-  `all=0` wrote to a file that did not exist and changed nothing. JIT fusion
-  is back on the list of things not ruled out, and a build with the knob
-  present can now test it properly.
-- The one probe that passes, `libc memset(tagged, 1)`, differs from the ten
-  that fail only in the size of the UNTAGGED memset it does first -- 8 bytes
-  rather than a full page. So the tagged access is poisoned by what ran before
-  it, not by anything about itself.
+What located it was instrumenting `tlb_handle_miss` to name its caller. The
+tagged address arrived from C, from a translation unit far from `emu/tlb.c`,
+and `jit/hle.c` is the only C on the arm64 path that touches guest memory on
+behalf of an entire libc call. Those probes are still in, rate-limited, as
+tripwires: if a tagged address ever reaches the TLB again, the log says so and
+names the caller instead of costing another week.
 
-The fault is always reported at the callee's FIRST instruction -- `dup
-v0.16b, w1` for memset, `add x4, x1, x2` for memcpy -- neither of which has a
-memory operand, and both of which are block-entry pcs. `memory.S`'s
-fault-restart contract says the reported PC names the faulting
-sub-instruction, so either that contract is not holding here or the fault is
-raised at a block boundary rather than by an access.
+Confirmed on device: `tagged_pointer: PASS`, and zero probe lines in `dmesg` --
+the probes going silent is the real check, since it means nothing is handing
+the emulator a tagged pointer any more.
 
 ### Reproducing arm64-guest bugs without a device
 

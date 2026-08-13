@@ -198,17 +198,19 @@ jobs:
             sudo ln -sfn x86_64-linux-gnu/asm /usr/include/asm
           fi
 
-      # tagged_pointer is deliberately excluded: its `atomics` probe fails
-      # under qemu-user and passes on device, because qemu clears the exclusive
-      # monitor far more eagerly than a real core (see the script's header).
-      # Gating an automated push on a known host artifact would mean a red sync
-      # every morning, which is how a gate stops being read.
+      # The full set, tagged_pointer included. It was excluded when this step
+      # was written, on the grounds that its `atomics` probe failed under
+      # qemu-user and passed on device -- a host artifact, since qemu clears
+      # the exclusive monitor far more eagerly than a real core. That was
+      # wrong: the probe was failing because the arm64 C memory helpers took
+      # the guest address with its TBI tag on, and the device only survived it
+      # because AArch64 ignores the top byte on a dereference. It now passes
+      # everywhere, and it is the ONLY automated cover for a whole class of
+      # tag bugs (the last of which made every Android memset fault), so it
+      # gates the sync like everything else.
       - name: Run the arm64 guest tests under qemu-user
         if: steps.merge.outputs.clean == 'true'
-        run: |
-          bash tools/run-arm64-guest-tests.sh \
-            ands_bcond_fusion arm64_regress atomics64 hle_loop \
-            ptrace_singlestep smc_stale_block stlr_ldar_publish vector_smoke
+        run: bash tools/run-arm64-guest-tests.sh
 
       - name: Push to working
         if: steps.merge.outputs.clean == 'true'
@@ -271,8 +273,6 @@ jobs:
             verdict="upstream builds but fails the i386 guest tests too; the breakage is not from this merge"
           elif grep -q "host_machine.system() == 'linux'" meson.build 2>/dev/null &&
                ! ISH_ARM64_WORK=/tmp/base-arm64 bash tools/run-arm64-guest-tests.sh \
-                   ands_bcond_fusion arm64_regress atomics64 hle_loop \
-                   ptrace_singlestep smc_stale_block stlr_ldar_publish vector_smoke \
                    >/tmp/base-arm64.log 2>&1; then
             verdict="upstream builds but fails the arm64 guest tests too; the breakage is not from this merge"
           fi

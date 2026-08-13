@@ -97,6 +97,17 @@ need_in fs/aok-tests.manifest             arm64/tagged_pointer.c
 need_in tests/manual/setup-regressions.sh tagged_pointer
 need_in kernel/calls.c guest_abi_untag_addr \
     "the fault handler resolves arm64 faults untagged, as Linux's do_page_fault does"
+# The last and worst of the TBI leaks, and the one nothing else would catch:
+# jit/hle.c runs whole libc calls natively in C with pointers taken straight
+# from the guest register file. Losing the mask there does not fail to build
+# and does not fail any i386 test -- it just makes every memset and memcpy on
+# an Android heap pointer fault, reported at the callee's first instruction,
+# which is a week of somebody's life.
+need_in jit/hle.c    guest_abi_untag_addr "HLE untags the guest pointer arguments"
+need_in jit/hle.c    hle_fn_returns_pointer \
+    "and puts the tag back on pointer-valued results, as hardware does"
+need_in emu/tlb.c    guest_abi_untag_addr \
+    "the arm64 C memory helpers that bypass the prep macros untag on entry"
 
 # --- arm64 guest: testable without a device ---------------------------------
 # The arm64 engine is aarch64-host-only, so on an x86_64 dev box every gadget
