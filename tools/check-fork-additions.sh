@@ -108,6 +108,13 @@ need_in jit/hle.c    hle_fn_returns_pointer \
     "and puts the tag back on pointer-valued results, as hardware does"
 need_in emu/tlb.c    guest_abi_untag_addr \
     "the arm64 C memory helpers that bypass the prep macros untag on entry"
+need_in kernel/calls.c SAME_FAULT_LIMIT \
+    "a fault that resolves and re-faults is delivered, not spun on forever"
+# The tripwires that found the HLE leak, kept for the next one. They are the
+# difference between "a tagged address got in somewhere" and a week of
+# bisecting: they name the calling helper in the log the first time it happens.
+need_in emu/tlb.c    tlb_note_tagged_miss \
+    "the TBI tripwire that names whoever hands the TLB a tagged address"
 
 # --- arm64 guest: testable without a device ---------------------------------
 # The arm64 engine is aarch64-host-only, so on an x86_64 dev box every gadget
@@ -169,6 +176,8 @@ need_file opt/AOK/tools/ish-report.sh
 need_in fs/aok-tools.manifest ish-report.sh "the one-command diagnostic report"
 need_file opt/AOK/tools/ish-remote.sh
 need_in fs/aok-tools.manifest ish-remote.sh "the code-gated remote command listener"
+need_in opt/AOK/tools/ish-remote.sh inflight \
+    "a command that killed the listener is reported, not silently swallowed"
 
 # --- host CPU feature detection --------------------------------------------
 # One binary ships to every device from an ARMv8.0 iPad up, so "what can this
@@ -222,6 +231,22 @@ need_in .github/workflows/build-release-ipa.yml "DogeKingC/ish-AOK-bind"
 # just be slower.
 need_in .github/workflows/build-dev-ipa.yml     "ISH_ARM64_GRET=ldar"
 need_in .github/workflows/build-release-ipa.yml "ISH_ARM64_GRET=ldar"
+
+# The automated sync is what runs THIS script, so it is the one file whose
+# loss would disarm every check above at once and report nothing. Guard the
+# workflow and both gates it depends on: without check-fork-additions.sh the
+# sync stops noticing that our work vanished, and without the arm64 harness it
+# stops testing the only engine this fork actually ships on -- neither of which
+# fails a build or shows up anywhere except on a phone, weeks later.
+need_file .github/workflows/sync-upstream.yml
+need_in .github/workflows/sync-upstream.yml check-fork-additions.sh \
+    "the sync verifies this fork's work survived the merge"
+need_in .github/workflows/sync-upstream.yml run-guest-tests.sh \
+    "the sync runs the i386 guest regression tests"
+need_in .github/workflows/sync-upstream.yml run-arm64-guest-tests.sh \
+    "the sync runs the arm64 guest tests under qemu-user"
+need_in .github/workflows/sync-upstream.yml "github.repository == 'DogeKingC/ish-AOK-bind'" \
+    "pinned, so a fork of this fork does not push to a repo it should not"
 
 if [ "$fail" -eq 0 ]; then
     echo "fork additions: all present"
