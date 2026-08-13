@@ -123,16 +123,33 @@ servicemanager holds `ref handle 3 -> node 33 (proc 5031) strong 1 weak 1
 death-requested` -- a strong reference to incidentd's node, with death
 notification requested.
 
-**The next blocker: `checkService` returns null for everything.** `service
-list` works; `service check <name>` reports "not found" for *every* service,
-including `manager` itself, so it is not about any particular service. The two
-take different paths -- `listServices` returns names out of servicemanager's
-own map, while `checkService` has to hand a binder reference back through a
-transaction reply. `kernel/binder.c` does implement that translation
-(`binder_translate_object`, both BINDER->HANDLE and HANDLE->HANDLE) and
-`tests/manual/binder_ipc.c` covers an object sent in a reply and passes, so
-the gap is narrower than "unimplemented" and worth bisecting against what
-servicemanager actually sends. That is the next thing to chase.
+**The next blocker: `checkService` returns null for everything**, and it is
+NOT the binder driver. `service list` works; `service check <name>` reports
+"not found" for every service, `manager` included. What has been ruled out, and
+how:
+
+- **The driver.** `binder_ipc`'s relay phase now covers all three shapes this
+  involves -- an object sent in a reply, a third party's handle relayed on to a
+  stranger (`HANDLE -> HANDLE`, then a direct call through it), and the manager
+  handing back its OWN node to a caller that already holds handle 0 for it.
+  All pass, on an x86 box, with no device.
+- **The SELinux permission check.** `canList` and `canFind` both call
+  `selinux_check_access` with the same caller SID. Listing works, so the SID,
+  the AVC and the stub's allow-everything verdict are all fine.
+- **The context lookup.** `incident` and `manager` are both present in
+  `plat_service_contexts` (lines 333 and 473), and servicemanager logs
+  `No match for <name> in service_contexts` when `selabel_lookup` fails. It
+  does not.
+- **Enforcement mode.** `sys/fs/selinux/enforce` reads `0`.
+- **A dead manager.** `/proc/ish/binder` reports `manager pid 43`, `secctx
+  yes`, while the failing check runs.
+
+So the difference is above the driver, in what libbinder or servicemanager does
+between finding the service in its map and the caller seeing a usable binder.
+The next step needs instrumentation on that side -- our own tests replicate the
+protocol shape faithfully but not libbinder's exact parcel -- so it wants either
+a printk in the driver dumping the objects in that specific reply, or a locally
+built Android client.
 
 Two other things the daemon sweep established, both about the image rather
 than the emulator:

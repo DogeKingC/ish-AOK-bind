@@ -743,6 +743,7 @@ static void test_transaction(const char *dev) {
 #define RELAY_REGISTER_CODE 0x51
 #define RELAY_LOOKUP_CODE 0x52
 #define RELAY_CALL_CODE 0x53
+#define RELAY_SELF_CODE 0x54
 #define PROVIDER_OBJECT_PTR UINT64_C(0xbeef000000004000)
 #define PROVIDER_OBJECT_COOKIE UINT64_C(0xbeef000000005000)
 #define RELAY_CALL_MAGIC UINT64_C(0x0f0f0f0f0000600d)
@@ -772,6 +773,7 @@ struct relay_mgr_ctx {
     uint32_t provider_handle;
     int registered;
     int served_lookup;
+    int served_self;
 };
 
 static int relay_mgr_handler(uint32_t cmd, const void *payload, void *vctx) {
@@ -815,6 +817,46 @@ static int relay_mgr_handler(uint32_t cmd, const void *payload, void *vctx) {
         relay_free_buffer(ctx->b, tr.data.ptr.buffer);
         (void) binder_wr(ctx->b, &out, sizeof(out), NULL, 0, NULL);
         ctx->registered = 1;
+        return 1;
+    }
+
+    if (tr.code == RELAY_SELF_CODE) {
+        // `service check manager`: the manager hands back its OWN node, to a
+        // caller that already holds handle 0 for it. The reply must resolve to
+        // the ref the client already has rather than minting a second one --
+        // Linux's binder_get_ref_for_node returns the existing ref -- so the
+        // handle the client sees here is legitimately 0, which is the one
+        // value a "did I get something usable" check is tempted to treat as
+        // failure.
+        static struct {
+            uint64_t magic;
+            struct flat_binder_object obj;
+        } self_data;
+        static binder_size_t self_offsets[1];
+
+        self_data.magic = RELAY_REPLY_MAGIC;
+        memset(&self_data.obj, 0, sizeof(self_data.obj));
+        self_data.obj.type = BINDER_TYPE_BINDER;
+        self_data.obj.flags = FLAT_BINDER_FLAG_ACCEPTS_FDS;
+        self_data.obj.binder = 0; // the context manager registered with ptr 0
+        self_data.obj.cookie = 0;
+        self_offsets[0] = offsetof(typeof(self_data), obj);
+
+        struct {
+            uint32_t cmd;
+            struct binder_transaction_data tr;
+        } __attribute__((packed)) out;
+        memset(&out, 0, sizeof(out));
+        out.cmd = BC_REPLY;
+        out.tr.data_size = sizeof(self_data);
+        out.tr.offsets_size = sizeof(self_offsets);
+        out.tr.data.ptr.buffer = (binder_uintptr_t) (uintptr_t) &self_data;
+        out.tr.data.ptr.offsets = (binder_uintptr_t) (uintptr_t) self_offsets;
+
+        relay_free_buffer(ctx->b, tr.data.ptr.buffer);
+        check(binder_wr(ctx->b, &out, sizeof(out), NULL, 0, NULL) >= 0,
+              "manager: a reply carrying the manager's own node is accepted");
+        ctx->served_self = 1;
         return 1;
     }
 
@@ -906,6 +948,9 @@ struct relay_client_ctx {
     uint32_t handle;
     int got_lookup_reply;
     int got_call_reply;
+    int got_self_reply;
+    int self_is_binder_type;
+    uint32_t self_handle;
 };
 
 static int relay_client_handler(uint32_t cmd, const void *payload, void *vctx) {
@@ -935,12 +980,19 @@ static int relay_client_handler(uint32_t cmd, const void *payload, void *vctx) {
             (void) binder_wr(ctx->b, &acquire, sizeof(acquire), NULL, 0, NULL);
         }
         ctx->got_lookup_reply = 1;
-    } else {
+    } else if (!ctx->got_call_reply) {
         uint64_t magic = 0;
         if (tr.data_size >= sizeof(magic))
             memcpy(&magic, (void *) (uintptr_t) tr.data.ptr.buffer, sizeof(magic));
         if (magic == RELAY_REPLY_MAGIC)
             ctx->got_call_reply = 1;
+    } else {
+        struct flat_binder_object obj;
+        if (relay_get_object(&tr, &obj) == 0) {
+            ctx->self_is_binder_type = obj.type == BINDER_TYPE_HANDLE;
+            ctx->self_handle = obj.handle;
+        }
+        ctx->got_self_reply = 1;
     }
     relay_free_buffer(ctx->b, tr.data.ptr.buffer);
     return 1;
@@ -1074,10 +1126,21 @@ static void test_handle_relay(const char *dev) {
             rc = relay_call(&b, ctx.handle, RELAY_CALL_CODE, &call, sizeof(call),
                             NULL, 0, relay_client_handler, &ctx, &ctx.got_call_reply);
         }
+        // And the `check manager` shape: ask the manager for itself.
+        if (rc == 0) {
+            static uint64_t ask_self;
+            ask_self = RELAY_CALL_MAGIC;
+            rc = relay_call(&b, 0, RELAY_SELF_CODE, &ask_self, sizeof(ask_self), NULL, 0,
+                            relay_client_handler, &ctx, &ctx.got_self_reply);
+        }
         (void) write(cli_pipe[1], got_handle ? "h" : "x", 1);
         close(cli_pipe[1]);
         binder_close_dev(&b);
         fflush(NULL);
+        if (!ctx.got_self_reply || !ctx.self_is_binder_type) {
+            fflush(NULL);
+            _exit(75);
+        }
         _exit(got_handle && rc == 0 && ctx.got_call_reply ? 0 : 74);
     }
 
@@ -1088,7 +1151,7 @@ static void test_handle_relay(const char *dev) {
     // Serve both the registration and the lookup.
     struct relay_mgr_ctx ctx = { .b = &mgr };
     uint8_t readbuf[1024];
-    while (!(ctx.registered && ctx.served_lookup)) {
+    while (!(ctx.registered && ctx.served_lookup && ctx.served_self)) {
         size_t consumed = 0;
         if (binder_wr(&mgr, NULL, 0, readbuf, sizeof(readbuf), &consumed) < 0) {
             if (errno == EINTR)
@@ -1101,6 +1164,7 @@ static void test_handle_relay(const char *dev) {
     }
     check(ctx.registered, "relay: manager saw the registration");
     check(ctx.served_lookup, "relay: manager answered the lookup");
+    check(ctx.served_self, "relay: manager answered a request for its own node");
 
     char verdict = 0;
     (void) read(cli_pipe[0], &verdict, 1);
