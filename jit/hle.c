@@ -1392,7 +1392,13 @@ static int hle_loop_exec(struct cpu_state *cpu, struct tlb *tlb,
     bool cmp_on_src = (spec >> 39) & 1;
     unsigned looplen = (spec >> 40) & 0xff;
 
-    uint64_t s0 = fill ? 0 : regs[rs], d0 = regs[rd], c0 = regs[rc];
+    // Same TBI stripping as hle_call below: rs/rd are guest POINTERS taken raw
+    // out of the register file and used as addresses, so the tag has to come
+    // off here exactly as the prep macros take it off in the gadgets. rc is a
+    // counter and is left alone.
+    uint64_t s0 = fill ? 0 : (uint64_t) guest_abi_untag_addr(GUEST_ABI_ARM64, regs[rs]),
+             d0 = (uint64_t) guest_abi_untag_addr(GUEST_ABI_ARM64, regs[rd]),
+             c0 = regs[rc];
     // Iterations until the loop's own exit condition. These are do-while
     // loops: a zero count (SUBS) or already-equal pointers (CMP) still run
     // one iteration and then wrap the full 2^64 -- represent as "huge" and
@@ -1529,6 +1535,22 @@ static int hle_loop_exec(struct cpu_state *cpu, struct tlb *tlb,
 // operation, writes the return register, and sets the guest pc to the return
 // address. Returns INT_NONE on success (the gadget then exits the block via
 // jit_ret) or INT_PF on a guest memory fault (the gadget exits via jit_exit).
+// Which HLE'd functions return a POINTER (their dst, or an address inside one
+// of their arguments) rather than a length or a comparison result. Only those
+// get the caller's TBI tag put back on the way out -- see the end of hle_call.
+static bool hle_fn_returns_pointer(enum hle_fn fn) {
+    switch (fn) {
+        case HLE_MEMCPY: case HLE_MEMMOVE: case HLE_MEMSET:
+        case HLE_STRCPY: case HLE_STRNCPY: case HLE_STRCAT: case HLE_STRNCAT:
+        case HLE_STPCPY: case HLE_STPNCPY:
+        case HLE_MEMCHR: case HLE_STRCHR: case HLE_STRRCHR:
+        case HLE_MEMRCHR: case HLE_RAWMEMCHR: case HLE_STRPBRK:
+            return true;
+        default:
+            return false;
+    }
+}
+
 int hle_call(struct cpu_state *cpu, struct tlb *tlb, unsigned long fn,
         unsigned long entry_ip) {
 #if defined(__aarch64__)
@@ -1543,6 +1565,26 @@ int hle_call(struct cpu_state *cpu, struct tlb *tlb, unsigned long fn,
     qword_t a1 = regs[rv ? (int) riscv64_a1 : 1];
     qword_t a2 = regs[rv ? (int) riscv64_a2 : 2];
     qword_t ret_addr = regs[rv ? (int) riscv64_ra : (int) arm64_x30];
+
+    // AArch64 TBI. These arguments come STRAIGHT out of the guest register
+    // file and are used as guest addresses below, so the top byte has to go
+    // the same way read_prep/write_prep strip it in the gadgets. Nothing else
+    // on this path does it, which is the bug this fixes: on a guest whose
+    // allocator tags pointers (bionic's Scudo tags every heap pointer, with no
+    // MTE hardware required), every HLE'd memset/memcpy/strlen faulted on an
+    // address the JIT would have handled -- and reported the fault at the
+    // function's FIRST INSTRUCTION, because that is where the HLE hook sits,
+    // which sent a long investigation looking at `dup v0.16b, w1` for a memory
+    // bug it does not have.
+    //
+    // a2 is a LENGTH, not a pointer -- and is ~0ull for the unbounded string
+    // forms -- so it is deliberately left alone.
+    qword_t a0_tag = 0;
+    if (!rv) {
+        a0_tag = a0 & ~(qword_t) 0x00ffffffffffffffULL;
+        a0 = (qword_t) guest_abi_untag_addr(GUEST_ABI_ARM64, a0);
+        a1 = (qword_t) guest_abi_untag_addr(GUEST_ABI_ARM64, a1);
+    }
     qword_t result = a0;
     bool ok;
 
@@ -1693,6 +1735,13 @@ int hle_call(struct cpu_state *cpu, struct tlb *tlb, unsigned long fn,
 
     if (!ok)
         return INT_PF;
+    // A pointer-valued result carries the tag back. Real hardware never strips
+    // it -- these functions return either their own dst argument or an address
+    // inside it -- and a caller that compares memchr's result against the
+    // pointer it passed in must still see them equal. The length- and
+    // comparison-valued results are numbers and must NOT be tagged.
+    if (a0_tag != 0 && result != 0 && hle_fn_returns_pointer((enum hle_fn) fn))
+        result |= a0_tag;
     // x0/a0 gets the return value; pc jumps to the caller. riscv64's x0 slot
     // is the hardwired zero -- writing regs[10] (a0) is correct there.
     regs[rv ? riscv64_a0 : 0] = result;
