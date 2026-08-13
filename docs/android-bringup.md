@@ -169,14 +169,42 @@ answer, filed as a caveat.
 object at offset 4. It fails against the old driver with `BR_FAILED_REPLY` and
 passes now.
 
-**What is and is not confirmed.** The fix is verified by that regression test
-on an x86 box with no device: the exact parcel libbinder emits is accepted, and
-the object comes back as a usable handle. It has *not* yet been run on device
-against a real `servicemanager` -- `service check manager` is the one-line
-experiment that closes this, and it should be the first thing the next session
-does. The reasoning that ties the test to the symptom is sound but it is
-reasoning; the doc has been wrong before at exactly this join, which is how
-this bug survived a round of elimination in the first place.
+**Confirmed on device**, against a real `servicemanager` and a real
+`incidentd`, on a dev IPA built from the fix:
+
+```
+$ chroot /root/android-sys /system/bin/service list
+Found 2 services:
+0	incident: [android.os.IIncidentManager]
+1	manager: [android.os.IServiceManager]
+
+manager          Service manager: found
+incident         Service incident: found
+nosuchservice    Service nosuchservice: not found
+```
+
+The last line is the control, and it matters: without it "found" only shows
+that something changed, not that lookup still discriminates.
+
+Two things worth noticing in that output. The interface descriptors are new --
+this document previously recorded `manager: []`, and the empty brackets were
+the same bug seen from the other side. `service list` prints a descriptor by
+calling `getInterfaceDescriptor()` on the binder it gets back from
+`checkService`, so when `checkService` returned null there was nothing to ask
+and the field came back empty. That detail sat in the doc for a session as an
+unexplained cosmetic oddity; it was the bug, logged and not read.
+
+**How this was established, because the obvious method does not work.** The
+device build reports only `iSH-AOK 1.3 (547)` with a zeroed build date, so it
+cannot tell you which commit it came from -- and reasoning from "the device
+must be running the old binary" gets it wrong. `tests/manual/binder_ipc.c`'s
+`align4` phase is the answer: a small standalone version of it (offsets 2, 4,
+8 and 12, reply accepted or `BR_FAILED_REPLY`) is a *behavioural fingerprint*
+of which alignment rule a driver implements. Offset 2 must be refused under
+either rule, so it proves validation is running at all; 4 separates the two.
+Run it against a known-good and known-bad local build first, then against the
+device, and the device's driver identifies itself. That is cheaper and more
+trustworthy than any version string, and it works over `ish-remote.sh`.
 
 The other things ruled out at the time were correctly ruled out, and remain so:
 `canList`/`canFind` and the caller SID, the `plat_service_contexts` lookup,
@@ -297,11 +325,24 @@ down in the same paragraph as the exoneration ("our own tests replicate the
 protocol shape faithfully but not libbinder's exact parcel") and read as a
 caveat instead of a lead.
 
-The common shape: a strong signal (a precise PC, a green suite) was treated as
-an answer when it was only evidence about a narrower question. The cheap
-diagnostics in this document -- `/proc/ish/binder`, `/proc/ish/property_area`,
-`dmesg`, `binder_ping` -- are worth more than either, because they report state
-rather than inviting an inference.
+**You do not know what code a device is running until you make it prove it.**
+Confirming the `checkService` fix began with a confident and wrong assertion --
+that the device must still have the old binary, because a fix committed an hour
+ago could not be on a phone yet. It was: CI builds a dev IPA on every push to
+`working`, and the device had installed one. The version string is no help
+(`iSH-AOK 1.3 (547)`, zeroed build date), and neither is arithmetic about who
+had time to install what. What settled it was a twenty-line probe that asks the
+driver which alignment rule it implements, run first against known-good and
+known-bad local builds and then against the device. **Fingerprint the
+behaviour; do not date the binary.**
+
+The common shape in all three: a strong signal -- a precise PC, a green suite,
+a plausible timeline -- was treated as an answer when it was only evidence
+about a narrower question. The cheap diagnostics in this document
+(`/proc/ish/binder`, `/proc/ish/property_area`, `dmesg`, `binder_ping`) and a
+throwaway probe like the one above are worth more than any of them, because
+they report state rather than inviting an inference. `ish-remote.sh` makes that
+kind of probe cost about a minute, which is the whole reason it exists.
 
 ## Two ways to run a tree
 
@@ -346,14 +387,12 @@ that tree's `dev/__properties__`.
 
 ## Anticipated order of remaining work
 
-1. **Confirm the `checkService` fix on device.** `service check manager`, with
-   servicemanager already started. One command, and it is the only thing
-   standing between "the regression test accepts libbinder's parcel" and "a
-   real client can resolve a service". Done first, because everything below
-   assumes a client can get a binder for something.
-2. **logd**, or a socket sink at `/dev/socket/logdw`, so Android's own logging
-   is visible without relying on the kmsg path.
-3. Whatever the first real service needs after that. Do not build ahead of the
+1. **logd**, or a socket sink at `/dev/socket/logdw`, so Android's own logging
+   is visible without relying on the kmsg path. This is now the top of the
+   list: with `checkService` working, a client can resolve a service and
+   actually call it, and the next thing to go wrong will explain itself only
+   through logging that currently does not exist.
+2. Whatever the first real service needs after that. Do not build ahead of the
    evidence: every wall so far has been something other than the one predicted,
    and the cheap diagnostics (`/proc/ish/binder`, `/proc/ish/property_area`,
    `dmesg`, `binder_ping`) have each been worth more than a round of
