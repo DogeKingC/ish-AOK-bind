@@ -3,6 +3,7 @@
 #include "emu/interrupt.h"
 #include "kernel/signal.h"
 #include "kernel/task.h"
+#include "kernel/abi.h"
 
 static void arm64_watch_scan_value(guest_addr_t addr, const void *value, unsigned size);
 
@@ -24,6 +25,14 @@ static void arm64_watch_scan_value(guest_addr_t addr, const void *value, unsigne
 // successful ld1 exited INT_PF and the block re-ran forever.)
 int arm64_vldst_multi(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
                       unsigned rt, unsigned count, unsigned regbytes, int is_load) {
+    // AArch64 TBI. This is the C-side counterpart of read_prep/write_prep
+    // (jit/guest-arm64/gadgets.h), which mask the top byte before they touch
+    // the TLB -- and it exists because these helpers deliberately BYPASS those
+    // macros: the gadget hands the raw guest address straight to C so the
+    // transfer can span pages via tlb_read/tlb_write. Nothing else on that
+    // route ever strips the tag, so it has to happen here, on entry, before
+    // the address reaches a TLB index or an alignment check.
+    addr = (guest_addr_t) guest_abi_untag_addr(GUEST_ABI_ARM64, addr);
     for (unsigned r = 0; r < count; r++) {
         unsigned v = (rt + r) & 31;
         if (is_load) {
@@ -56,6 +65,14 @@ int arm64_vldst_multi(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
 // Returns 0 on success (see the INT_NONE note above), INT_PF on fault.
 int arm64_vldst_struct(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
                        unsigned rt, unsigned spec) {
+    // AArch64 TBI. This is the C-side counterpart of read_prep/write_prep
+    // (jit/guest-arm64/gadgets.h), which mask the top byte before they touch
+    // the TLB -- and it exists because these helpers deliberately BYPASS those
+    // macros: the gadget hands the raw guest address straight to C so the
+    // transfer can span pages via tlb_read/tlb_write. Nothing else on that
+    // route ever strips the tag, so it has to happen here, on entry, before
+    // the address reaches a TLB index or an alignment check.
+    addr = (guest_addr_t) guest_abi_untag_addr(GUEST_ABI_ARM64, addr);
     unsigned count = spec & 0xf;
     unsigned esize = 1u << ((spec >> 4) & 3);
     unsigned q = (spec >> 6) & 1;
@@ -176,6 +193,14 @@ static int arm64_atomic_alignment_fault(struct cpu_state *cpu, guest_addr_t addr
 int arm64_lse_rmw(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
                   unsigned size_bytes, unsigned op, uint64_t operand,
                   uint64_t *old_out) {
+    // AArch64 TBI. This is the C-side counterpart of read_prep/write_prep
+    // (jit/guest-arm64/gadgets.h), which mask the top byte before they touch
+    // the TLB -- and it exists because these helpers deliberately BYPASS those
+    // macros: the gadget hands the raw guest address straight to C so the
+    // transfer can span pages via tlb_read/tlb_write. Nothing else on that
+    // route ever strips the tag, so it has to happen here, on entry, before
+    // the address reaches a TLB index or an alignment check.
+    addr = (guest_addr_t) guest_abi_untag_addr(GUEST_ABI_ARM64, addr);
     if (addr & (size_bytes - 1))
         return arm64_atomic_alignment_fault(cpu, addr);
     void *ptr = tlb_write_ptr_slow(tlb, addr);
@@ -233,6 +258,14 @@ int arm64_lse_rmw(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
 int arm64_cas(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
               unsigned size_bytes, uint64_t expected, uint64_t desired,
               uint64_t *old_out, uint32_t *swapped) {
+    // AArch64 TBI. This is the C-side counterpart of read_prep/write_prep
+    // (jit/guest-arm64/gadgets.h), which mask the top byte before they touch
+    // the TLB -- and it exists because these helpers deliberately BYPASS those
+    // macros: the gadget hands the raw guest address straight to C so the
+    // transfer can span pages via tlb_read/tlb_write. Nothing else on that
+    // route ever strips the tag, so it has to happen here, on entry, before
+    // the address reaches a TLB index or an alignment check.
+    addr = (guest_addr_t) guest_abi_untag_addr(GUEST_ABI_ARM64, addr);
     if (addr & (size_bytes - 1))
         return arm64_atomic_alignment_fault(cpu, addr);
     void *ptr = tlb_write_ptr_slow(tlb, addr);
@@ -278,6 +311,14 @@ int arm64_cas(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
 int arm64_casp(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
                unsigned sz, const uint64_t expected[2], const uint64_t desired[2],
                uint64_t old_out[2], uint32_t *swapped) {
+    // AArch64 TBI. This is the C-side counterpart of read_prep/write_prep
+    // (jit/guest-arm64/gadgets.h), which mask the top byte before they touch
+    // the TLB -- and it exists because these helpers deliberately BYPASS those
+    // macros: the gadget hands the raw guest address straight to C so the
+    // transfer can span pages via tlb_read/tlb_write. Nothing else on that
+    // route ever strips the tag, so it has to happen here, on entry, before
+    // the address reaches a TLB index or an alignment check.
+    addr = (guest_addr_t) guest_abi_untag_addr(GUEST_ABI_ARM64, addr);
     // Alignment requirement is the TOTAL pair size (2*sz), per the ARM ARM
     // — which also guarantees the access never crosses a page, so the
     // single resolved host pointer below covers the whole pair.
@@ -328,6 +369,14 @@ int arm64_casp(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
 // loop retries — same value-based-monitor caveat as the STXR path.
 int arm64_ldxp(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
                unsigned sz, uint64_t val_out[2]) {
+    // AArch64 TBI. This is the C-side counterpart of read_prep/write_prep
+    // (jit/guest-arm64/gadgets.h), which mask the top byte before they touch
+    // the TLB -- and it exists because these helpers deliberately BYPASS those
+    // macros: the gadget hands the raw guest address straight to C so the
+    // transfer can span pages via tlb_read/tlb_write. Nothing else on that
+    // route ever strips the tag, so it has to happen here, on entry, before
+    // the address reaches a TLB index or an alignment check.
+    addr = (guest_addr_t) guest_abi_untag_addr(GUEST_ABI_ARM64, addr);
     if (addr & (2 * sz - 1))
         return arm64_atomic_alignment_fault(cpu, addr);
     void *ptr = __tlb_read_ptr(tlb, addr);
@@ -364,6 +413,14 @@ int arm64_ldxp(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
 int arm64_stxp(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
                unsigned sz, uint64_t desired_lo, uint64_t desired_hi,
                uint32_t *status_out) {
+    // AArch64 TBI. This is the C-side counterpart of read_prep/write_prep
+    // (jit/guest-arm64/gadgets.h), which mask the top byte before they touch
+    // the TLB -- and it exists because these helpers deliberately BYPASS those
+    // macros: the gadget hands the raw guest address straight to C so the
+    // transfer can span pages via tlb_read/tlb_write. Nothing else on that
+    // route ever strips the tag, so it has to happen here, on entry, before
+    // the address reaches a TLB index or an alignment check.
+    addr = (guest_addr_t) guest_abi_untag_addr(GUEST_ABI_ARM64, addr);
     if (cpu->arm64_excl_addr != addr) {
         cpu->arm64_excl_addr = UINT64_MAX;
         *status_out = 1;
@@ -538,35 +595,57 @@ extern void arm64_resolve_write_ptr(void) __asm__("arm64_resolve_write_ptr");
 extern void arm64_crosspage_load(void) __asm__("arm64_crosspage_load");
 extern void arm64_crosspage_store(void) __asm__("arm64_crosspage_store");
 
-static const char *tlb_arm64_caller_name(void *from) {
-    static const struct { void (*fn)(void); const char *name; } helpers[] = {
-        {arm64_handle_read_miss,  "arm64_handle_read_miss"},
-        {arm64_handle_write_miss, "arm64_handle_write_miss"},
-        {arm64_resolve_write_ptr, "arm64_resolve_write_ptr"},
-        {arm64_crosspage_load,    "arm64_crosspage_load"},
-        {arm64_crosspage_store,   "arm64_crosspage_store"},
+// The device answered "not one of the arm64 gadget helpers", which was useful
+// (it ruled out the whole assembly miss path) and then immediately became the
+// wrong question: the caller is C, and the gadget stubs were the only names on
+// the list. So the C functions that can reach tlb_handle_miss are anchors too.
+//
+// Nearest-below with the delta printed rather than a span cap: a C function is
+// not a twelve-instruction stub, and guessing its length would just turn a
+// real answer back into "unknown". A small delta names the caller; a delta in
+// the tens of kilobytes says the caller is in some other translation unit
+// entirely, which is itself worth knowing and cannot be mistaken for a match.
+extern void *tlb_write_ptr_slow(struct tlb *tlb, guest_addr_t addr);
+
+struct tlb_caller_anchor { const void *addr; const char *name; };
+
+static const char *tlb_arm64_caller_name(void *from, uintptr_t *delta_out) {
+    const struct tlb_caller_anchor anchors[] = {
+        // assembly stubs (jit/guest-arm64/memory.S)
+        {(const void *) arm64_handle_read_miss,  "arm64_handle_read_miss"},
+        {(const void *) arm64_handle_write_miss, "arm64_handle_write_miss"},
+        {(const void *) arm64_resolve_write_ptr, "arm64_resolve_write_ptr"},
+        {(const void *) arm64_crosspage_load,    "arm64_crosspage_load"},
+        {(const void *) arm64_crosspage_store,   "arm64_crosspage_store"},
+        // C, this file -- __tlb_write_ptr/__tlb_read_ptr are forceinline, so a
+        // return address lands in whichever of these inlined them.
+        {(const void *) tlb_write_ptr_slow,      "tlb_write_ptr_slow"},
+        {(const void *) __tlb_read_cross_page,   "__tlb_read_cross_page"},
+        {(const void *) __tlb_write_cross_page,  "__tlb_write_cross_page"},
+        {(const void *) arm64_lse_rmw,           "arm64_lse_rmw"},
+        {(const void *) tlb_handle_miss,         "tlb_handle_miss (recursed?)"},
     };
-    // Nearest entry point at or below the return address, within a stub's
-    // worth of instructions. These are `bl`-then-return stubs, so the return
-    // address sits a few instructions past the entry, never far.
-    enum { STUB_SPAN = 256 };
     const char *best = NULL;
-    uintptr_t best_delta = STUB_SPAN;
-    for (unsigned i = 0; i < sizeof(helpers) / sizeof(helpers[0]); i++) {
-        uintptr_t entry = (uintptr_t) helpers[i].fn;
-        uintptr_t ret = (uintptr_t) from;
+    uintptr_t best_delta = (uintptr_t) -1;
+    uintptr_t ret = (uintptr_t) from;
+    for (unsigned i = 0; i < sizeof(anchors) / sizeof(anchors[0]); i++) {
+        uintptr_t entry = (uintptr_t) anchors[i].addr;
         if (ret < entry)
             continue;
         if (ret - entry < best_delta) {
             best_delta = ret - entry;
-            best = helpers[i].name;
+            best = anchors[i].name;
         }
     }
-    return best != NULL ? best : "not one of the arm64 gadget helpers (C caller?)";
+    if (delta_out != NULL)
+        *delta_out = best != NULL ? best_delta : 0;
+    return best != NULL ? best : "below every known anchor";
 }
 #else
-static const char *tlb_arm64_caller_name(void *from) {
+static const char *tlb_arm64_caller_name(void *from, uintptr_t *delta_out) {
     (void) from;
+    if (delta_out != NULL)
+        *delta_out = 0;
     return "n/a on this host";
 }
 #endif
@@ -577,10 +656,12 @@ static void tlb_note_tagged_miss(guest_addr_t addr, int type, void *from) {
     if (tagged_miss_log_count >= TAGGED_MISS_LOG_BUDGET)
         return;
     tagged_miss_log_count++;
-    printk("arm64: TLB miss on TAGGED address %#llx (%s), called from %p = %s "
-           "-- the tag survived past the gadget's prep macro\n",
+    uintptr_t delta = 0;
+    const char *name = tlb_arm64_caller_name(from, &delta);
+    printk("arm64: TLB miss on TAGGED address %#llx (%s), called from %p = "
+           "%s+%#lx -- the tag survived past the gadget's prep macro\n",
            (unsigned long long) addr, type == MEM_WRITE ? "write" : "read",
-           from, tlb_arm64_caller_name(from));
+           from, name, (unsigned long) delta);
 }
 
 __no_instrument void *tlb_handle_miss(struct tlb *tlb, guest_addr_t addr, int type) {
@@ -606,12 +687,13 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, guest_addr_t addr, int ty
         static unsigned miss_fail_log_count;
         if (miss_fail_log_count < MISS_FAIL_LOG_BUDGET) {
             miss_fail_log_count++;
-            printk("arm64: TLB miss FAILED for %#llx (%s), called from %p = %s "
-                   "-- this is the address the fault will report\n",
+            uintptr_t fdelta = 0;
+            const char *fname = tlb_arm64_caller_name(__builtin_return_address(0), &fdelta);
+            printk("arm64: TLB miss FAILED for %#llx (%s), called from %p = "
+                   "%s+%#lx -- this is the address the fault will report\n",
                    (unsigned long long) addr,
                    type == MEM_WRITE ? "write" : "read",
-                   __builtin_return_address(0),
-                   tlb_arm64_caller_name(__builtin_return_address(0)));
+                   __builtin_return_address(0), fname, (unsigned long) fdelta);
         }
         tlb->segfault_addr = addr;
         return NULL;

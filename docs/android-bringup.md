@@ -275,14 +275,19 @@ raised at a block boundary rather than by an access.
 `tools/run-arm64-guest-tests.sh` cross-builds iSH for aarch64-linux (clang,
 `tools/cross-aarch64.ini`) and runs `tests/manual/arm64/*` under qemu-user
 against a real Alpine aarch64 rootfs, so the arm64 gadget set executes for
-real on an x86_64 development machine. Eight of the nine tests pass there
-today.
+real on an x86_64 development machine. All nine tests pass there today.
 
-It does NOT reproduce this bug, which is itself a data point: qemu-user is
-*stricter* about tags than real hardware (an arm64 core ignores bits 56-63 on
-a dereference, so a gadget that forgets to mask still works on device and
-faults here), and the memset probes pass under it at both the pre-merge and
-current trees. `tagged_pointer`'s own `atomics` probe fails there and passes
-on device -- qemu clears the exclusive monitor far more eagerly than a real
-core, so LDXR/STXR sequences with interleaved accesses are not comparable.
-Read a failure there as a lead and a pass as one host's worth of evidence.
+It is stricter about tags than real hardware, which is a feature: an arm64
+core IGNORES bits 56-63 on a dereference, so a path that forgets to mask still
+works on device and faults under qemu. That difference caught a real bug. On
+its first runs `tagged_pointer`'s `atomics` probe failed there while passing on
+device, and that was written off in this document as a qemu artifact (qemu
+clears the exclusive monitor more eagerly than a real core, so LDXR/STXR
+sequences genuinely are not comparable). It was not an artifact: the LSE and
+exclusive C helpers in `emu/tlb.c` were taking the guest address untagged, and
+the device only survived it because TBI hid the bad pointer. Writing off a
+failing test as a host artifact is the specific mistake to avoid here -- the
+whole value of a stricter host is the failures it produces.
+
+What it does NOT reproduce is the memset case, at either the pre-merge or the
+current tree.
