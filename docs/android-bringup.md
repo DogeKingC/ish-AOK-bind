@@ -123,33 +123,66 @@ servicemanager holds `ref handle 3 -> node 33 (proc 5031) strong 1 weak 1
 death-requested` -- a strong reference to incidentd's node, with death
 notification requested.
 
-**The next blocker: `checkService` returns null for everything**, and it is
-NOT the binder driver. `service list` works; `service check <name>` reports
-"not found" for every service, `manager` included. What has been ruled out, and
-how:
+### `checkService` returned null for everything: fixed, and it WAS the driver
 
-- **The driver.** `binder_ipc`'s relay phase now covers all three shapes this
-  involves -- an object sent in a reply, a third party's handle relayed on to a
-  stranger (`HANDLE -> HANDLE`, then a direct call through it), and the manager
-  handing back its OWN node to a caller that already holds handle 0 for it.
-  All pass, on an x86 box, with no device.
-- **The SELinux permission check.** `canList` and `canFind` both call
-  `selinux_check_access` with the same caller SID. Listing works, so the SID,
-  the AVC and the stub's allow-everything verdict are all fine.
-- **The context lookup.** `incident` and `manager` are both present in
-  `plat_service_contexts` (lines 333 and 473), and servicemanager logs
-  `No match for <name> in service_contexts` when `selabel_lookup` fails. It
-  does not.
-- **Enforcement mode.** `sys/fs/selinux/enforce` reads `0`.
-- **A dead manager.** `/proc/ish/binder` reports `manager pid 43`, `secctx
-  yes`, while the failing check runs.
+`service list` worked while `service check <name>` reported "not found" for
+every service, `manager` included. The cause was one line in `kernel/binder.c`:
+object offsets inside a transaction were required to be 8-byte aligned.
 
-So the difference is above the driver, in what libbinder or servicemanager does
-between finding the service in its map and the caller seeing a usable binder.
-The next step needs instrumentation on that side -- our own tests replicate the
-protocol shape faithfully but not libbinder's exact parcel -- so it wants either
-a printk in the driver dumping the objects in that specific reply, or a locally
-built Android client.
+They only have to be 4-byte aligned. `Parcel` packs its contents to 4 bytes, so
+an object inherits the alignment of whatever was written before it; only the
+binder *buffer* is 8-aligned. Linux says the same thing explicitly --
+`binder_validate_object()` tests `IS_ALIGNED(offset, sizeof(u32))`.
+
+That single constant produces exactly the observed split:
+
+| call | what precedes the object | offset | verdict |
+|---|---|---|---|
+| `listServices` | no objects at all | -- | worked |
+| `addService` | interface token + service name | 8-aligned | worked |
+| `checkService` **reply** | `Status::writeToParcel`, EX_NONE: one int32 | **4** | rejected |
+
+libbinder's reply for `@nullable IBinder checkService` is a 4-byte status
+followed immediately by `writeStrongBinder`, so its object sits at offset 4 and
+the whole parcel is 28 bytes. The driver refused it with `BR_FAILED_REPLY`;
+libbinder turns a failed transaction into a null binder; `service` prints "not
+found". Nothing above the driver was ever wrong.
+
+**Why the elimination list was wrong, which is the part worth keeping.** The
+driver was ruled out because `binder_ipc`'s relay phase covers all three shapes
+this involves -- an object in a reply, a third party's handle relayed on to a
+stranger, and the manager handing back its own node -- and all three passed.
+They still pass. They also all build their object as the second member of a
+`struct { uint64_t magic; struct flat_binder_object obj; }`, so every one of
+them lands at offset 8. The tests were faithful about the protocol *shape* and
+silently unanimous about an alignment they never meant to be asserting.
+
+A passing test only rules out the cases it encodes. "The driver is ruled out,
+all three shapes pass" should have been "all three shapes pass **with an
+8-aligned object**, and I have not checked that libbinder produces one" -- and
+the doc even said, one paragraph later, that our tests "replicate the protocol
+shape faithfully but not libbinder's exact parcel". That sentence was the
+answer, filed as a caveat.
+
+`tests/manual/binder_ipc.c` now has a phase (`align4`) that replays libbinder's
+`checkService` reply byte for byte: a 28-byte parcel, an int32 status, and the
+object at offset 4. It fails against the old driver with `BR_FAILED_REPLY` and
+passes now.
+
+**What is and is not confirmed.** The fix is verified by that regression test
+on an x86 box with no device: the exact parcel libbinder emits is accepted, and
+the object comes back as a usable handle. It has *not* yet been run on device
+against a real `servicemanager` -- `service check manager` is the one-line
+experiment that closes this, and it should be the first thing the next session
+does. The reasoning that ties the test to the symptom is sound but it is
+reasoning; the doc has been wrong before at exactly this join, which is how
+this bug survived a round of elimination in the first place.
+
+The other things ruled out at the time were correctly ruled out, and remain so:
+`canList`/`canFind` and the caller SID, the `plat_service_contexts` lookup,
+enforcement mode (`sys/fs/selinux/enforce` reads `0`), and a live manager
+(`/proc/ish/binder` reported `manager pid 43`, `secctx yes`). They were just
+answers to a question that was not the one being asked.
 
 Two other things the daemon sweep established, both about the image rather
 than the emulator:
@@ -189,7 +222,16 @@ than the emulator:
 
 **Re-run `chroot-setup.sh` after every iSH restart.** Mounts do not survive
 one, and the symptom is not obviously a mount problem: `Bad boot_id: ''` and a
-servicemanager that exits without logging why. It cost two rounds here.
+servicemanager that exits without logging why. It has now cost five rounds
+across three sessions, three of them in a single afternoon. `Bad boot_id: ''`
+is this, not a bug in `fs/proc/sys.c` -- check the mounts before you measure
+anything.
+
+**`/AOK/tools/ish-remote.sh <code>` drives the device over ntfy**, which is
+much faster than round-tripping commands through a human: each experiment costs
+seconds instead of a build-and-install cycle. It is what made the tagged-pointer
+work tractable. One caveat that looks like a hang: ntfy rate-limits large
+messages, so chunk anything long rather than sending it in one shot.
 
 `binder_ping` still exists and is still the cheapest probe:
 `PING_TRANSACTION` depends on no property, no logd and no init, so it isolates
@@ -213,6 +255,41 @@ exist here. It ends up in `dmesg` only because `/dev/kmsg` accepts writes;
 `android::base`'s KernelLogger writes there. If `dmesg` is silent about a
 crash, check that `/dev/kmsg` in that tree is a character device (1,11) and not
 a regular file -- a plain file at that path swallows every message.
+
+## Two ways to be wrong for a long time
+
+Both of the expensive bugs in this document -- the tagged pointers and
+`checkService` -- cost far more than they should have, and for the same
+underlying reason each time: a piece of evidence was trusted to mean more than
+it actually meant. They are worth naming, because both will recur.
+
+**"The fault is at this instruction" is not "this instruction is at fault."**
+The tagged-pointer bug was reported at `dup v0.16b, w1` and `add x4, x1, x2` --
+`memset`'s and `memcpy`'s first instructions, neither of which touches memory.
+That is because `jit/hle.c` hooks a libc function at its *entry point*, so an
+HLE'd call always faults at the callee's first instruction whatever the real
+cause. A day went into the SIMD gadgets, instruction fusion and the
+fault-restart contract, all innocent. **If a fault is attributed to an
+instruction with no memory operand, the first hypothesis is that something is
+intercepting the function, not that the instruction is wrong.** Whoever is
+intercepting it is where to look.
+
+**A passing test rules out only what it encodes, not what it was written for.**
+`checkService` was blamed on libbinder for a full round because three driver
+tests covering the right protocol shapes all passed -- and all three happened to
+place their object at an 8-aligned offset, which was the entire bug. No test
+asserted that alignment; they simply agreed on it, silently, because they were
+all written the same way. **When a test suite clears a component, ask what the
+tests hold constant that the real caller does not.** Here the answer was written
+down in the same paragraph as the exoneration ("our own tests replicate the
+protocol shape faithfully but not libbinder's exact parcel") and read as a
+caveat instead of a lead.
+
+The common shape: a strong signal (a precise PC, a green suite) was treated as
+an answer when it was only evidence about a narrower question. The cheap
+diagnostics in this document -- `/proc/ish/binder`, `/proc/ish/property_area`,
+`dmesg`, `binder_ping` -- are worth more than either, because they report state
+rather than inviting an inference.
 
 ## Two ways to run a tree
 
@@ -257,10 +334,11 @@ that tree's `dev/__properties__`.
 
 ## Anticipated order of remaining work
 
-1. **Run a real client against the area.** `service list` with servicemanager
-   already started is the one-line experiment that says whether the property
-   work landed. Until someone does it, the property area is verified against
-   bionic's reader and nothing else.
+1. **Confirm the `checkService` fix on device.** `service check manager`, with
+   servicemanager already started. One command, and it is the only thing
+   standing between "the regression test accepts libbinder's parcel" and "a
+   real client can resolve a service". Done first, because everything below
+   assumes a client can get a binder for something.
 2. **logd**, or a socket sink at `/dev/socket/logdw`, so Android's own logging
    is visible without relying on the kmsg path.
 3. Whatever the first real service needs after that. Do not build ahead of the

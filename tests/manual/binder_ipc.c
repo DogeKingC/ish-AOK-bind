@@ -1641,6 +1641,207 @@ static void test_binderfs(void) {
         (void) umount(mnt);
 }
 
+// ---------------------------------------------------------------------------
+// An object at an offset that is 4-aligned but not 8-aligned.
+//
+// Not a synthetic corner: it is the shape of every `checkService` reply.
+// libbinder writes `Status::writeToParcel`, which for EX_NONE is a single
+// int32, and then `writeStrongBinder` -- so the flat_binder_object sits at
+// offset 4 and the parcel is 28 bytes long. Parcel packs its contents to 4
+// bytes; only the binder *buffer* is 8-aligned. Linux agrees: the alignment
+// test in binder_validate_object() is IS_ALIGNED(offset, sizeof(u32)).
+//
+// Every other phase here builds its objects behind a uint64_t, so they all
+// land 8-aligned and none of them can see this. That blind spot is the point:
+// a driver requiring 8-aligned offsets still passes `addService` (whose object
+// follows an interface token and lands at 96) and `listServices` (no objects
+// at all), while rejecting every `checkService` reply -- which from userspace
+// is indistinguishable from the service not being registered.
+// ---------------------------------------------------------------------------
+
+#define ALIGN4_CODE 0x61
+#define ALIGN4_OBJECT_PTR UINT64_C(0xbeef000000008000)
+#define ALIGN4_OBJECT_COOKIE UINT64_C(0xbeef000000009000)
+
+// Byte-for-byte what libbinder produces for `@nullable IBinder checkService`.
+struct align4_reply {
+    uint32_t exception;            // Status::writeToParcel(), EX_NONE
+    struct flat_binder_object obj; // Parcel::writeStrongBinder(), at offset 4
+} __attribute__((packed));
+
+struct align4_mgr_ctx {
+    struct binder *b;
+    int replied;
+};
+
+static int align4_mgr_handler(uint32_t cmd, const void *payload, void *vctx) {
+    struct align4_mgr_ctx *ctx = vctx;
+    if (cmd != BR_TRANSACTION)
+        return 0;
+    struct binder_transaction_data tr;
+    memcpy(&tr, payload, sizeof(tr));
+
+    static struct align4_reply reply_data;
+    static binder_size_t reply_offsets[1];
+    memset(&reply_data, 0, sizeof(reply_data));
+    reply_data.exception = 0;
+    reply_data.obj.type = BINDER_TYPE_BINDER;
+    reply_data.obj.flags = FLAT_BINDER_FLAG_ACCEPTS_FDS;
+    reply_data.obj.binder = ALIGN4_OBJECT_PTR;
+    reply_data.obj.cookie = ALIGN4_OBJECT_COOKIE;
+    reply_offsets[0] = offsetof(struct align4_reply, obj);
+
+    struct {
+        uint32_t cmd;
+        struct binder_transaction_data tr;
+    } __attribute__((packed)) out;
+    memset(&out, 0, sizeof(out));
+    out.cmd = BC_REPLY;
+    out.tr.data_size = sizeof(reply_data); // 28, not a multiple of 8 either
+    out.tr.offsets_size = sizeof(reply_offsets);
+    out.tr.data.ptr.buffer = (binder_uintptr_t) (uintptr_t) &reply_data;
+    out.tr.data.ptr.offsets = (binder_uintptr_t) (uintptr_t) reply_offsets;
+
+    struct {
+        uint32_t cmd;
+        binder_uintptr_t buffer;
+    } __attribute__((packed)) freebuf = { BC_FREE_BUFFER, tr.data.ptr.buffer };
+
+    uint8_t writebuf[sizeof(out) + sizeof(freebuf)];
+    memcpy(writebuf, &freebuf, sizeof(freebuf));
+    memcpy(writebuf + sizeof(freebuf), &out, sizeof(out));
+
+    check(binder_wr(ctx->b, writebuf, sizeof(writebuf), NULL, 0, NULL) == 0,
+          "align4: manager BC_REPLY with the object at offset 4");
+    ctx->replied = 1;
+    return 1;
+}
+
+struct align4_client_ctx {
+    struct binder *b;
+    int got_reply;
+    int failed;
+    uint32_t handle;
+};
+
+static int align4_client_handler(uint32_t cmd, const void *payload, void *vctx) {
+    struct align4_client_ctx *ctx = vctx;
+    if (cmd == BR_FAILED_REPLY || cmd == BR_DEAD_REPLY) {
+        // This is the observed failure: the driver refuses the reply outright,
+        // and libbinder turns that into a null binder -- "not found".
+        ctx->failed = 1;
+        ctx->got_reply = 1;
+        return 1;
+    }
+    if (cmd != BR_REPLY)
+        return 0;
+
+    struct binder_transaction_data tr;
+    memcpy(&tr, payload, sizeof(tr));
+
+    check(tr.data_size == sizeof(struct align4_reply),
+          "align4: a 28-byte parcel survives the round trip");
+    if (tr.offsets_size == sizeof(binder_size_t)) {
+        binder_size_t off;
+        memcpy(&off, (void *) (uintptr_t) tr.data.ptr.offsets, sizeof(off));
+        check(off == offsetof(struct align4_reply, obj),
+              "align4: the object offset is relayed unchanged");
+        struct flat_binder_object obj;
+        memcpy(&obj, (uint8_t *) (uintptr_t) tr.data.ptr.buffer + off, sizeof(obj));
+        check(obj.type == BINDER_TYPE_HANDLE,
+              "align4: a 4-aligned object is still translated to a handle");
+        check(obj.handle != 0, "align4: the translated handle is usable");
+        ctx->handle = obj.handle;
+    } else {
+        check(0, "align4: reply carries one object");
+    }
+
+    struct {
+        uint32_t cmd;
+        binder_uintptr_t buffer;
+    } __attribute__((packed)) freebuf = { BC_FREE_BUFFER, tr.data.ptr.buffer };
+    (void) binder_wr(ctx->b, &freebuf, sizeof(freebuf), NULL, 0, NULL);
+
+    ctx->got_reply = 1;
+    return 1;
+}
+
+static void test_parcel_object_alignment(const char *dev) {
+    struct binder mgr = { .fd = -1 };
+    if (binder_open_dev(&mgr, dev) < 0) {
+        check(0, "align4: manager open+mmap");
+        return;
+    }
+    int32_t zero = 0;
+    if (ioctl(mgr.fd, BINDER_SET_CONTEXT_MGR, &zero) < 0) {
+        printf("SKIP align4: context manager already claimed (errno=%d)\n", errno);
+        binder_close_dev(&mgr);
+        return;
+    }
+
+    int sync_pipe[2];
+    check(pipe(sync_pipe) == 0, "align4: sync pipe");
+
+    pid_t client = fork();
+    check(client >= 0, "align4: fork client");
+    if (client == 0) {
+        close(sync_pipe[1]);
+        char go;
+        (void) read(sync_pipe[0], &go, 1);
+        close(sync_pipe[0]);
+
+        struct binder b = { .fd = -1 };
+        if (binder_open_dev(&b, dev) < 0) {
+            fflush(NULL);
+            _exit(70);
+        }
+
+        // The request side is a plain payload; only the reply carries an
+        // object, exactly as checkService does.
+        static uint64_t ask;
+        ask = RELAY_CALL_MAGIC;
+        struct align4_client_ctx ctx = { .b = &b };
+        int rc = relay_call(&b, 0, ALIGN4_CODE, &ask, sizeof(ask), NULL, 0,
+                            align4_client_handler, &ctx, &ctx.got_reply);
+        binder_close_dev(&b);
+        fflush(NULL);
+        if (ctx.failed)
+            _exit(76); // the driver rejected the reply
+        _exit(rc == 0 && ctx.got_reply && ctx.handle != 0 ? 0 : 77);
+    }
+
+    (void) write(sync_pipe[1], "g", 1);
+    close(sync_pipe[1]);
+    close(sync_pipe[0]);
+
+    struct align4_mgr_ctx ctx = { .b = &mgr };
+    uint8_t readbuf[1024];
+    while (!ctx.replied) {
+        size_t consumed = 0;
+        if (binder_wr(&mgr, NULL, 0, readbuf, sizeof(readbuf), &consumed) < 0) {
+            if (errno == EINTR)
+                continue;
+            check(0, "align4: manager BINDER_WRITE_READ");
+            break;
+        }
+        if (br_parse(readbuf, consumed, align4_mgr_handler, &ctx) < 0)
+            break;
+    }
+
+    int status = 0;
+    waitpid(client, &status, 0);
+    int exited = WIFEXITED(status);
+    // Split deliberately: 76 is BR_FAILED_REPLY, the specific symptom this
+    // phase exists for, and naming it separately keeps a future regression
+    // from being reported as a generic "the client did not finish".
+    check(!(exited && WEXITSTATUS(status) == 76),
+          "align4: the driver does not reject a 4-aligned object outright");
+    check(exited && WEXITSTATUS(status) == 0,
+          "align4: checkService's own reply layout round-trips");
+
+    binder_close_dev(&mgr);
+}
+
 int main(int argc, char **argv) {
     test_init(argc, argv);
     alarm(test_watchdog_secs(60));
@@ -1659,6 +1860,7 @@ int main(int argc, char **argv) {
     test_basics(binder_path);
     test_transaction(binder_path);
     test_handle_relay(binder_path);
+    test_parcel_object_alignment(binder_path);
     test_death_notification(vndbinder_path);
     test_security_context(binder_dev_named("hwbinder"));
     test_poll_delivery(binder_dev_named("hwbinder"));

@@ -1263,7 +1263,17 @@ static void binder_transaction(struct binder_proc *proc, struct binder_thread *t
         // Offsets must be aligned, in range, and strictly ascending -- the
         // ascending check is what stops two objects from overlapping and
         // letting a second pass reinterpret bytes the first pass validated.
-        if (off % sizeof(binder_uintptr_t) != 0 || off < last_end ||
+        //
+        // The alignment is 4, not 8, and this is deliberate: Parcel packs its
+        // contents to 4 bytes, so an object only ever inherits the alignment
+        // of whatever was written before it. libbinder's `checkService` reply
+        // is a single int32 status followed by the binder, putting the object
+        // at offset 4. Linux uses IS_ALIGNED(offset, sizeof(u32)) here for the
+        // same reason. Requiring the buffer's own 8-byte alignment instead
+        // rejects that reply -- and only that kind of reply, which is why it
+        // read as "every checkService fails while addService and listServices
+        // work".
+        if (off % 4 != 0 || off < last_end ||
             off + sizeof(struct binder_object_header) > (size_t) tr->data_size)
             goto err_bad_offset;
         struct binder_object_header *hdr = (struct binder_object_header *) (data + off);

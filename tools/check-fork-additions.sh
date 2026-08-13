@@ -148,6 +148,17 @@ need_in kernel/exec.c  'security.exec'               "execve consumes the setexe
 need_in kernel/binder.c BR_TRANSACTION_SEC_CTX \
     "binder delivers the sender's context to a node that asked for one"
 need_in kernel/binder.c binder_show_state "the /proc/ish/binder state dump"
+# Object offsets inside a parcel are 4-aligned, not 8: Parcel packs to 4, so
+# libbinder's checkService reply (int32 status, then the binder) puts its
+# object at offset 4. Requiring the buffer's own 8-byte alignment here looks
+# tidier and breaks every checkService while leaving addService and
+# listServices working, which reads as "the service is not registered". The
+# align4 phase is the only test that pins it -- every other one builds its
+# object behind a uint64_t and lands 8-aligned by accident.
+need_in kernel/binder.c "off % 4 != 0" \
+    "parcel object offsets are validated at 4-byte alignment, as Linux does"
+need_in tests/manual/binder_ipc.c align4_client_handler \
+    "the phase that replays libbinder's checkService reply byte for byte"
 need_in fs/proc/ish.c   binder_show_state "state dump wired into /proc/ish"
 
 # --- writable /dev/kmsg ---------------------------------------------------
