@@ -6,6 +6,7 @@
 #include "kernel/fs.h"
 #include "kernel/binder.h"
 #include "kernel/property_area.h"
+#include "kernel/logd_sink.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -686,6 +687,7 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"documents", .show = proc_ish_show_documents},
     {"host_info", .show = proc_ish_show_host_info},  // Add host hardware related information
     {"ips", .show = proc_ish_show_ips},
+    {"logd", S_IFREG | 0644, .show = logd_sink_show, .update = logd_sink_update},
     {"property_area", S_IFREG | 0644, .show = property_area_show, .update = property_area_update},
     {"roots", S_IFREG | 0644, .show = proc_ish_show_roots, .update = proc_ish_update_roots},
     {"version", .show = proc_ish_show_version},

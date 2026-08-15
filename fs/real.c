@@ -1004,6 +1004,22 @@ int realfs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev_t_ UNU
         lock_fchdir(mount->root_fd);
         err = mkfifo(fix_path(path), perm);
         unlock_fchdir();
+    } else if (S_ISSOCK(mode)) {
+        // A bound AF_UNIX address is an S_IFSOCK inode, and fs/sock.c creates
+        // it through mknod. Refusing it here meant no guest unix socket could
+        // be bound on a realfs root at all -- the bind returned EPERM, which
+        // reads as a permission problem rather than "this filesystem cannot
+        // represent a socket". fakefs has always handled it (it records the
+        // mode in meta.db and keeps a plain file on the host), so this only
+        // brings realfs into line.
+        //
+        // The inode is a name, not an endpoint: the host socket the guest
+        // actually talks over lives at sock_tmp_prefix.<socket_id>, exactly as
+        // it does on fakefs. A host that refuses mknod(S_IFSOCK) -- iOS may --
+        // still lands on the EPERM this used to return unconditionally.
+        lock_fchdir(mount->root_fd);
+        err = mknod(fix_path(path), S_IFSOCK | perm, 0);
+        unlock_fchdir();
     } else if (S_ISREG(mode)) {
         err = openat(mount->root_fd, fix_path(path), O_CREAT|O_EXCL|O_RDONLY, perm);
         if (err >= 0)

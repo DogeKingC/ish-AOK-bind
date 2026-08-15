@@ -101,6 +101,7 @@ binder_ping.c
 binder_object_align_probe.c
 binder_poll_wakeup_probe.c
 property_area.c
+logd_sink.c
 mount_stdev.c
 mount_cross_dev.c
 cgroup2_rmdir.c

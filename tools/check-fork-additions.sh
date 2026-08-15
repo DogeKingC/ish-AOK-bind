@@ -199,6 +199,33 @@ need_in fs/mem.c     ish_log_write_record "kmsg_write is not EPERM any more"
 need_file tests/manual/proc_random.c
 need_in fs/proc/sys.c boot_id_lock "boot_id is generated under a lock"
 
+# --- logd sink -------------------------------------------------------------
+# /dev/socket/logdw. Without it Android's own account of a failure goes
+# nowhere: the kmsg path only catches what android::base's KernelLogger writes,
+# which is fatals, so everything else fails silently -- the exact blindness
+# that made the earlier bring-up walls expensive.
+#
+# Two hooks in fs/sock.c are what make a kernel-side server on a guest socket
+# work at all, and both were found the hard way: the inode reference has to be
+# HELD or socket_id is reassigned and the guest connects to a socket nobody
+# bound, and a guest datagram arrives with an internal credential header that
+# only the guest recv paths strip.
+need_file kernel/logd_sink.c
+need_file kernel/logd_sink.h
+need_file tests/manual/logd_sink.c
+need_in meson.build       kernel/logd_sink.c
+need_in app/AppDelegate.m logd_sink_start "starts the logd sink at boot"
+need_in xX_main_Xx.h      logd_sink_start "starts the logd sink at boot (CLI)"
+need_in fs/proc/ish.c     logd_sink_show  "/proc/ish/logd, which says whether the sink is up"
+need_in fs/sock.c  unix_socket_host_path_for \
+    "the host path behind a guest socket name, with the inode reference held"
+need_in fs/sock.c  unix_dgram_strip_cred \
+    "a kernel-side reader strips the credential header the guest recv paths do"
+need_in fs/real.c  S_ISSOCK \
+    "realfs can create a socket inode, or no unix socket binds on a realfs root"
+need_in fs/aok-tests.manifest             logd_sink.c
+need_in tests/manual/setup-regressions.sh logd_sink
+
 # --- Android chroot setup --------------------------------------------------
 need_file opt/AOK/tools/android/chroot-setup.sh
 need_file opt/AOK/tools/android/root-profile.sh

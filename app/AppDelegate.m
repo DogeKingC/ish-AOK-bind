@@ -50,6 +50,7 @@
 #include "kernel/ashmem.h"
 #include "kernel/dma_heap.h"
 #include "kernel/property_area.h"
+#include "kernel/logd_sink.h"
 #include "tools/fakefs.h"
 #include "fs/path.h"
 #include "fs/real.h"
@@ -2478,6 +2479,9 @@ static TerminalViewController *CreateTerminalViewController(void) {
     // never outlives the session that wrote it. Without it every libbinder
     // client spins on servicemanager.ready and never opens the driver above.
     property_area_create();
+    // Somewhere for Android's liblog to write, so a failing process says why
+    // instead of dying silently. See kernel/logd_sink.c.
+    logd_sink_start();
 
     generic_mkdirat(AT_PWD, "/dev/pts", 0755);
 

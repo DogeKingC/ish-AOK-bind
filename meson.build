@@ -319,6 +319,7 @@ if get_option('kernel') == 'ish'
         'kernel/ashmem.c',
         'kernel/dma_heap.c',
         'kernel/property_area.c',
+        'kernel/logd_sink.c',
         'kernel/ptrace.c',
 
         'kernel/fs.c',

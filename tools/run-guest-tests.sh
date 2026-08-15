@@ -20,7 +20,7 @@ BUILD_DIR="${1:-build}"
 shift || true
 TESTS=("$@")
 if [ ${#TESTS[@]} -eq 0 ]; then
-    TESTS=(binder_ipc binder_ping ashmem dma_heap selinuxfs kmsg proc_random property_area)
+    TESTS=(binder_ipc binder_ping ashmem dma_heap selinuxfs kmsg proc_random property_area logd_sink)
 fi
 
 ISH="$BUILD_DIR/ish"

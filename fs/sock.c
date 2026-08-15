@@ -3514,6 +3514,64 @@ out:
     return err;
 }
 
+// Resolves an existing guest socket path to the real host socket path the unix
+// socket layer uses for it, assigning the id if it does not have one yet.
+//
+// Exists so iSH's OWN code can serve a socket that guest processes connect to
+// by guest path, which is not otherwise expressible: a guest AF_UNIX address
+// is a fakefs S_IFSOCK inode, and the host socket behind it lives at
+// sock_tmp_prefix.<socket_id> where socket_id is assigned lazily on first use.
+// Without this, kernel-side code has no way to find out which host path a
+// guest's connect() to a given name will actually reach.
+//
+// kernel/logd_sink.c is the first caller: Android's liblog connects a datagram
+// socket to /dev/socket/logdw, and there is no init to have created it.
+// The returned reference must be held for as long as the caller serves the
+// socket, and released with inode_release() afterwards. That is not
+// bookkeeping: socket_id lives on the cached inode_data, so if the last
+// reference goes away the entry can be freed and the NEXT lookup of the same
+// path assigns a FRESH id. The server would then be bound to the old host
+// socket while the guest's connect() went to a new one that nobody bound, and
+// the guest sees ENOENT from a path that plainly exists. A real bind() avoids
+// this by parking the reference on the bound fd (socket.unix_name_inode); a
+// kernel-side server has no fd, so it holds it here instead.
+int unix_socket_host_path_for(const char *guest_path, char *out, size_t out_size,
+                              struct inode_data **hold) {
+    char path[MAX_PATH];
+    int err = path_normalize(AT_PWD, guest_path, path, N_SYMLINK_FOLLOW);
+    if (err < 0)
+        return err;
+    struct mount *mount = find_mount_and_trim_path(path);
+    if (mount == NULL)
+        return _ENOENT;
+    struct statbuf stat;
+    err = mount->fs->stat(mount, path, &stat);
+    if (err < 0) {
+        mount_release(mount);
+        return err;
+    }
+    if (!S_ISSOCK(stat.mode)) {
+        mount_release(mount);
+        return _ENOTSOCK;
+    }
+
+    struct inode_data *inode = inode_get(mount, stat.inode);
+    lock(&inode->lock, 0);
+    if (inode->socket_id == 0)
+        inode->socket_id = unix_socket_next_id();
+    uint32_t socket_id = inode->socket_id;
+    unlock(&inode->lock);
+    mount_release(mount);
+
+    int n = snprintf(out, out_size, "%s.%u", sock_tmp_prefix, socket_id);
+    if (n < 0 || (size_t) n >= out_size) {
+        inode_release(inode);
+        return _ENAMETOOLONG;
+    }
+    *hold = inode; // caller releases
+    return 0;
+}
+
 // ---- unix peer-token registry ----
 //
 // The connect side of a guest AF_UNIX stream sends an 8-byte token as the
@@ -4306,6 +4364,30 @@ struct unix_dgram_cred_hdr {
     uint64_t scm_cookie;
 };
 #define UNIX_DGRAM_CRED_MAGIC 0x1D6CC12D
+
+// Strips that header for a reader that is NOT a guest fd.
+//
+// Kernel-side code serving a guest unix datagram socket reads the host socket
+// directly, so it bypasses the recv paths that would have taken the header
+// off, and sees it as the first bytes of the payload. That is not a
+// hypothetical: kernel/logd_sink.c decoded the magic as liblog's header and
+// reported log id 45 (0x2D) from a tid of 27841 (0x6CC1) -- the two halves of
+// UNIX_DGRAM_CRED_MAGIC, read as a record.
+//
+// Returns the payload offset (0 when there is no header, so a datagram from
+// something that did not add one still works), and fills *cred when non-NULL,
+// which is how such a reader learns which guest process sent it.
+size_t unix_dgram_strip_cred(const void *buf, size_t len, struct ucred_ *cred) {
+    if (len < sizeof(struct unix_dgram_cred_hdr))
+        return 0;
+    struct unix_dgram_cred_hdr hdr;
+    memcpy(&hdr, buf, sizeof(hdr));
+    if (hdr.magic != UNIX_DGRAM_CRED_MAGIC)
+        return 0;
+    if (cred != NULL)
+        *cred = hdr.cred;
+    return sizeof(hdr);
+}
 
 // Defined next to scm_free below; needed by the bare recvfrom path above
 // them to discard a consumed datagram's fd parcel.

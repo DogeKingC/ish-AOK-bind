@@ -461,6 +461,14 @@ static inline int sock_level_to_real(int fake) {
 
 extern const char *sock_tmp_prefix;
 
+// The host socket path behind a guest AF_UNIX name; see the definition.
+struct inode_data;
+// Strips the internal credential header from a guest unix datagram read
+// straight off the host socket; see the definition.
+size_t unix_dgram_strip_cred(const void *buf, size_t len, struct ucred_ *cred);
+int unix_socket_host_path_for(const char *guest_path, char *out, size_t out_size,
+                              struct inode_data **hold);
+
 struct tcp_info_ {
     uint8_t state;
     uint8_t ca_state;

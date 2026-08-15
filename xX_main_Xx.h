@@ -9,6 +9,7 @@
 #include "kernel/ashmem.h"
 #include "kernel/dma_heap.h"
 #include "kernel/property_area.h"
+#include "kernel/logd_sink.h"
 #include "fs/real.h"
 #include "fs/sock.h"
 #ifdef __APPLE__
@@ -104,6 +105,9 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
     // /dev/__properties__, without which every libbinder client spins on
     // servicemanager.ready instead of opening the driver above.
     property_area_create();
+    // Somewhere for Android's liblog to write, so a failing process says why
+    // instead of dying silently. See kernel/logd_sink.c.
+    logd_sink_start();
     char cwd[MAX_PATH + 1];
     if (root == NULL && workdir == NULL) {
         getcwd(cwd, sizeof(cwd));
