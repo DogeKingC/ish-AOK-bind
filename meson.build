@@ -28,6 +28,30 @@ endif
 
 add_project_arguments('-Wno-switch', language: 'c')
 
+# Whether the deps/bash submodule is populated, decided HERE rather than beside
+# the bash target further down: kernel/native.c's registry needs the answer as a
+# define, and add_project_arguments has to run before any target is declared.
+#
+# A weak symbol would keep this local to one file and was tried first. It does
+# not work: ld64 will not leave an unresolved REFERENCE in a static initializer,
+# weak_import included, so a build without deps/bash failed to link on the table
+# entry itself.
+fs_early = import('fs')
+have_bash = fs_early.exists('deps/bash/shell.c')
+if have_bash
+    # Populated but STALE is the case worth catching by name. A pull that moves
+    # the submodule pointer does not move the submodule, so deps/bash can be a
+    # bash without the sources AOK's build lists -- and the error that produced
+    # was `File deps/bash/aok_fork.c does not exist`, which says nothing about
+    # what to do. Checked here so the whole configure stops with the command.
+    if not fs_early.exists('deps/bash/aok_fork.c')
+        error('deps/bash is checked out at an older commit than this build ' +
+              'expects (aok_fork.c is missing). Update it with:\n' +
+              '    git submodule update --init deps/bash')
+    endif
+    add_project_arguments('-DISH_NATIVE_BASH=1', language: 'c')
+endif
+
 # Resolved here (rather than next to the gadget source lists below) because
 # it also drives a project-wide define, and add_project_arguments must run
 # before any target is declared. The arm64-GUEST gadgets
@@ -154,6 +178,17 @@ aok_generated_docs = custom_target('aok_generated_docs',
               meson.current_source_dir() / 'opt' / 'AOK' / 'docs', '@OUTPUT@',
               '/docs', '_docs'])
 
+# The syscall numbers a native program may issue, generated from calls.c's own
+# table so the two cannot drift. The hand-written list this replaces named 77
+# of the 217 syscalls AOK implements -- "only what the shim uses" -- which is
+# the same shape of gap tools/check-native-libc.py exists to close, and it left
+# bash with 140 kernel calls it could not reach for no reason but that nobody
+# had needed them yet.
+native_syscall_nums = custom_target('native_syscall_nums',
+    output: 'native_syscall_nums.h',
+    input: files('tools/gen-native-syscalls.py', 'kernel/calls.c'),
+    command: [python, '@INPUT0@', '@INPUT1@', '@OUTPUT@'])
+
 emu_src = [
     'emu/tlb.c',
     'emu/fpu.c',
@@ -243,6 +278,11 @@ if get_option('kernel') == 'ish'
 
         'kernel/fork.c',
         'kernel/exec.c',
+        'kernel/native.c',
+        'kernel/native_io.c',
+        'kernel/native_libc.c',
+        'kernel/native_syscall.c', native_syscall_nums,
+        'kernel/smallclue_glue.c',
         'kernel/exit.c',
         'kernel/time.c',
         'kernel/mmap.c',
@@ -324,7 +364,341 @@ if get_option('kernel') == 'ish'
         'platform/' + host_machine.system() + '.c',
     ]
 
+    # SmallCLUE, compiled in as HOST code so its applets run without being
+    # translated (kernel/native.h). Two things make this unlike an ordinary
+    # vendored dependency:
+    #
+    #  - src/main.c is excluded: it is a four-line shim around smallclueMain,
+    #    and its main() is the one symbol that collides with AOK's.
+    #  - Every file is force-included with kernel/native_libc.h, which
+    #    redirects the libc surface onto AOK's VFS. Without it a plain open()
+    #    in an applet resolves against the *iOS* filesystem and quietly reads
+    #    the wrong file; tools/check-native-libc.py is the gate that keeps
+    #    that honest.
+    #
+    # Excluded feature groups, entry points stubbed in kernel/smallclue_glue.c:
+    # checksum_app needs OpenSSL (AOK links none), integration.c is the
+    # WITH_EXSH path into PSCAL's VM, and the openssh trio needs the vendored
+    # OpenSSH tree.
+    # gzip_app and tar_app are excluded for a build-system reason rather than a
+    # code one: they are the only files needing zlib, and the Xcode app targets
+    # link the meson archives by name with no zlib anywhere in the project (no
+    # libz.tbd, no OTHER_LDFLAGS). Re-enabling either means adding zlib to
+    # those targets first -- worth doing, since tar is a real loss, but it is a
+    # change to the app project rather than to this build.
+    smallclue_excluded = ['main.c', 'integration.c', 'checksum_app.c',
+                          'openssh_app.c', 'openssh_shim.c', 'openssh_stubs.c',
+                          'gzip_app.c', 'tar_app.c']
+
+    # Nextvi -- the editor `vi` runs -- is a submodule OF a submodule and is not
+    # populated by a plain checkout, so the build has to work either way. With
+    # the tree present its single translation unit is compiled in (vi.c
+    # #includes the other eight sources) and src/nextvi_stubs.c drops out; with
+    # it absent the stub's weak nextvi_main_entry prints "editor unavailable in
+    # this build" and `vi` exits 127. Populate it with:
+    #
+    #     git -C deps/smallclue submodule update --init third-party/nextvi
+    #
+    # -- and NOT a bare `--init`, which also drags in the abandoned deps/linux.
+    # The result is fixed at configure time, so populating the submodule
+    # afterwards needs a `meson setup --reconfigure` before ninja sees it.
+    nextvi_dir = 'deps/smallclue/third-party/nextvi'
+    have_nextvi = run_command(python, '-c',
+            'import os, sys; sys.exit(0 if os.path.exists(sys.argv[1]) else 1)',
+            meson.current_source_dir() / nextvi_dir / 'vi.c',
+            check: false).returncode() == 0
+
+    # Nextvi runs `!!` and `:!cmd` with fork+dup2+execvp, and a native program
+    # cannot fork. Upstream Nextvi therefore reports "fork failed" for the shell
+    # escape; a Nextvi carrying the NEXTVI_PLATFORM_SPAWN seam in term.c calls
+    # kernel/nextvi_glue.c's nextvi_platform_spawn instead and it works.
+    #
+    # Detected rather than assumed, so that both are correct builds: without
+    # the seam nothing here is compiled in and the escape fails honestly, and
+    # nothing has to be remembered when the submodule moves either way.
+    have_nextvi_spawn = have_nextvi and run_command(python, '-c',
+            'import sys; sys.exit(0 if "NEXTVI_PLATFORM_SPAWN" in open(sys.argv[1]).read() else 1)',
+            meson.current_source_dir() / nextvi_dir / 'term.c',
+            check: false).returncode() == 0
+
+    smallclue_src = []
+    if have_nextvi
+        smallclue_excluded += 'nextvi_stubs.c'
+        # Supplies nextvi_main_entry over the renamed real one; see the file.
+        src += files('kernel/nextvi_glue.c')
+        if not have_nextvi_spawn
+            warning('this Nextvi has no NEXTVI_PLATFORM_SPAWN seam in term.c, ' +
+                    'so `!!` and `:!cmd` inside vi will report "fork failed"')
+        endif
+    else
+        # Loudly, because the runtime symptom is not: the stub's diagnostic is
+        # written and then erased by the terminal reset SmallCLUE emits on the
+        # way out, and the editor's status is discarded, so `vi` on a stub build
+        # simply vanishes and reports success. That was reported from a device
+        # as "vi exits immediately", and it took a build to reproduce.
+        warning('nextvi is not checked out -- `vi` will be a stub that exits ' +
+                'silently. Populate it with: git -C deps/smallclue submodule ' +
+                'update --init third-party/nextvi')
+    endif
+    # Space-separated, not newline: meson interprets \n inside its own string
+    # literals, which would break the one-liner before python ever sees it.
+    foreach f : run_command(python, '-c',
+            'import glob, os, sys; print(" ".join(sorted(os.path.basename(p) for p in glob.glob(sys.argv[1] + "/src/*.c"))))',
+            meson.current_source_dir() / 'deps/smallclue',
+            check: true).stdout().strip().split(' ')
+        if f != '' and not smallclue_excluded.contains(f)
+            smallclue_src += files('deps/smallclue/src' / f)
+        endif
+    endforeach
+
+    smallclue_includes = include_directories(
+        'deps/smallclue-shim',
+        'deps/smallclue',
+        'deps/smallclue/src',
+        'deps/smallclue/common',
+        'deps/smallclue/compat',
+    )
+
+    smallclue_c_args = [
+        '-include', meson.current_source_dir() / 'kernel/native_libc.h',
+        '-DSMALLCLUE_PLATFORM_SPAWN',
+        '-w',  # vendored code, not ours to police
+    ]
+
+    libsmallclue = static_library('smallclue', smallclue_src,
+        include_directories: [includes, smallclue_includes],
+        c_args: smallclue_c_args)
+
+    # Nextvi gets an archive of its own for one reason: a -D that must apply to
+    # its translation unit and to no other. It is a program written to run once
+    # and exit, and AOK runs it again every time someone types `vi`, so its
+    # entry point is renamed and kernel/nextvi_glue.c supplies a
+    # nextvi_main_entry that resets the state a fresh process would have had.
+    # Renaming through the compiler is how SmallCLUE's own CMake build already
+    # turns Nextvi's main() into nextvi_main_entry.
+    libnextvi = []
+    if have_nextvi
+        nextvi_c_args = smallclue_c_args + ['-Dnextvi_main_entry=nextvi_editor_run']
+        if have_nextvi_spawn
+            nextvi_c_args += '-DNEXTVI_PLATFORM_SPAWN'
+        endif
+        libnextvi = static_library('nextvi', files(nextvi_dir / 'vi.c'),
+            include_directories: [includes, smallclue_includes],
+            c_args: nextvi_c_args)
+    endif
+
+    # ------------------------------------------------------------------ bash
+    #
+    # GNU bash as a second native program (docs/bash_native_plan.md). Like
+    # Nextvi it is a submodule that a plain checkout does not populate, so the
+    # build works either way and says so when it does not:
+    #
+    #     git submodule update --init deps/bash
+    bash_dir = 'deps/bash'
+
+    libbash = []
+    if have_bash
+        bash_includes = include_directories(
+            'deps/bash-shim',   # <builtins/builtext.h>; see the header there
+            bash_dir, bash_dir / 'generated', bash_dir / 'generated/builtins',
+            bash_dir / 'include', bash_dir / 'builtins', bash_dir / 'lib',
+            bash_dir / 'lib/readline', bash_dir / 'lib/termcap',
+        )
+
+        # What bash's own Makefile passes. -DHAVE_CONFIG_H above all: without it
+        # most of bash does not include config.h at all, and the failures look
+        # like missing headers rather than a missing define.
+        #
+        # CONF_* describe the GUEST rather than this Mac, because they are what
+        # $MACHTYPE and $OSTYPE report to a script -- a shell inside AOK saying
+        # "darwin" would be lying about the system its scripts are running on.
+        bash_defs = [
+            '-DHAVE_CONFIG_H', '-DSHELL',
+            # NOT -DMACOSX, which bash's configure would set here. It turns on
+            # HFS filename normalization (lib/sh/fnxform.c) -- and the
+            # filesystem bash sees is the GUEST's fakefs, not the Mac's, so
+            # decomposing names the way HFS wants would corrupt them.
+            '-DPROGRAM="bash"',
+            '-DCONF_HOSTTYPE="' + host_machine.cpu_family() + '"',
+            '-DCONF_OSTYPE="linux-gnu"',
+            '-DCONF_MACHTYPE="' + host_machine.cpu_family() + '-ish-linux-gnu"',
+            '-DCONF_VENDOR="ish"',
+            '-DLOCALEDIR="/usr/local/share/locale"', '-DPACKAGE="bash"',
+            # bash brings its own globbing, and macOS's <glob.h> shares the
+            # include guard _GLOB_H_ with bash's -- see kernel/native_libc.h.
+            '-DNATIVE_LIBC_OWN_GLOB',
+            # fork by re-launch (deps/bash/aok_fork.c). Guards the two hooks in
+            # bash's own sources so the vendor tree still builds without it.
+            '-DAOK_NATIVE_FORK=1',
+            # The two symbols that collide with libish, out of 1837 against
+            # 1775. main is the obvious one; wait_for is bash's job-control
+            # reaper against AOK's condition-variable wait (util/sync.h).
+            '-Dmain=bash_main_entry',
+            '-Dwait_for=bash_wait_for',
+            '-include', meson.current_source_dir() / 'kernel/native_libc.h',
+            # mkbuiltins writes bash_builtext.h here; deps/bash-shim forwards
+            # <builtins/builtext.h> to it.
+            '-I' + meson.current_build_dir(),
+            '-w',  # vendored code, not ours to police
+        ]
+
+        # mkbuiltins turns builtins/*.def into C. It runs on the BUILD machine,
+        # so it is a native: true executable and is NOT compiled with the shim
+        # -- it is a build tool reading files here, not a program that will run
+        # inside the guest.
+        mkbuiltins = executable('mkbuiltins',
+            files(bash_dir / 'builtins/mkbuiltins.c'),
+            native: true,
+            include_directories: bash_includes,
+            c_args: ['-DHAVE_CONFIG_H', '-DSHELL', '-w'])
+        run_mkbuiltins = find_program('tools/run-mkbuiltins.sh')
+        bash_def_dir = meson.current_source_dir() / bash_dir / 'builtins'
+
+        bash_defs_files = []
+        foreach d : run_command(python, '-c',
+                'import glob, os, sys; print(" ".join(sorted(os.path.basename(p) for p in glob.glob(sys.argv[1] + "/*.def"))))',
+                bash_def_dir, check: true).stdout().strip().split(' ')
+            bash_defs_files += files(bash_dir / 'builtins' / d)
+        endforeach
+
+        # The dispatch table and its externs, from every .def at once. Every
+        # .def goes in even where the builtin is compiled out: the #if guards
+        # inside the generated table are what leave `complete` and friends out
+        # of a build without readline.
+        bash_builtins_tbl = custom_target('bash_builtins_table',
+            output: ['bash_builtins.c', 'bash_builtext.h'],
+            input: bash_defs_files,
+            command: [run_mkbuiltins, 'table', mkbuiltins, bash_def_dir,
+                      '@OUTPUT0@', '@OUTPUT1@', '@INPUT@'])
+
+        # Builtins whose .c must not be LINKED, though their .def still feeds
+        # the table above. Each needs readline or history, which this build does
+        # not have, and each would drag in rl_*/history_* that nothing defines.
+        # bash itself gets away with compiling them because its builtins are a
+        # static archive and nothing references them -- link_whole here would
+        # pull them in regardless.
+        # Every builtin is linked now that readline is in: bind and complete
+        # were excluded only because READLINE being off made config-bot.h
+        # undefine PROGRAMMABLE_COMPLETION, so the generated table left them
+        # out and nothing referred to them.
+        bash_builtins_unlinked = [# reserved.def documents the shell keywords
+                                  # and produces no C file at all.
+                                  'reserved.def']
+        bash_builtin_src = []
+        foreach d : run_command(python, '-c',
+                'import glob, os, sys; print(" ".join(sorted(os.path.basename(p) for p in glob.glob(sys.argv[1] + "/*.def"))))',
+                bash_def_dir, check: true).stdout().strip().split(' ')
+            if not bash_builtins_unlinked.contains(d)
+                bash_builtin_src += custom_target('bash_builtin_' + d.split('.')[0],
+                    output: d.replace('.def', '.c'),
+                    input: files(bash_dir / 'builtins' / d),
+                    command: [run_mkbuiltins, 'one', mkbuiltins, bash_def_dir,
+                              '@INPUT@', '@OUTPUT@'])
+            endif
+        endforeach
+
+        # The sources bash actually links, taken from its own build rather than
+        # a glob: several top-level .c are build tools (mksignames, mksyntax),
+        # and lib/readline contributes only the nine files bash uses whether or
+        # not line editing is compiled in.
+        bash_top = ['shell.c', 'eval.c', 'y.tab.c', 'general.c', 'make_cmd.c',
+            'print_cmd.c', 'dispose_cmd.c', 'execute_cmd.c', 'variables.c',
+            'copy_cmd.c', 'error.c', 'expr.c', 'flags.c', 'jobs.c', 'subst.c',
+            'hashcmd.c', 'hashlib.c', 'mailcheck.c', 'trap.c', 'input.c',
+            'unwind_prot.c', 'pathexp.c', 'sig.c', 'test.c', 'version.c',
+            'alias.c', 'array.c', 'arrayfunc.c', 'assoc.c', 'braces.c',
+            'bracecomp.c', 'bashhist.c', 'bashline.c', 'list.c', 'stringlib.c',
+            'locale.c', 'findcmd.c', 'redir.c', 'pcomplete.c', 'pcomplib.c',
+            'xmalloc.c',
+            # iSH-AOK's own: fork by re-launch. Not upstream.
+            'aok_fork.c']
+        bash_builtins_static = ['common.c', 'evalstring.c', 'evalfile.c',
+            'getopt.c', 'bashgetopt.c']
+        # lib/sh's exact list, from bash's own build rather than a glob. 22 of
+        # its 75 sources are REPLACEMENTS configure compiles only where the
+        # system lacks the function -- getcwd, strerror, times, strtoul and so
+        # on -- and compiling those here would not merely be redundant, it
+        # would define the very names kernel/native_libc.h rewrites and shadow
+        # the routed versions with ones that talk to the host.
+        bash_lib_sh = ['casemod', 'clktck', 'clock', 'eaccess', 'fmtullong',
+            'fmtulong', 'fmtumax', 'fnxform', 'fpurge', 'getenv',
+            'gettimeofday', 'input_avail', 'itos', 'mailstat', 'makepath',
+            'mbscasecmp', 'mbschr', 'mbscmp', 'mktime', 'netconn', 'netopen',
+            'oslib', 'pathcanon', 'pathphys', 'random', 'setlinebuf', 'shmatch',
+            'shmbchar', 'shquote', 'shtty', 'snprintf', 'spell', 'stringlist',
+            'stringvec', 'strnlen', 'strtoimax', 'strtrans', 'strvis', 'timers',
+            'timeval', 'tmpfile', 'uconvert', 'ufuncs', 'unicode', 'utf8',
+            'wcsdup', 'wcsnwidth', 'winsize', 'zcatfd', 'zgetline', 'zmapfd',
+            'zread', 'zwrite']
+        bash_lib_other = ['lib/glob/glob.c', 'lib/glob/gmisc.c',
+            'lib/glob/smatch.c', 'lib/glob/strmatch.c',
+            'lib/glob/xmbsrtowcs.c', 'lib/tilde/tilde.c',
+            # readline in full. It was left out of the first cut as "a large
+            # body of code doing its own terminal handling", and that turned
+            # out to cost the two things a shell is judged by: `shopt -s
+            # progcomp` fails without it, because config-bot.h undefines
+            # PROGRAMMABLE_COMPLETION when READLINE is off, and \[ \] in PS1
+            # print LITERALLY, because their handling in decode_prompt_string
+            # sits inside #if defined (READLINE). A prompt full of \[\] and no
+            # line editing is not a shell anyone would set as their default.
+            'lib/readline/bind.c', 'lib/readline/callback.c',
+            'lib/readline/colors.c', 'lib/readline/compat.c',
+            'lib/readline/complete.c', 'lib/readline/display.c',
+            'lib/readline/funmap.c', 'lib/readline/histexpand.c',
+            'lib/readline/histfile.c', 'lib/readline/history.c',
+            'lib/readline/histsearch.c', 'lib/readline/input.c',
+            'lib/readline/isearch.c', 'lib/readline/keymaps.c',
+            'lib/readline/kill.c', 'lib/readline/macro.c',
+            'lib/readline/mbutil.c', 'lib/readline/misc.c',
+            'lib/readline/nls.c', 'lib/readline/parens.c',
+            'lib/readline/parse-colors.c', 'lib/readline/readline.c',
+            'lib/readline/rltty.c', 'lib/readline/savestring.c',
+            'lib/readline/search.c', 'lib/readline/shell.c',
+            'lib/readline/signals.c', 'lib/readline/terminal.c',
+            'lib/readline/text.c', 'lib/readline/tilde.c',
+            'lib/readline/undo.c', 'lib/readline/util.c',
+            'lib/readline/vi_mode.c', 'lib/readline/xfree.c',
+            'lib/readline/xmalloc.c',
+            # bash's OWN termcap, not the system one. readline needs tgetent
+            # and friends, and bash's configure links -ltermcap when it finds
+            # it -- which would put a system library on the Xcode link line,
+            # the very thing that keeps zlib (and tar, and gzip) out. The
+            # bundled implementation costs three files and no dependency.
+            'lib/termcap/termcap.c', 'lib/termcap/tparam.c']
+
+        bash_src = []
+        foreach f : bash_top
+            bash_src += files(bash_dir / f)
+        endforeach
+        foreach f : bash_builtins_static
+            bash_src += files(bash_dir / 'builtins' / f)
+        endforeach
+        foreach f : bash_lib_sh
+            bash_src += files(bash_dir / 'lib/sh' / (f + '.c'))
+        endforeach
+        foreach f : bash_lib_other
+            bash_src += files(bash_dir / f)
+        endforeach
+        bash_src += files(bash_dir / 'generated/syntax.c')
+
+        # kernel/native.c declares native_bash_main weak, so the registry entry
+        # resolves only when this file is in the build.
+        src += files('kernel/bash_glue.c')
+
+        libbash = static_library('bash',
+            bash_src + bash_builtin_src + [bash_builtins_tbl],
+            include_directories: [includes, bash_includes],
+            c_args: bash_defs)
+    endif
+
+    # link_whole, not link_with: this folds SmallCLUE's objects into libish.a
+    # itself. The Xcode project links the meson archives by name (libish.a,
+    # libish_emu.a, libfakefs.a), so a fourth archive would silently fail to
+    # link on iOS -- which is exactly what happened -- and would need adding to
+    # every app target by hand. Riding inside libish.a keeps the two build
+    # systems from diverging again.
     libish = library('ish', src,
+        link_whole: [libsmallclue, libnextvi, libbash],
         include_directories: includes)
     ish = declare_dependency(
         link_with: [libish, libish_emu, libfakefs],

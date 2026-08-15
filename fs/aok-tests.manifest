@@ -89,6 +89,7 @@ proc_pid_io.c
 taskstats_genl.c
 tmpfs_mmap.c
 tmpfs_statfs.c
+tmpfs_append.c
 memfd_mmap.c
 binder_ipc.c
 ashmem.c
@@ -101,6 +102,8 @@ binder_object_align_probe.c
 binder_poll_wakeup_probe.c
 property_area.c
 mount_stdev.c
+mount_cross_dev.c
+cgroup2_rmdir.c
 mmap_truncate_sigbus.c
 null_page_fault.c
 signalfd_epoll_deadlock.c
@@ -111,6 +114,7 @@ chroot_getcwd.c
 iovec_abi_marshal.c
 fakefs_type_race.c
 fakefs_casefold.c
+fakefs_inode_alias.c
 fifo_open_creat_deadlock.c
 proc_stat_monotonic.c
 sock_getfd_errno.c
@@ -155,4 +159,8 @@ arm64/ands_bcond_fusion.c
 arm64/hle_loop.c
 arm64/tagged_pointer.c
 riscv64/ptrace_regset.c
+riscv64/jalr_retcache.c
+arm64/ret_retcache.c
+jit_fuse_ab.sh
+jit_bench.c
 aes_gcm_accel.c

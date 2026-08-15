@@ -139,6 +139,7 @@ if [ "$is_arm64_guest" -eq 1 ]; then
     need_file arm64/arm64_regress.c
     need_file arm64/vector_smoke.c
     need_file arm64/smc_stale_block.c
+    need_file arm64/ret_retcache.c
     need_file arm64/stlr_ldar_publish.c
     need_file arm64/ptrace_singlestep.c
     need_file arm64/ands_bcond_fusion.c
@@ -147,6 +148,7 @@ if [ "$is_arm64_guest" -eq 1 ]; then
 fi
 if [ "$is_riscv64_guest" -eq 1 ]; then
     need_file riscv64/ptrace_regset.c
+    need_file riscv64/jalr_retcache.c
 fi
 need_file signal_core.c
 need_file signal_restart.c
@@ -215,6 +217,7 @@ need_file proc_pid_io.c
 need_file taskstats_genl.c
 need_file tmpfs_mmap.c
 need_file tmpfs_statfs.c
+need_file tmpfs_append.c
 need_file memfd_mmap.c
 need_file binder_ipc.c
 need_file ashmem.c
@@ -226,6 +229,8 @@ need_file binder_ping.c
 need_file property_area.c
 need_file aes_gcm_accel.c
 need_file mount_stdev.c
+need_file mount_cross_dev.c
+need_file cgroup2_rmdir.c
 need_file mmap_truncate_sigbus.c
 need_file null_page_fault.c
 need_file signalfd_epoll_deadlock.c
@@ -236,6 +241,7 @@ need_file chroot_getcwd.c
 need_file iovec_abi_marshal.c
 need_file fakefs_type_race.c
 need_file fakefs_casefold.c
+need_file fakefs_inode_alias.c
 need_file fifo_open_creat_deadlock.c
 need_file proc_stat_monotonic.c
 need_file sock_getfd_errno.c
@@ -499,7 +505,7 @@ build_one() {
     cc -pthread -o "$work_dir/bin/$name" "$fixed_asm" -lm -ldl
 }
 
-all_tests="signal_core signal_restart signal_realtime signal_altstack signal_stop_cont signal_forced_trap signal_poll signal_child_burst eventfd_interrupt futex_core process_lifecycle pthread_sync ptrace_group_stop ptrace_thread_follow epoll_mod_wake epoll_oneshot_rearm epoll_mod_spurious_wake epoll_data_layout epoll_eloop epoll_exclusive epoll_dup_add ptrace_exit_kill fcntl_lock fcntl_ofd fcntl_setown at_empty_path utimensat_fd copy_file_range name_to_handle_at sendfile_vhangup pidfd_open pidfd_clone pidfd_fdinfo_pid fsopen_move_mount keyctl_link mountinfo_epollet tmpfs_nlink unix_dgram_cred ambient_caps scm_rights_stress scm_rights_pidfd fs_conformance process_conformance time_conformance mem_conformance sock_conformance getpeername_smallbuf netlink_route netlink_audit mount_flags devtmpfs_mount clone_error_cleanup uts_namespace posix_timer_fork vfork_fatal_signal vfork_exec_stale_jit getppid_thread concurrent_exec_tlb exec_i386_fault_addr random_seed getrusage_group pty_line_discipline proc_pid_io taskstats_genl tmpfs_mmap tmpfs_statfs memfd_mmap binder_ipc ashmem dma_heap selinuxfs kmsg proc_random binder_ping property_area mount_stdev mmap_truncate_sigbus null_page_fault signalfd_epoll_deadlock pidfd_epoll_deadlock signalfd_thread_group wayland_scm_shm chroot_getcwd iovec_abi_marshal fakefs_type_race fakefs_casefold fifo_open_creat_deadlock proc_stat_monotonic sock_getfd_errno inotify_close_race inotify_mount_paths statx_mnt_id_timerfd timerfd_settime_readiness opath_symlink_pidfd_wait pidfd_self_exit_deadlock prctl_capbset_drop oom_score_adj sysv_ipc accept_rcvtimeo accept_kill socket_kill inaddr_any_iface procfd_reopen siocoutq epoll_nested tmpfs_exec kcmp pixman_accel aes_gcm_accel file_perms ftruncate_fd_mode syscall_wiring sysfs_cpu_topology"
+all_tests="signal_core signal_restart signal_realtime signal_altstack signal_stop_cont signal_forced_trap signal_poll signal_child_burst eventfd_interrupt futex_core process_lifecycle pthread_sync ptrace_group_stop ptrace_thread_follow epoll_mod_wake epoll_oneshot_rearm epoll_mod_spurious_wake epoll_data_layout epoll_eloop epoll_exclusive epoll_dup_add ptrace_exit_kill fcntl_lock fcntl_ofd fcntl_setown at_empty_path utimensat_fd copy_file_range name_to_handle_at sendfile_vhangup pidfd_open pidfd_clone pidfd_fdinfo_pid fsopen_move_mount keyctl_link mountinfo_epollet tmpfs_nlink unix_dgram_cred ambient_caps scm_rights_stress scm_rights_pidfd fs_conformance process_conformance time_conformance mem_conformance sock_conformance getpeername_smallbuf netlink_route netlink_audit mount_flags devtmpfs_mount clone_error_cleanup uts_namespace posix_timer_fork vfork_fatal_signal vfork_exec_stale_jit getppid_thread concurrent_exec_tlb exec_i386_fault_addr random_seed getrusage_group pty_line_discipline proc_pid_io taskstats_genl tmpfs_mmap tmpfs_statfs tmpfs_append memfd_mmap binder_ipc ashmem dma_heap selinuxfs kmsg proc_random binder_ping property_area mount_stdev mount_cross_dev cgroup2_rmdir mmap_truncate_sigbus null_page_fault signalfd_epoll_deadlock pidfd_epoll_deadlock signalfd_thread_group wayland_scm_shm chroot_getcwd iovec_abi_marshal fakefs_type_race fakefs_casefold fakefs_inode_alias fifo_open_creat_deadlock proc_stat_monotonic sock_getfd_errno inotify_close_race inotify_mount_paths statx_mnt_id_timerfd timerfd_settime_readiness opath_symlink_pidfd_wait pidfd_self_exit_deadlock prctl_capbset_drop oom_score_adj sysv_ipc accept_rcvtimeo accept_kill socket_kill inaddr_any_iface procfd_reopen siocoutq epoll_nested tmpfs_exec kcmp pixman_accel aes_gcm_accel file_perms ftruncate_fd_mode syscall_wiring sysfs_cpu_topology"
 if [ "$is_x86_guest" -eq 1 ]; then
     # x86 flag-semantics atomics (lock-prefixed inline asm)
     all_tests="atomic_xadd32 atomic_cmpxchg32 atomic_cmpxchg8b atomic_logic32 cow_atomic_fault x87_fpu x86_loop bcd_adjust port_io_gpf $all_tests"
@@ -513,10 +519,10 @@ if [ "$is_amd64_guest" -eq 1 ]; then
     all_tests="$all_tests amd64_regress avx_regress amd64_incdec"
 fi
 if [ "$is_arm64_guest" -eq 1 ]; then
-    all_tests="$all_tests atomics64 arm64_regress vector_smoke smc_stale_block stlr_ldar_publish ptrace_singlestep ands_bcond_fusion hle_loop tagged_pointer"
+    all_tests="$all_tests atomics64 arm64_regress vector_smoke smc_stale_block ret_retcache stlr_ldar_publish ptrace_singlestep ands_bcond_fusion hle_loop tagged_pointer"
 fi
 if [ "$is_riscv64_guest" -eq 1 ]; then
-    all_tests="$all_tests ptrace_regset"
+    all_tests="$all_tests ptrace_regset jalr_retcache"
 fi
 
 test_selected() {

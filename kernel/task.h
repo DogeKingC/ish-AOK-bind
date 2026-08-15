@@ -63,6 +63,7 @@ static inline void task_io_counters_add(struct task_io_counters *dst,
     atomic_fetch_add_explicit(&dst->blkio_delay_ns, atomic_load_explicit(&src->blkio_delay_ns, memory_order_relaxed), memory_order_relaxed);
 }
 struct futex; // opaque; defined in kernel/futex.c (see futex_restart_futex below)
+struct native_exec_pending; // opaque; defined in kernel/native.c
 
 // The SELinux context every task carries when no policy has ever been loaded.
 // A real kernel reports u:r:kernel:s0 in that state, but only until init
@@ -104,6 +105,34 @@ struct task {
     struct mem *mem; // pointer to mm.mem, for convenience
     pthread_t thread;
     uint64_t threadid;
+
+    // Set by execve when the program resolves to one implemented natively
+    // inside iSH-AOK (kernel/native.h), and consumed where this task would
+    // otherwise start executing the loaded image. Hung off the task rather
+    // than kept thread-local because a task can be exec'd by a thread that is
+    // only impersonating it (kernel/init.c's boot-command launcher does
+    // exactly that, then hands the task to its own thread).
+    struct native_exec_pending *native_exec;
+    // The environment that native program sees, seeded from execve's envp.
+    // Here rather than in a global because two native programs really can run
+    // at once, one per guest task (kernel/native.h).
+    char **native_env;
+
+    // Signals a native program has a handler for that the SHIM is blocking on
+    // its behalf, and which the program itself has not asked to block.
+    //
+    // A native program cannot give the kernel a handler -- that would jump the
+    // guest CPU into host code -- so the shim blocks the signal and runs the
+    // handler at the next syscall checkpoint instead. Blocked means "do not
+    // wake this task" everywhere else in the kernel, which is exactly wrong
+    // here: the task must wake, so that its next checkpoint can run the
+    // handler. Without this, ^C during `sleep 30` under a native bash did
+    // nothing until the NEXT keystroke, which the interrupted read then ate.
+    //
+    // Kept apart from what the program blocked for itself, because that half
+    // must go on meaning what it says. kernel/native_libc.c maintains both.
+    sigset_t_ native_prog_blocked;
+    sigset_t_ native_held;
 
     struct {
         atomic_int count; // If positive, don't delete yet, wait_to_delete
@@ -339,6 +368,9 @@ static inline bool task_is_64bit(const struct task *task) {
 // parent as NULL to create the init process. Returns NULL if out of memory.
 // Ends with an underscore because there's a mach function by the same name
 struct task *task_create_(struct task *parent);
+// A child of current with fork semantics, for a caller that execs into it
+// immediately. See kernel/fork.c. NULL on failure, already cleaned up.
+struct task *task_fork_for_exec(void);
 // Removes the process from the process table and frees it. Must be called with pids_lock.
 void task_destroy(struct task *task, int UNUSED(caller));
 // Removes the process from the process table. Must be called with pids_lock.

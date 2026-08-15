@@ -15,6 +15,10 @@
 #include "kernel/ptrace.h"
 
 void handle_interrupt(int interrupt);
+// One syscall on behalf of a natively-compiled program (kernel/native.h),
+// reached from host code instead of from a guest trap. Numbering is
+// asm-generic; see the definition in kernel/calls.c.
+sqword_t syscall_dispatch_native(qword_t syscall_num, const qword_t raw_args[6]);
 void amd64_trace_track_exec(pid_t_ pid, pid_t_ tgid, const char *file);
 bool amd64_trace_is_lineage_tgid(pid_t_ tgid);
 
@@ -51,6 +55,8 @@ int do_execve(const char *file, size_t argc, const char *argv, const char *envp)
 dword_t sys_exit(dword_t status);
 noreturn void do_exit(struct task *task, int status);
 noreturn void do_exit_group(int status);
+// Wait for a child on behalf of native code; see kernel/exit.c.
+int task_wait_child(dword_t pid, int *status_out, int options);
 dword_t sys_exit_group(dword_t status);
 dword_t sys_wait4(pid_t_ pid, addr_t status_addr, dword_t options, addr_t rusage_addr);
 dword_t sys_wait4_guest(pid_t_ pid, guest_addr_t status_addr, dword_t options, guest_addr_t rusage_addr);

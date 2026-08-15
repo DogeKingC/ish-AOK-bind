@@ -19,6 +19,7 @@
 #include "fs/tty.h"
 #include "fs/path.h"
 #include "kernel/elf.h"
+#include "kernel/native.h"
 #include "kernel/vdso.h"
 #include "jit/jit.h"
 #include "tools/ptraceomatic-config.h"
@@ -993,6 +994,23 @@ beyond_hope:
     goto out_free_interp;
 }
 
+// exec_args packs its strings back to back; natively-implemented programs
+// (kernel/native.h) are ordinary C and want the argv/envp shape. The pointers
+// alias the caller's block rather than copying it, so the vector is only valid
+// for as long as that block is.
+static char **exec_args_to_vector(struct exec_args args) {
+    char **vec = malloc((args.count + 1) * sizeof(*vec));
+    if (vec == NULL)
+        return NULL;
+    const char *p = args.args;
+    for (size_t i = 0; i < args.count; i++) {
+        vec[i] = (char *) p;
+        p += strlen(p) + 1;
+    }
+    vec[args.count] = NULL;
+    return vec;
+}
+
 static size_t args_size(struct exec_args args) {
     const char *args_end = args.args;
     for (size_t i = 0; i < args.count; i++) {
@@ -1157,6 +1175,41 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
     if (!(stat.mode & 0111)) {
         fd_close(fd);
         return _EACCES;
+    }
+
+    // Natively-implemented programs (/AOK/native/*, kernel/native.h) are
+    // dispatched here: after the existence and permission checks above, so
+    // they behave like any other executable, but before any ELF parsing, since
+    // there is no guest image to load. Keyed off the resolved fd rather than
+    // `file`, so a symlink from anywhere in the guest lands here while argv[0]
+    // stays whatever the caller passed.
+    const char *native_name = aokfs_native_program_name(fd);
+    if (native_name != NULL) {
+        const struct native_program *prog = native_program_lookup(native_name);
+        // No match means this build does not carry that program; fall through
+        // and run the /AOK/native stub, which says so out loud.
+        if (prog != NULL) {
+            char **native_argv = exec_args_to_vector(argv);
+            char **native_envp = exec_args_to_vector(envp);
+            if (native_argv == NULL || native_envp == NULL) {
+                free(native_argv);
+                free(native_envp);
+                fd_close(fd);
+                return _ENOMEM;
+            }
+            fd_close(fd);
+            // Recorded rather than run here. Running a native program never
+            // returns, so doing it at this point would strand every buffer the
+            // execve syscall still means to free -- including the argv/envp
+            // blocks themselves. Instead take a private copy, report success,
+            // and let each entry point run it once its own frees are done (see
+            // native_exec_run_pending).
+            int perr = native_exec_set_pending(prog, (int) argv.count,
+                    native_argv, native_envp);
+            free(native_argv);
+            free(native_envp);
+            return perr;
+        }
     }
 
     err = format_exec(fd, file, argv, envp);
@@ -1429,6 +1482,9 @@ ssize_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
 
     free(envp);
     free(argv);
+    // After the frees: a native program recorded by __do_execve runs here and
+    // does not return (kernel/native.h).
+    native_exec_run_pending();
     return err;
 }
 
@@ -1464,6 +1520,9 @@ ssize_t sys_execve_guest(guest_addr_t filename_addr, guest_addr_t argv_addr, gue
 
     free(envp);
     free(argv);
+    // After the frees: a native program recorded by __do_execve runs here and
+    // does not return (kernel/native.h).
+    native_exec_run_pending();
     return err;
 }
 
@@ -1524,6 +1583,9 @@ ssize_t sys_execveat(fd_t dirfd, addr_t filename_addr, addr_t argv_addr, addr_t 
 out_free_args:
     free(envp);
     free(argv);
+    // After the frees: a native program recorded by __do_execve runs here and
+    // does not return (kernel/native.h).
+    native_exec_run_pending();
     return err;
 }
 
@@ -1597,6 +1659,9 @@ ssize_t sys_execveat_guest(fd_t dirfd, guest_addr_t filename_addr, guest_addr_t 
 out_free_args:
     free(envp);
     free(argv);
+    // After the frees: a native program recorded by __do_execve runs here and
+    // does not return (kernel/native.h).
+    native_exec_run_pending();
     return err;
 }
 

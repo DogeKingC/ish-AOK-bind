@@ -36,6 +36,18 @@ static bool mount_trace_elogind(void) {
     return false;
 }
 
+// Filesystem by registered name. fsopen has always done this inline; native
+// programs (kernel/smallclue_shim.c) need the same lookup from outside this
+// file, so it is exported rather than copied.
+const struct fs_ops *fs_lookup(const char *name) {
+    if (name == NULL)
+        return NULL;
+    for (size_t i = 0; i < sizeof(filesystems) / sizeof(filesystems[0]); i++)
+        if (filesystems[i] != NULL && strcmp(filesystems[i]->name, name) == 0)
+            return filesystems[i];
+    return NULL;
+}
+
 void fs_register(const struct fs_ops *fs) {
     for (unsigned i = 0; i < MAX_FILESYSTEMS; i++) {
         if (filesystems[i] == NULL) {
@@ -101,6 +113,33 @@ struct mount *mount_find(char *path) {
     return mount;
 }
 
+// Is a filesystem mounted at exactly this point?
+//
+// Not the same question as mount_find, which resolves a path to the mount
+// CONTAINING it and so answers "yes" for every path under a mount. This is an
+// exact match on the mount point itself, which is what tells a root that
+// actually mounted from one that silently did not: the app creates
+// /AOK/roots/<name> and only then calls do_mount, so the directory exists
+// either way and its presence proves nothing.
+//
+// The root's point is stored as "" (its guest path normalizes away), so accept
+// the "/" spelling callers naturally use, the same way /proc/mounts prints it.
+bool mount_exists_at_point(const char *point) {
+    if (strcmp(point, "/") == 0)
+        point = "";
+    lock(&mounts_lock, 0);
+    struct mount *mount;
+    bool found = false;
+    list_for_each_entry(&mounts, mount, mounts) {
+        if (strcmp(mount->point, point) == 0) {
+            found = true;
+            break;
+        }
+    }
+    unlock(&mounts_lock);
+    return found;
+}
+
 void mount_retain(struct mount *mount) {
     lock(&mounts_lock, 0);
     mount->refcount++;
@@ -131,6 +170,42 @@ int mount_id(struct mount *target) {
     return 1;
 }
 
+// The device files on this mount report through stat(2)'s st_dev, which is
+// also /proc/self/mountinfo's field 3 (major:minor). On Linux those two are
+// the same number by construction, so they must be produced from one place
+// here as well.
+//
+// There is no single field to read: a filesystem with no backing device
+// (tmpfs, proc, devpts, sysfs, cgroup, and fakefs since a3ea924e) leaves
+// stat.dev at 0 and gets mount->fake_dev stamped on, while realfs derives a
+// real device from the host volume (fs/real.c copy_stat). Printing fake_dev
+// unconditionally would therefore be wrong for exactly the realfs mounts. So
+// ask the filesystem, by stat'ing the mount's own root: path "" is what
+// find_mount_and_trim_path leaves behind for a path that is exactly the mount
+// point, making this literally the call `stat /mountpoint` makes. Falling back
+// to fake_dev when the filesystem leaves dev 0 is fs/stat.c's
+// stat_stamp_fake_dev rule; the two must stay in step.
+//
+// Deliberately not under inodes_lock, which generic_statat holds across the
+// same call to stop fakefs's SQLite metadata and host stat halves from being
+// combined torn. Only stat.dev is read here, and that field comes wholly from
+// one side -- fakefs pins it to 0, realfs takes it from the host stat -- so
+// there is no torn combination to protect against, and the proc read path
+// this runs on has not been shown to be free of inodes_lock (it is not
+// recursive).
+dev_t_ mount_dev(struct mount *mount) {
+    // A bind carries no backing of its own (root_fd -1, data NULL), so its
+    // fs's stat fails here for the same reason its statfs does; report the
+    // origin's superblock, which is what bind->fake_dev already copies. See
+    // mount_statfs (kernel/fs.c) for why this deref needs no lock.
+    if (mount->bind_origin != NULL)
+        mount = mount->bind_origin;
+    struct statbuf stat = {};
+    if (mount->fs->stat != NULL && mount->fs->stat(mount, "", &stat) >= 0 && stat.dev != 0)
+        return stat.dev;
+    return mount->fake_dev;
+}
+
 int do_mount(const struct fs_ops *fs, const char *source, const char *point, const char *info, int flags) {
     struct mount *new_mount = malloc(sizeof(struct mount));
     if (new_mount == NULL)
@@ -138,6 +213,7 @@ int do_mount(const struct fs_ops *fs, const char *source, const char *point, con
     new_mount->point = strdup(point);
     new_mount->point_len = strlen(point);
     new_mount->source = strdup(source);
+    new_mount->display_source = NULL;
     new_mount->info = strdup(info);
     new_mount->flags = flags;
     new_mount->fs = fs;
@@ -171,6 +247,89 @@ int do_mount(const struct fs_ops *fs, const char *source, const char *point, con
     return 0;
 }
 
+// Snapshot the mount table for a caller outside this file. Every traversal of
+// `mounts` lives in here because the lock discipline does -- kernel/fs.h says
+// the lock must be held while traversing, and mount_statfs must NOT be called
+// under it. A native `df` (kernel/smallclue_shim.c) got that wrong in both
+// directions before this existed, and hung.
+//
+// Two passes on purpose: collect the mounts under the lock, then statfs each
+// with the lock dropped. Entries are copied rather than referenced so nothing
+// outlives the lock.
+int mount_snapshot(struct mount_info **out, size_t *count_out) {
+    if (out == NULL || count_out == NULL)
+        return _EINVAL;
+    *out = NULL;
+    *count_out = 0;
+
+    lock(&mounts_lock, 0);
+    size_t count = 0;
+    struct mount *mount;
+    list_for_each_entry(&mounts, mount, mounts)
+        count++;
+    struct mount_info *info = calloc(count > 0 ? count : 1, sizeof(*info));
+    if (info == NULL) {
+        unlock(&mounts_lock);
+        return _ENOMEM;
+    }
+    size_t i = 0;
+    list_for_each_entry(&mounts, mount, mounts) {
+        if (i >= count)
+            break;
+        const char *from = mount->display_source != NULL ? mount->display_source
+                                                         : mount->source;
+        snprintf(info[i].source, sizeof(info[i].source), "%s",
+                 from != NULL ? from : "none");
+        snprintf(info[i].point, sizeof(info[i].point), "%s",
+                 (mount->point != NULL && mount->point[0] != '\0') ? mount->point : "/");
+        snprintf(info[i].type, sizeof(info[i].type), "%s",
+                 mount->fs != NULL && mount->fs->name != NULL ? mount->fs->name : "none");
+        info[i].mount = mount;
+        i++;
+    }
+    unlock(&mounts_lock);
+
+    // Lock dropped: mount_statfs reaches into the filesystem and must not run
+    // under mounts_lock.
+    for (size_t j = 0; j < i; j++) {
+        struct statfsbuf sb = {};
+        if (mount_statfs(info[j].mount, &sb) == 0)
+            info[j].statfs = sb;
+    }
+
+    *out = info;
+    *count_out = i;
+    return 0;
+}
+
+// See kernel/fs.h: renames a mount for display only. `display_source` NULL or
+// empty restores the real source.
+int mount_set_display_source(const char *point, const char *display_source) {
+    char *name = NULL;
+    if (display_source != NULL && display_source[0] != '\0') {
+        name = strdup(display_source);
+        if (name == NULL)
+            return _ENOMEM;
+    }
+
+    lock(&mounts_lock, 0);
+    struct mount *mount;
+    list_for_each_entry(&mounts, mount, mounts) {
+        // The root's point is "" internally, so accept its guest spelling too
+        // (same accommodation as the MS_REMOUNT lookup below).
+        bool is_root = strcmp(point, "/") == 0 && mount->point[0] == '\0';
+        if (strcmp(point, mount->point) == 0 || is_root) {
+            free((void *) mount->display_source);
+            mount->display_source = name;
+            unlock(&mounts_lock);
+            return 0;
+        }
+    }
+    unlock(&mounts_lock);
+    free(name);
+    return _ENOENT;
+}
+
 int mount_remove(struct mount *mount) {
     if (mount->refcount != 0)
         return _EBUSY;
@@ -187,6 +346,7 @@ int mount_remove(struct mount *mount) {
     list_remove(&mount->mounts);
     free((void *) mount->info);
     free((void *) mount->source);
+    free((void *) mount->display_source);
     free((void *) mount->point);
     free(mount);
     return 0;
@@ -315,6 +475,10 @@ static int do_bind_mount(const char *norm_source, const char *point, const char 
     bind->point = strdup(point);
     bind->point_len = strlen(point);
     bind->source = strdup(norm_source);
+    // A bind reports the guest path it was bound from, which is source; it must
+    // NOT alias the origin's display_source, or umounting the bind would free
+    // the name out from under the origin (`mount --bind / /mnt/x`).
+    bind->display_source = NULL;
     bind->info = strdup(info);
     bind->bind_prefix = strdup(src);
     if (bind->point == NULL || bind->source == NULL || bind->info == NULL || bind->bind_prefix == NULL) {

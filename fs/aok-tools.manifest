@@ -11,12 +11,14 @@
 # here -- the next build picks it up automatically. Order here is the order
 # shown by `ls /AOK/tools` (after the bundled iSH_benchmark entries).
 
+native-links.sh
 provision-ultimate-alpine.sh
 provision-ultimate-devuan.sh
 provision-ultimate-archlinux.sh
 mount-root.sh
 ish-report.sh
 ish-remote.sh
+manage-roots.sh
 setup-wayland.sh
 start-wayland.sh
 ktop/ktop.c

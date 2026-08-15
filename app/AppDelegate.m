@@ -1385,14 +1385,41 @@ static int EnsureRegularFileNonEmpty(const char *path, const char *contents, mod
     return 0;
 }
 
-// Provision /etc/hostname and /etc/hosts before init starts, on EVERY boot path (real
-// /sbin/init and the fake-init fallback) -- called from ensureBooted. Docker-exported
-// distro images ship both files empty and the guest's hostname.sh only *reads*
-// /etc/hostname, so an empty file there leaves the system with an empty hostname.
+// Provision the /etc files a distro image ships empty, before init starts, on EVERY
+// boot path (real /sbin/init and the fake-init fallback) -- called from ensureBooted.
+// Docker-exported distro images ship /etc/hostname and /etc/hosts empty and the guest's
+// hostname.sh only *reads* /etc/hostname, so an empty file there leaves the system with
+// an empty hostname.
 static void ProvisionGuestHostFiles(void) {
     EnsureDirectory("/etc", 0755);
     EnsureRegularFileNonEmpty("/etc/hostname", "localhost\n", 0644);
     EnsureRegularFileNonEmpty("/etc/hosts", "127.0.0.1\tlocalhost\n127.0.1.1\tlocalhost\n", 0644);
+
+    // /etc/environment is the same shape of hole: a Devuan/Debian minirootfs ships it
+    // zero-length and carries no /etc/default/locale either, so a fresh root boots in
+    // the C/POSIX locale with no UTF-8 charmap. UTF-8-aware tools then either mangle
+    // non-ASCII (less, python3, git, man-db) or refuse to start at all -- btop exits
+    // with "ERROR: No UTF-8 locale detected!" before drawing a single frame. Naming
+    // the locale is the whole fix: glibc has C.UTF-8 built in on these images and musl
+    // needs no locale data at all, so nothing has to be generated.
+    //
+    // This is the file that reaches the default launch command, and that is the
+    // reason to write this one rather than any other: the app launches
+    // "/bin/login -f root", login builds the session environment through PAM, and
+    // pam_env reads /etc/environment with no configuration at all (/etc/pam.d/login's
+    // plain "session required pam_env.so readenv=1"). It does NOT reach an ssh
+    // session -- stock sshd_config on these images leaves UsePAM at the upstream
+    // default of "no", so sshd runs no PAM stack; the rootfs carries an
+    // /etc/profile.d/00-aok-locale.sh for that, written by
+    // tools/build-devuan-minirootfs.sh and provision-ultimate-devuan.sh. LANG only,
+    // never LC_ALL, which would outrank -- and so block -- any per-category locale
+    // the user sets later.
+    //
+    // Only ever written when the file is missing or empty, so a root that already
+    // configures its locale (including one built from the fixed
+    // tools/build-devuan-minirootfs.sh, or provisioned by provision-ultimate-*.sh)
+    // keeps exactly what it has.
+    EnsureRegularFileNonEmpty("/etc/environment", "LANG=C.UTF-8\n", 0644);
 
     // Seed the kernel hostname from /etc/hostname right now instead of
     // waiting for the guest's own hostname.sh, which runs a minute or more
@@ -1460,6 +1487,15 @@ static int EnsureSymlink(const char *path, const char *target) {
 // already set (e.g. an existing execute bit on a script). Symlinks are left
 // alone (FTW_PHYS below reports them as FTW_SL rather than following them)
 // so this can't be used to reach outside the tree via a symlink target.
+// "It wasn't there" is the ordinary first-launch outcome for a directory we are
+// about to create, not a failure worth logging.
+static BOOL ISHIsFileNotFoundError(NSError *error) {
+    if (error == nil)
+        return YES;
+    return [error.domain isEqualToString:NSCocoaErrorDomain] &&
+           (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError);
+}
+
 static int FixSharedDirectoryPermissionsCallback(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf) {
     (void)ftwbuf;
     if (typeflag == FTW_D || typeflag == FTW_DP)
@@ -2364,7 +2400,10 @@ static TerminalViewController *CreateTerminalViewController(void) {
                                    @"path": rootMetadata.path ?: @""});
     }
 
-    intptr_t err = mount_root(&fakefs, rootData.fileSystemRepresentation);
+    // defaultRoot ("Devuan6-arm64") is what / reports as its source in
+    // /proc/mounts, so df names the booted filesystem instead of printing the
+    // app group container path it is stored at.
+    intptr_t err = mount_root(&fakefs, rootData.fileSystemRepresentation, defaultRoot.UTF8String);
     if (err < 0) {
         return RecordBootFailure(err,
                                  @"boot.root.mount.failed",
@@ -2544,6 +2583,11 @@ static TerminalViewController *CreateTerminalViewController(void) {
     EnsureSymlink("/dev/rtc", "/dev/rtc0");
 
     do_mount(&aokfs, NSBundle.mainBundle.resourcePath.UTF8String, "/AOK", "", MS_READONLY_);
+    // Every /AOK mount's source is a host container path: long, mostly a UUID,
+    // and useless to the guest, so each names itself instead -- the same thing
+    // Linux's own virtual filesystems do, where proc reports "proc" and a tmpfs
+    // reports "tmpfs". Display only; mount->source still opens the real path.
+    mount_set_display_source("/AOK", "aokfs");
     NSURL *aokPersistURL = AOKPersistDirectoryURL();
     if (aokPersistURL != nil) {
         NSError *persistError = nil;
@@ -2557,6 +2601,8 @@ static TerminalViewController *CreateTerminalViewController(void) {
             // than relying on ordinary Unix ownership.
             FixSharedDirectoryPermissions(aokPersistURL.fileSystemRepresentation);
             int persistMountErr = do_mount(&realfs, aokPersistURL.fileSystemRepresentation, "/AOK/persist", "", MOUNT_ISH_SHARED_);
+            if (persistMountErr >= 0)
+                mount_set_display_source("/AOK/persist", "persist");
             if (persistMountErr < 0)
                 NSLog(@"Could not mount /AOK/persist: %d", persistMountErr);
         } else {
@@ -2635,7 +2681,40 @@ static TerminalViewController *CreateTerminalViewController(void) {
     if (aokRootsURL != nil) {
         // Recreate fresh each boot so a root renamed/deleted since the last
         // boot doesn't leave a stale, unmountable directory behind.
-        [NSFileManager.defaultManager removeItemAtURL:aokRootsURL error:nil];
+        //
+        // This used to be one removeItemAtURL of the whole directory with its
+        // error discarded, and it was not working: on a device, /AOK/roots
+        // held 15 entries where only 7 roots existed, the other 8 dating from
+        // July while the directory around them was recreated that morning.
+        // Empty leftovers are not harmless -- they are indistinguishable from
+        // real roots in `ls /AOK/roots`, and chroot setups write mount-point
+        // scaffolding (dev, proc, run, sys) into them, so they accrete content
+        // and start to look genuine. They cannot be deleted from the app
+        // either, because the app is right that they are not roots.
+        //
+        // Two changes. Remove entry by entry rather than all-or-nothing, so
+        // one undeletable child cannot strand every other; and keep the error,
+        // because an operation whose entire purpose is preventing stale state
+        // must not fail silently.
+        NSError *pruneError = nil;
+        NSArray<NSURL *> *staleEntries =
+            [NSFileManager.defaultManager contentsOfDirectoryAtURL:aokRootsURL
+                                       includingPropertiesForKeys:nil
+                                                          options:0
+                                                            error:&pruneError];
+        if (staleEntries == nil && pruneError != nil && !ISHIsFileNotFoundError(pruneError))
+            NSLog(@"Could not list %@ to prune it: %@", aokRootsURL.path, pruneError);
+        for (NSURL *stale in staleEntries) {
+            NSError *entryError = nil;
+            if (![NSFileManager.defaultManager removeItemAtURL:stale error:&entryError])
+                NSLog(@"Could not prune stale root mount point %@: %@",
+                        stale.lastPathComponent, entryError);
+        }
+        // Then the directory itself, so a fresh one gets the permissions below.
+        NSError *removeError = nil;
+        if (![NSFileManager.defaultManager removeItemAtURL:aokRootsURL error:&removeError] &&
+                !ISHIsFileNotFoundError(removeError))
+            NSLog(@"Could not remove %@ before recreating it: %@", aokRootsURL.path, removeError);
         NSError *rootsError = nil;
         if ([NSFileManager.defaultManager createDirectoryAtURL:aokRootsURL
                                    withIntermediateDirectories:YES
@@ -2645,6 +2724,8 @@ static TerminalViewController *CreateTerminalViewController(void) {
             // same single-host-owner-shared-by-every-guest-uid situation.
             chmod(aokRootsURL.fileSystemRepresentation, 0777);
             int rootsMountErr = do_mount(&realfs, aokRootsURL.fileSystemRepresentation, "/AOK/roots", "", MOUNT_ISH_SHARED_);
+            if (rootsMountErr >= 0)
+                mount_set_display_source("/AOK/roots", "roots");
             if (rootsMountErr < 0) {
                 NSLog(@"Could not mount /AOK/roots: %d", rootsMountErr);
             } else {
@@ -2681,6 +2762,15 @@ static TerminalViewController *CreateTerminalViewController(void) {
                             NSLog(@"Could not mount secondary root %@ at %@: %d", otherRootName, mountPoint, secondaryErr);
                             continue;
                         }
+                        // Report the root's name rather than its backing path,
+                        // for the same reason 88496575 does it for / : the
+                        // source here is an app group container path whose
+                        // only variable part is a UUID the guest can do
+                        // nothing with, and it is long enough to wrap every
+                        // df row onto a second line. With several roots
+                        // installed that is most of the table. Display only --
+                        // mount->source still opens the SQLite db.
+                        mount_set_display_source(mountPoint.UTF8String, otherRootName.UTF8String);
                         [ISHDiagnosticsStore recordLaunchStage:@"boot.root.secondary.mounted"
                                                        details:@{@"root": otherRootName, @"path": mountPoint}];
                     }
@@ -2730,6 +2820,8 @@ static TerminalViewController *CreateTerminalViewController(void) {
             NSURL *fakefsDataURL = [sharedFakefsURL URLByAppendingPathComponent:@"data" isDirectory:YES];
             int fakefsMountErr = do_mount(&fakefs, fakefsDataURL.fileSystemRepresentation, "/AOK/fakefs", "", 0);
             ISHAppGroupReleaseLock(fakefsLockFd);
+            if (fakefsMountErr >= 0)
+                mount_set_display_source("/AOK/fakefs", "fakefs");
             if (fakefsMountErr < 0) {
                 NSLog(@"Could not mount /AOK/fakefs: %d", fakefsMountErr);
                 [ISHDiagnosticsStore recordLaunchStage:@"boot.fakefs.mountFailed"

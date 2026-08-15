@@ -10,6 +10,7 @@
 #include "kernel/task.h"
 #include "fs/proc.h"
 #include "fs/proc/net.h"
+#include "fs/dev.h"
 #include "fs/devices.h"
 #include "fs/real.h"
 #include "platform/platform.h"
@@ -599,7 +600,14 @@ int proc_show_mounts(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
         if (point[0] == '\0')
             point = "/";
 
-        proc_print_escaped(buf, mount->source);
+        // An empty source would print as an empty field, and /proc/mounts is
+        // space-separated with no quoting: busybox then reads the mount point
+        // as the source and the type as the mount point (`df` showed a bind of
+        // / mounted on "fake", and `umount` tried to unmount "fake"). A bind of
+        // the root is exactly that case, since the root's guest path normalizes
+        // to "". Spell it "/", as mountinfo already does.
+        const char *source = mount_display_source(mount);
+        proc_print_escaped(buf, source[0] == '\0' ? "/" : source);
         proc_printf(buf, " ");
         proc_print_escaped(buf, point);
         proc_printf(buf, " %s ", mount->fs->name);
@@ -653,7 +661,11 @@ int proc_show_mountinfo(struct proc_entry *UNUSED(entry), struct proc_data *buf)
         int id = proc_mountinfo_id(mount);
         int parent_id = proc_mountinfo_parent_id(mount);
 
-        proc_printf(buf, "%d %d 0:0 / ", id, parent_id);
+        // Field 3 is the device files on this mount report through st_dev, so
+        // it comes from the same place that number does (fs/mount.c) rather
+        // than being made up here; the two must not contradict each other.
+        dev_t_ dev = mount_dev(mount);
+        proc_printf(buf, "%d %d %d:%d / ", id, parent_id, dev_major(dev), dev_minor(dev));
         proc_print_escaped(buf, point);
         proc_printf(buf, " %s", mount->flags & MS_READONLY_ ? "ro" : "rw");
         if (mount->flags & MS_NOSUID_)
@@ -663,7 +675,8 @@ int proc_show_mountinfo(struct proc_entry *UNUSED(entry), struct proc_data *buf)
         if (mount->flags & MS_NOEXEC_)
             proc_printf(buf, ",noexec");
         proc_printf(buf, " - %s ", mount->fs->name);
-        proc_print_escaped(buf, mount->source[0] == '\0' ? "/" : mount->source);
+        const char *source = mount_display_source(mount);
+        proc_print_escaped(buf, source[0] == '\0' ? "/" : source);
         proc_printf(buf, " %s", mount->flags & MS_READONLY_ ? "ro" : "rw");
         if (mount->info && mount->info[0] != '\0')
             proc_printf(buf, ",%s", mount->info);

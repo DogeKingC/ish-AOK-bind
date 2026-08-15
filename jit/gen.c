@@ -4306,18 +4306,36 @@ int gen_step_arm64(struct gen_state *state, struct tlb *tlb) {
     if ((insn & 0xfe000000) == 0xd6000000) {
         unsigned opc = (insn >> 21) & 0xf;
         unsigned rn = (insn >> 5) & 0x1f;
+        // These three are the whole of this engine's remaining exits to C --
+        // every compile-time-target edge already chains. The _cached variants
+        // add a jit_frame.ret_cache lookup on the computed target and dispatch
+        // straight into an already-translated block; see ret_cache_dispatch in
+        // jit/guest-arm64/control.S. Gated so both arms live in one binary
+        // (/proc/ish/arm64_jit_fuse retcache), with the OFF arm byte-for-byte
+        // the gadget that shipped before. All THREE get it, not just ret: br is
+        // PLT and switch-table dispatch, blr is every indirect call, and the
+        // cache is keyed by target rather than by call site, so they are the
+        // identical lookup. On riscv64 the indirect half was worth 3.4x on its
+        // own, i.e. far more than the returns.
+        extern void gadget_arm64_br_cached(void);
+        extern void gadget_arm64_blr_cached(void);
+        extern void gadget_arm64_ret_cached(void);
+        bool retcache = (arm64_jit_fuse_mask() & JIT_FUSE_A64_RETCACHE) != 0;
         switch (opc) {
         case 0: // BR
-            gen(state, (unsigned long) gadget_arm64_br);
+            gen(state, (unsigned long) (retcache ? gadget_arm64_br_cached
+                                                 : gadget_arm64_br));
             gen(state, rn);
             break;
         case 1: // BLR
-            gen(state, (unsigned long) gadget_arm64_blr);
+            gen(state, (unsigned long) (retcache ? gadget_arm64_blr_cached
+                                                 : gadget_arm64_blr));
             gen(state, rn);
             gen(state, state->arm64_ip); // return address
             break;
         case 2: // RET
-            gen(state, (unsigned long) gadget_arm64_ret);
+            gen(state, (unsigned long) (retcache ? gadget_arm64_ret_cached
+                                                 : gadget_arm64_ret));
             gen(state, rn);
             break;
         default:
@@ -5436,8 +5454,26 @@ int gen_step_riscv64(struct gen_state *state, struct tlb *tlb) {
         {
             // Single gadget: target computed from rs1 BEFORE the link
             // write, so rd==rs1 (jalr ra, 0(ra)) follows the spec.
+            //
+            // The _cached variant adds a jit_frame.ret_cache lookup on the
+            // computed target and dispatches straight into an already-
+            // translated block instead of exiting to C; see jalr_cached in
+            // jit/guest-riscv64/alu.S. This is the whole lever: an instrumented
+            // count put this engine's JIT->C exits and its jalr count one apart,
+            // so essentially every round trip through the frontend is here.
+            //
+            // Emitted for EVERY jalr, not only the rd==0 return shape. The
+            // cache is keyed by the TARGET, not by a recorded call site, so an
+            // indirect call (rd!=0) and a `jr`/`jalr x0` tail call are the exact
+            // same lookup and want it for the same reason -- a PLT stub or a
+            // vtable dispatch lands on a function entry the frontend has
+            // dispatched before. Nothing in an entry says "return", so there is
+            // nothing to restrict, and restricting it would only forgo hits.
             extern void gadget_riscv64_jalr(void);
-            gen(state, (unsigned long) gadget_riscv64_jalr);
+            extern void gadget_riscv64_jalr_cached(void);
+            gen(state, (unsigned long)
+                    ((riscv64_jit_fuse_mask() & JIT_FUSE_RV_RETCACHE)
+                     ? gadget_riscv64_jalr_cached : gadget_riscv64_jalr));
             gen(state, riscv64_rd_off(rd));
             gen(state, riscv64_rs_off(rs1));
             gen(state, (uint64_t) riscv64_imm_i(insn));
@@ -10373,10 +10409,11 @@ static const struct jit_fuse_entry i386_fuse_names[] = {
 };
 static const struct jit_fuse_entry arm64_fuse_names[] = {
     {"bcond", JIT_FUSE_A64_BCOND}, {"ldst", JIT_FUSE_A64_LDST},
-    {"ldcmp", JIT_FUSE_A64_LDCMP},
+    {"ldcmp", JIT_FUSE_A64_LDCMP}, {"retcache", JIT_FUSE_A64_RETCACHE},
 };
 static const struct jit_fuse_entry riscv64_fuse_names[] = {
     {"fold", JIT_FUSE_RV_FOLD}, {"jal", JIT_FUSE_RV_JAL},
+    {"retcache", JIT_FUSE_RV_RETCACHE},
 };
 static const struct jit_fuse_entry amd64_fuse_names[] = {
     {"incdec_reg", JIT_FUSE_AMD64_INCDEC_REG},

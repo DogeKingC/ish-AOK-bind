@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "kernel/calls.h"
+#include "kernel/native.h"
 #include "kernel/task.h"
 #include "emu/memory.h"
 #include "emu/tlb.h"
@@ -404,6 +405,30 @@ struct task *task_create_(struct task *parent) {
     task->vfork = NULL;
     task->exit_signal = 0;
 
+    // Both of these are OWNED heap pointers, and `*task = *parent` above is a
+    // shallow copy, so leaving them aliased gives two tasks one allocation and
+    // whichever dies first frees it under the other. task_free_final does
+    // exactly that (native_exec_discard_pending, native_env_discard), and so
+    // does native_env_init on the child's own exec.
+    //
+    // That is not theoretical. Native bash assigns `environ = export_env`, so
+    // the task's environment vector IS bash's exported-variable array; every
+    // command bash ran spawned a child task that inherited the pointer and
+    // freed the array on its way out. The shell then read freed memory in
+    // add_or_supercede_exported_var and the app died on a null entry -- while
+    // running bash's own test suite, several commands after the one that
+    // caused it.
+    //
+    // Null rather than duplicate: a task made here is on its way to an execve,
+    // and the environment it ends up with is that call's envp. A native
+    // program asking before then gets an empty vector from native_env_slot.
+    task->native_env = NULL;
+    task->native_exec = NULL;
+    // The shim's signal bookkeeping describes the native program running in
+    // the PARENT; a fresh task has none until it becomes one.
+    task->native_prog_blocked = 0;
+    task->native_held = 0;
+
     lock_init(&task->general_lock, "task_creat_gen\0");
 
     task->sockrestart = (struct task_sockrestart) {};
@@ -471,6 +496,10 @@ void task_unlink_locked(struct task *task) {
 }
 
 static void task_free_final(struct task *task) {
+    // A native program recorded by execve but never reached -- the task died
+    // between the exec and its first execution (task_start failing, say).
+    native_exec_discard_pending(task);
+    native_env_discard(task);
     if (task != NULL && task_is_leader(task) && task->group != NULL) {
         cond_destroy(&task->group->child_exit);
         free(task->group->cgroup_path);
@@ -639,6 +668,14 @@ static void task_wait_for_mem_quiesce(struct task *task) {
 }
 
 void task_run_current(void) {
+    // A task whose image is a natively-implemented program never enters the
+    // emulator at all: it is dispatched here instead, and does not return. The
+    // execve entry points handle the ordinary case of an already-running task
+    // exec'ing one; this covers a task whose FIRST image is native, which is
+    // reached without any execve syscall returning -- the CLI's top-level
+    // command and kernel/init.c's boot-command launcher both land here.
+    native_exec_run_pending();
+
     struct task* save = current; // Because I kinda suspect that current gets messed up sometimes
     struct cpu_state *cpu = &save->cpu;
     struct tlb tlb = {};

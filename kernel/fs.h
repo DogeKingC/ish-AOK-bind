@@ -100,6 +100,12 @@ int generic_mkdirat(struct fd *at, const char *path, mode_t_ mode);
 int access_check(struct statbuf *stat, int check);
 int setattr_check(struct statbuf *stat, struct attr attr);
 
+// Write a HOST buffer to a guest fd number. write(2) copies from guest memory
+// first; code that already holds host memory -- natively-implemented programs
+// (kernel/native.h), which run as host code and never had a guest buffer --
+// needs to skip that copy rather than fake one.
+ssize_t fd_write_host_buf(fd_t fd_no, const void *buf, size_t size);
+
 // iSH-internal mount flag, NOT part of the guest mount(2) ABI. fs/mount.c's
 // sys_mount masks incoming guest flags to MS_FLAGS before calling do_mount(),
 // so a guest process can never set or clear this bit; only native do_mount()
@@ -118,6 +124,17 @@ struct mount {
     const char *point;
     size_t point_len;
     const char *source;
+    // Name reported for this mount in /proc/mounts and /proc/self/mountinfo
+    // (df's "Filesystem" column), when the real `source` is not worth showing
+    // the guest. The root's source is a host path -- on device one containing
+    // the app group UUID -- which df wraps onto its own line and which the
+    // guest can do nothing with, so the root reports its own name instead
+    // ("Devuan6-arm64"). NULL means "report source", which is every mount the
+    // guest itself made: mount(2) shows the string the guest passed, like
+    // Linux. Deliberately not a copy of source: realfs (fs/real.c) and iosfs
+    // (app/iOSFS.m) replace mount->source after the mount completes, and a
+    // snapshot taken here would go stale.
+    const char *display_source;
     const char *info;
     int flags;
     const struct fs_ops *fs;
@@ -153,8 +170,29 @@ extern lock_t mounts_lock;
 struct mount *mount_find(char *path);
 void mount_retain(struct mount *mount);
 void mount_release(struct mount *mount);
+// statfs for a mount, filling in the filesystem's magic and following a bind
+// to the mount that actually backs it. Every statfs(2)/fstatfs(2) variant goes
+// through this; call it rather than mount->fs->statfs, which is wrong for a
+// bind (see kernel/fs.c).
+int mount_statfs(struct mount *mount, struct statfsbuf *stat);
+
+// A copied snapshot of the mount table, for callers outside fs/mount.c. See
+// mount_snapshot's comment there for why the traversal cannot be done by the
+// caller. Free the returned array with free().
+struct mount_info {
+    char source[256];
+    char point[256];
+    char type[64];
+    struct statfsbuf statfs;
+    struct mount *mount; // for identity only; do not deref without the lock
+};
+int mount_snapshot(struct mount_info **out, size_t *count_out);
 // mountinfo/statx mount ID (1-based list position); see fs/mount.c
 int mount_id(struct mount *mount);
+// The st_dev files on this mount report, i.e. mountinfo's device field; asks
+// the filesystem rather than assuming, since only backing-less filesystems use
+// mount->fake_dev. Follows a bind to its origin. See fs/mount.c.
+dev_t_ mount_dev(struct mount *mount);
 
 // O_PATH|O_NOFOLLOW fd referring to a symlink itself; see fs/generic.c
 bool fd_is_opath_link(struct fd *fd);
@@ -162,6 +200,20 @@ struct fd *opath_link_fd_create(struct mount *mount, const char *path);
 int opath_link_fstat(struct fd *fd, struct statbuf *stat);
 struct mount *opath_link_get_mount(struct fd *fd);
 ssize_t opath_link_readlink(struct fd *fd, char *buf, size_t bufsize);
+
+// The name to report for a mount in /proc/mounts and /proc/self/mountinfo.
+static inline const char *mount_display_source(struct mount *mount) {
+    return mount->display_source != NULL ? mount->display_source : mount->source;
+}
+
+// Set the name the mount at `point` reports in /proc/mounts and
+// /proc/self/mountinfo, leaving mount->source (the host path the filesystem
+// code opens) alone. Takes mounts_lock, so call it without the lock held.
+int mount_set_display_source(const char *point, const char *display_source);
+
+// True if a filesystem is mounted at exactly `point` ("/" accepted for the
+// root). Takes mounts_lock, so call it without the lock held.
+bool mount_exists_at_point(const char *point);
 
 // must hold mounts_lock while calling these, or traversing mounts
 int do_mount(const struct fs_ops *fs, const char *source, const char *point, const char *info, int flags);
@@ -261,6 +313,12 @@ bool is_adhoc_fd(struct fd *fd);
 // filesystems
 extern const struct fs_ops procfs;
 extern const struct fs_ops aokfs;
+
+// If fd refers to a /AOK/native/<name> entry, the <name> that identifies the
+// natively-implemented program behind it (kernel/native.h); NULL otherwise.
+// Keyed off the already-resolved fd rather than the path execve was handed, so
+// a symlink from anywhere in the guest reaches the same program.
+const char *aokfs_native_program_name(struct fd *fd);
 extern const struct fs_ops fakefs;
 extern const struct fs_ops devptsfs;
 extern const struct fs_ops tmpfs;
@@ -273,6 +331,7 @@ extern const struct fs_ops cgroup2fs;
 // talk to, can find one.
 extern const struct fs_ops selinuxfs;
 void fs_register(const struct fs_ops *fs);
+const struct fs_ops *fs_lookup(const char *name); // by registered name, NULL if unknown
 char* get_filesystems(void); // For /proc/filesystems
 
 // System-wide bytes moved through file-backed fds (kernel/fs.c), feeding

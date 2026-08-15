@@ -15,16 +15,34 @@ if get_option('kernel') == 'ish'
     endif
 
     unicorn = disabler()
-    if host_machine.system() == 'darwin'
-        unicorn_dirs = ['/usr/local/lib']
+    # pkg-config first: unicorn ships a .pc, and it is the only source here that
+    # supplies the include path as well as the library.
+    unicorn = dependency('unicorn', required: false)
+    if not unicorn.found() and host_machine.system() == 'darwin'
+        # Homebrew, native prefix first. Each candidate carries its own include
+        # directory: the library alone is not enough, and pairing a library from
+        # one prefix with whatever header happens to be reachable is how this
+        # broke. /usr/local/include is an implicit clang search path on macOS, so
+        # an Intel Homebrew's unicorn header satisfied the compile with no -I
+        # flag and left nothing in build.ninja to notice it by -- the build only
+        # failed once that stale prefix was deleted, long after anything pointed
+        # at it.
         if host_machine.cpu_family() == 'aarch64'
-            unicorn_dirs = [
-                '/opt/homebrew/opt/unicorn/lib',
-                '/opt/homebrew/lib',
-            ]
+            unicorn_prefixes = ['/opt/homebrew/opt/unicorn', '/opt/homebrew', '/usr/local']
+        else
+            unicorn_prefixes = ['/usr/local/opt/unicorn', '/usr/local', '/opt/homebrew/opt/unicorn']
         endif
-        unicorn = cc.find_library('unicorn', dirs: unicorn_dirs, required: false)
-    else
+        foreach prefix : unicorn_prefixes
+            if not unicorn.found()
+                unicorn_lib = cc.find_library('unicorn', dirs: [prefix + '/lib'], required: false)
+                if unicorn_lib.found() and cc.has_header('unicorn/unicorn.h',
+                        include_directories: include_directories([prefix + '/include']))
+                    unicorn = declare_dependency(dependencies: [unicorn_lib],
+                        include_directories: include_directories([prefix + '/include']))
+                endif
+            endif
+        endforeach
+    elif not unicorn.found()
         unicorn = cc.find_library('unicorn', required: false)
     endif
     if unicorn.found()
@@ -35,16 +53,37 @@ endif
 
 libarchive = dependency('libarchive', required: false)
 if not libarchive.found()
-    # homebrew
-    libarchive_prefix = '/usr/local/opt/libarchive'
-    libarchive_lib = cc.find_library('archive', dirs: [libarchive_prefix + '/lib'], required: false)
-    if not libarchive_lib.found()
-        libarchive_prefix = '/opt/homebrew/opt/libarchive'
-        libarchive_lib = cc.find_library('archive', dirs: [libarchive_prefix + '/lib'], required: false)
+    # Homebrew, which is keg-only for libarchive (macOS ships its own), so it is
+    # not on the default pkg-config path and has to be found by prefix.
+    #
+    # Search the prefix for THIS machine's architecture first. A Mac that has
+    # ever run the Intel Homebrew keeps it at /usr/local alongside the Apple
+    # Silicon one at /opt/homebrew, and trying /usr/local first picked the
+    # x86_64 build on an arm64 host: find_library only looks for the file, so
+    # configure succeeded and the failure landed at link time as a wall of
+    # "Undefined symbols for architecture arm64" behind one easily-missed
+    # "ignoring file ... found architecture 'x86_64'". Seen on an M5 with a
+    # 2021 /usr/local install still present.
+    if host_machine.cpu_family() == 'aarch64'
+        libarchive_prefixes = ['/opt/homebrew/opt/libarchive', '/usr/local/opt/libarchive']
+    else
+        libarchive_prefixes = ['/usr/local/opt/libarchive', '/opt/homebrew/opt/libarchive']
     endif
-    if libarchive_lib.found()
-        libarchive = declare_dependency(dependencies: [libarchive_lib], include_directories: include_directories([libarchive_prefix + '/include']))
-    endif
+    foreach prefix : libarchive_prefixes
+        if not libarchive.found()
+            libarchive_lib = cc.find_library('archive', dirs: [prefix + '/lib'], required: false)
+            # find_library does not check the architecture, so confirm the
+            # library actually links before settling on it. Without this the
+            # ordering above is only a guess about which prefix is usable.
+            if libarchive_lib.found() and cc.links(
+                    '#include <archive.h>\nint main(void) { return archive_read_new() == 0; }',
+                    dependencies: [libarchive_lib],
+                    include_directories: include_directories([prefix + '/include']),
+                    name: 'libarchive in ' + prefix)
+                libarchive = declare_dependency(dependencies: [libarchive_lib], include_directories: include_directories([prefix + '/include']))
+            endif
+        endif
+    endforeach
 endif
 
 if libarchive.found()
