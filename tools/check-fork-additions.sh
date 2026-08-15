@@ -233,6 +233,20 @@ need_in kernel/hostinfo.h host_cpu_features "the runtime ARM feature query"
 need_in fs/proc/ish.c     cpu_features      "/proc/ish/cpu_features"
 need_in meson_options.txt ldapr             "the FEAT_LRCPC dispatch variant"
 
+# --- the native subsystem's non-Darwin gate --------------------------------
+# Upstream's native-program work (kernel/native_libc.c) is written against
+# BSD/macOS libc and does not compile on glibc. That is invisible to the iOS
+# build and fatal to this one: a Linux host is where run-guest-tests.sh and
+# run-arm64-guest-tests.sh run, so without the gate the entire test apparatus
+# stops building -- which is exactly what the 108-commit sync did before this.
+# A future sync that drops the gate would reproduce it, and the symptom is a
+# wall of errors in a file nobody here edited.
+need_file kernel/native_stubs.c
+need_in meson.build have_native \
+    "the non-Darwin gate; without it upstream's native libc breaks every Linux gate"
+need_in meson.build "kernel/native_stubs.c" \
+    "and the stub that stands in for it"
+
 # --- shared ---------------------------------------------------------------
 need_file kernel/ioctl_abi.h
 

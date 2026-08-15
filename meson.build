@@ -37,7 +37,25 @@ add_project_arguments('-Wno-switch', language: 'c')
 # weak_import included, so a build without deps/bash failed to link on the table
 # entry itself.
 fs_early = import('fs')
-have_bash = fs_early.exists('deps/bash/shell.c')
+
+# Whether the native-program subsystem (SmallCLUE, nextvi, bash compiled in as
+# HOST code) can be built at all. kernel/native_libc.c is written against
+# BSD/macOS libc -- funopen, BSD struct statfs, sockaddr sa_len, dirent
+# d_namlen, an off_t-compatible fpos_t, and static assertions that posix_spawn's
+# opaque types are plain pointers -- so it does not compile on glibc.
+#
+# That matters because the Linux host is not optional: it is where the guest
+# regression suites run, including tools/run-arm64-guest-tests.sh, the only
+# automated cover the arm64 gadget set has. Rather than port an iOS feature to a
+# host that never exercises it -- and carry edits in a file upstream is actively
+# developing, conflicting on every sync -- a non-Darwin build swaps in
+# kernel/native_stubs.c, which reports "no native programs in this build". That
+# is a state the design already handles: exec falls through to the ordinary
+# path and /AOK/native is served empty, exactly as on an iOS build whose
+# submodules were never populated.
+have_native = host_machine.system() == 'darwin'
+
+have_bash = fs_early.exists('deps/bash/shell.c') and have_native
 if have_bash
     # Populated but STALE is the case worth catching by name. A pull that moves
     # the submodule pointer does not move the submodule, so deps/bash can be a
@@ -278,11 +296,7 @@ if get_option('kernel') == 'ish'
 
         'kernel/fork.c',
         'kernel/exec.c',
-        'kernel/native.c',
-        'kernel/native_io.c',
-        'kernel/native_libc.c',
         'kernel/native_syscall.c', native_syscall_nums,
-        'kernel/smallclue_glue.c',
         'kernel/exit.c',
         'kernel/time.c',
         'kernel/mmap.c',
@@ -364,6 +378,13 @@ if get_option('kernel') == 'ish'
         'platform/' + host_machine.system() + '.c',
     ]
 
+    if have_native
+        src += files('kernel/native.c', 'kernel/native_io.c',
+                     'kernel/native_libc.c', 'kernel/smallclue_glue.c')
+    else
+        src += files('kernel/native_stubs.c')
+    endif
+
     # SmallCLUE, compiled in as HOST code so its applets run without being
     # translated (kernel/native.h). Two things make this unlike an ordinary
     # vendored dependency:
@@ -422,6 +443,12 @@ if get_option('kernel') == 'ish'
             check: false).returncode() == 0
 
     smallclue_src = []
+    # have_native gates the glue too: kernel/nextvi_glue.c is force-included
+    # with native_libc.h and calls into the nlibc_* surface. Kept separate from
+    # have_nextvi_src so the "not checked out" diagnostic below does not start
+    # lying on a host where native is simply not built.
+    have_nextvi_src = have_nextvi
+    have_nextvi = have_nextvi_src and have_native
     if have_nextvi
         smallclue_excluded += 'nextvi_stubs.c'
         # Supplies nextvi_main_entry over the renamed real one; see the file.
@@ -430,7 +457,7 @@ if get_option('kernel') == 'ish'
             warning('this Nextvi has no NEXTVI_PLATFORM_SPAWN seam in term.c, ' +
                     'so `!!` and `:!cmd` inside vi will report "fork failed"')
         endif
-    else
+    elif not have_nextvi_src
         # Loudly, because the runtime symptom is not: the stub's diagnostic is
         # written and then erased by the terminal reset SmallCLUE emits on the
         # way out, and the editor's status is discarded, so `vi` on a stub build
@@ -465,9 +492,16 @@ if get_option('kernel') == 'ish'
         '-w',  # vendored code, not ours to police
     ]
 
-    libsmallclue = static_library('smallclue', smallclue_src,
-        include_directories: [includes, smallclue_includes],
-        c_args: smallclue_c_args)
+    # Not built on a host that has no native subsystem to link it into: every
+    # translation unit here is force-included with kernel/native_libc.h and
+    # calls the nlibc_* redirections, which only exist when native_libc.c is in
+    # the build. See have_native above.
+    libsmallclue = []
+    if have_native
+        libsmallclue = static_library('smallclue', smallclue_src,
+            include_directories: [includes, smallclue_includes],
+            c_args: smallclue_c_args)
+    endif
 
     # Nextvi gets an archive of its own for one reason: a -D that must apply to
     # its translation unit and to no other. It is a program written to run once
@@ -477,7 +511,7 @@ if get_option('kernel') == 'ish'
     # Renaming through the compiler is how SmallCLUE's own CMake build already
     # turns Nextvi's main() into nextvi_main_entry.
     libnextvi = []
-    if have_nextvi
+    if have_nextvi and have_native
         nextvi_c_args = smallclue_c_args + ['-Dnextvi_main_entry=nextvi_editor_run']
         if have_nextvi_spawn
             nextvi_c_args += '-DNEXTVI_PLATFORM_SPAWN'
