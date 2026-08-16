@@ -135,6 +135,38 @@ need_file tools/cross-aarch64.ini
 need_file tools/run-arm64-guest-tests.sh
 need_in meson.build "host_machine.system() == 'linux'" \
     "a Linux cross build still produces the CLI executable to run"
+# The harness linked every test binary against the STATIC musl (its sysroot's
+# libc.so is a dangling symlink, so -lc silently fell back to libc.a) while
+# still setting a PT_INTERP. Two libcs, and any thread's TLS sized as though
+# the program had none -- which presents as the emulator faulting on a plain
+# TLS store. Both halves of the fix are load-bearing.
+need_in tools/run-arm64-guest-tests.sh "ld-musl-aarch64.so.1\" \]; then" \
+    "the ldso is copied in so -lc resolves to the shared libc"
+need_in tools/run-arm64-guest-tests.sh "NEEDED.*libc" \
+    "and a static fallback is caught rather than silently shipped"
+need_in tools/run-arm64-guest-tests.sh __getauxval \
+    "libgcc's LSE-atomics init still resolves against the shared libc"
+
+# --- arm64 guest: threads get their own stack and TLS -----------------------
+# Android's idmap2d dies in RefBase::incStrong with a null mRefs, from a binder
+# pool thread. Shared stacks or shared TLS would produce exactly that, so it is
+# asserted directly rather than reasoned about.
+need_file tests/manual/arm64/thread_identity.c
+need_in fs/aok-tests.manifest             arm64/thread_identity.c
+need_in tests/manual/setup-regressions.sh thread_identity
+
+# --- arm64 fault diagnostics ------------------------------------------------
+# A guest fault has to name the library and offset it happened at, and the one
+# it was CALLED from: an outline-atomics helper builds no frame, so without x30
+# a crash in one is unattributable. And the knob that dumps memory around a
+# register has to be reachable from a guest shell -- getenv reads the app's
+# environment, which no phone can set, so it was dev-machine-only.
+need_in kernel/calls.c "lr-backing" \
+    "an arm64 fault names the caller, not just the faulting helper"
+need_in kernel/calls.c arm64_faultdump_set \
+    "the fault memdump is settable at runtime, not only from the environment"
+need_in fs/proc/ish.c  arm64_faultdump \
+    "and is exposed at /proc/ish/arm64_faultdump"
 
 # --- permissive SELinux stub ----------------------------------------------
 need_file fs/selinuxfs.c

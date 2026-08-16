@@ -394,7 +394,80 @@ one log line, one variable, and it gets from "exit 1, silently" to running its
 own startup. It is set by init in a real Android, which is why nothing here
 supplies it.
 
-Both remaining crashes are null dereferences, and neither is understood yet.
+Both remaining crashes are null dereferences. `idmap2d`'s is now identified
+exactly; `installd`'s is not.
+
+### idmap2d: `RefBase::incStrong` on an object whose `mRefs` is null
+
+The whole diagnosis came out of `dmesg`, off the shipping build, with no new
+instrumentation and no tombstone:
+
+```
+ERROR: 2981(binder:2981_2) [arm64] page fault on 0x4 at 0x7fffb359ca80 (write)
+  x0=0x1 x1=0x4 ... x19=0 x20=0x7ffd33224ba8 ...
+  x29=0xffffe7f0 x30=0x7fffb3593030
+  sp=0xffffe7f0 pc=0x7fffb359ca80 tpidr=0x7fffbcd11d40
+  pc-backing 0x7fffb359ca80: /system/lib64/libutils.so data_off=40960 file_off=65536
+opcode window around 0x7fffb359ca80: 70 00 00 34 [20]00 20 b8 c0 03 5f d6 ...
+```
+
+**`pc-backing` is the line that matters, and it names a file offset.** The
+page's offset in the file is `file_off + data_off` (`0x10000 + 0xa000`), plus
+the address's offset within its page (`0xa80`), so `pc` is `libutils.so+0x1aa80`
+and `x30` -- one page lower -- is `libutils.so+0x11030`. Both are directly
+`objdump`-able. `dump_addr_backing` now prints that sum itself (`-> file+0x...`)
+because computing it by hand off three fields is where the mistakes happen.
+
+Disassembling `libutils.so+0x11010`, the function `x30` returns into:
+
+```
+stp x29, x30, [sp,#-0x20]!
+ldr x19, [x0, #8]          ; x19 = this->mRefs   (RefBase's only field, at 8)
+mov x20, x0                ; x20 = this
+mov w0, #1
+add x1, x19, #4            ; &mRefs->mWeak       (weakref_impl: mStrong 0, mWeak 4)
+bl  __aarch64_ldadd4_relax ; <- returns to x30; the LDADD inside is the fault
+cmp w0, #0x100, lsl #12
+mov x1, x19                ; &mRefs->mStrong
+bl  __aarch64_ldadd4_relax
+mov w8, #0x10000000        ; INITIAL_STRONG_VALUE
+```
+
+That is `android::RefBase::incStrong()`, and the registers agree exactly:
+`x1 = 4`, `x19 = 0`, `x20` a plausible object pointer. `mRefs` is a
+`weakref_impl* const` assigned in `RefBase`'s constructor, so **a constructed
+object cannot have it null**. `x7` held the bytes of `":2981_3"`, so this is
+`ProcessState::spawnPooledThread` building the *third* pool thread's name --
+the first two went through the same `sp<T>::make` -> `incStrong` path without
+faulting, which makes it state-dependent rather than a broken code path.
+
+**The fault is a real guest-side null dereference, not a tagged pointer and not
+an intercepted function.** The faulting instruction has a memory operand
+(`LDADD W0, W0, [X1]`) and `x1` is genuinely 4. The reason it *looked* like a
+register-only instruction at first is that it sits inside an outline-atomics
+dispatch stub, which builds no stack frame -- so `pc` names a compiler helper
+and nothing names the caller. That is why `lr-backing` (x30) is now printed
+unconditionally on an arm64 fault: without it a crash in one of those stubs is
+unattributable, and `dump_stack` walks the emulator's stack, not the guest's.
+
+Two hypotheses were cheap enough to test and both are **ruled out** by
+`tests/manual/arm64/thread_identity.c` under the local harness: binder pool
+threads sharing a stack, and binder pool threads sharing a thread pointer.
+Under iSH every spawned thread gets its own high mmap'd stack and its own
+`TPIDR_EL0`, TLS stays private under concurrent traffic, and a once-written
+object pointer survives concurrent relaxed atomics through it. The device's
+identical `tpidr` across three runs is a deterministic allocator, not sharing.
+(`sp` around `0xffffe800` for a pool thread is still unexplained and is the one
+loose thread left in that register block.)
+
+What remains is to look at the object itself. `/proc/ish/arm64_faultdump`
+exists for exactly that: `echo 19,20 > /proc/ish/arm64_faultdump` makes the next
+arm64 fault dump guest memory around `x19` and `x20`, so the next reproduction
+shows whether the object is entirely zero (never constructed) or constructed
+with only `mRefs` missing (a lost store). It used to be readable only from
+`ISH_ARM64_FAULT_MEMDUMP` in the environment, which on iOS is the *app's*
+environment -- so the one diagnostic that could answer this was unreachable on
+the only machine where the bug happens.
 
 **There are no tombstones, and there will not be.** Android's own account of a
 native crash comes from `debuggerd`, which forks `crash_dump64` (it lives in
@@ -492,7 +565,19 @@ driver which alignment rule it implements, run first against known-good and
 known-bad local builds and then against the device. **Fingerprint the
 behaviour; do not date the binary.**
 
-The common shape in all three: a strong signal -- a precise PC, a green suite,
+**A test that crashes is not yet evidence about the thing you are testing.**
+`thread_identity.c` was written to test whether iSH gives binder pool threads
+their own stacks and TLS, and it segfaulted on the first run -- on the exact
+operation it was probing, a `__thread` write. That is as close to a confirmed
+hypothesis as a first run ever looks. Running it under plain qemu-user with no
+iSH in the picture at all took one minute and it crashed there too, which
+turned "the emulator loses thread TLS" into "the harness links every test
+against the wrong libc" (see the harness section below). **Before a failure is
+attributed to the component under test, run it without that component.** Here
+the component was removable in a single command; when it is not, that cost is
+worth paying anyway.
+
+The common shape in all four: a strong signal -- a precise PC, a green suite,
 a plausible timeline -- was treated as an answer when it was only evidence
 about a narrower question. The cheap diagnostics in this document
 (`/proc/ish/binder`, `/proc/ish/property_area`, `dmesg`, `binder_ping`) and a
@@ -546,8 +631,22 @@ that tree's `dev/__properties__`.
 1. **The two null dereferences.** `installd` faults at `0x0` just after
    `installd firing up`; `idmap2d` faults at `0x4` in a binder thread just
    after registering `idmap`. Start from iSH's own `page fault ... opcode
-   window` line in `dmesg` -- it names the guest PC, which `addr2line` resolves
-   against the binary -- rather than waiting on a tombstone that will not come.
+   window` line in `dmesg` -- it names the guest PC and, via `pc-backing` and
+   `lr-backing`, the library and file offset of both the faulting instruction
+   and its caller -- rather than waiting on a tombstone that will not come.
+
+   For `idmap2d` the function is now known (`RefBase::incStrong` with a null
+   `mRefs`, see above) and the next step is one command on device:
+   `echo 19,20 > /proc/ish/arm64_faultdump`, reproduce, and read the memory
+   dump. An object that is entirely zero was never constructed; an object with
+   a plausible vptr and only `mRefs` missing is a lost store, which is an
+   emulator bug and a very different search. Do not guess between those two --
+   the guess is free to make and expensive to be wrong about, and the dump
+   settles it.
+
+   Apply the same treatment to `installd` rather than assuming it is the same
+   bug: its fault address is `0x0`, not `0x4`, so it is at best the same
+   *class*.
 2. **A `tombstoned` sink**, if those two do not yield to the above. It would
    give Android's own stack traces for every native crash. Same shape as
    `kernel/logd_sink.c` but with fd passing, so a bigger job; worth it only if
@@ -604,7 +703,7 @@ than was known ("would sleep forever ... has never reproduced"):
 So the honest status is: the old code was **unsound** (a discarded wakeup with
 no guaranteed second chance) and demonstrably discarded wakeups in bulk, but no
 sequence was found that strands a receiver. The fix is cheap, removes the
-mechanism rather than the symptom, and costs nothing at 8/8 and 9/9 -- worth
+mechanism rather than the symptom, and costs nothing across both suites -- worth
 having on those grounds alone. It should not be described as having fixed an
 observed hang, because it did not.
 
@@ -698,7 +797,27 @@ the emulator a tagged pointer any more.
 `tools/run-arm64-guest-tests.sh` cross-builds iSH for aarch64-linux (clang,
 `tools/cross-aarch64.ini`) and runs `tests/manual/arm64/*` under qemu-user
 against a real Alpine aarch64 rootfs, so the arm64 gadget set executes for
-real on an x86_64 development machine. All nine tests pass there today.
+real on an x86_64 development machine. All eleven tests pass there today.
+
+**Every test binary it built used to be statically linked musl carrying a
+`PT_INTERP`,** and nothing said so. `musl-dev` ships `usr/lib/libc.so` as a
+symlink to the ldso, but the ldso lives in the `musl` package, so inside the
+harness's sysroot that symlink dangled; lld cannot follow it, says nothing, and
+satisfies `-lc` from `libc.a` instead. The binaries then ran with two copies of
+libc: the dynamic musl set the main thread's TLS up from `PT_TLS`, while
+`pthread_create` came from the static copy, whose `libc.tls_size` its own
+`__init_tls` never filled in. So a spawned thread's TLS block was sized as
+though the program had no TLS at all. One `__thread` variable fitted in the
+slack; **the second one faulted on first write, in the thread, with no
+diagnostic** -- which reads exactly like the emulator faulting on a plain TLS
+store, and is an expensive thing to believe while hunting an emulator bug.
+
+The fix is to copy the ldso into the sysroot so `-lc` resolves to the real
+shared libc, plus a one-function `__getauxval` shim (Alpine defines that alias
+only in `libc.a`, and libgcc's LSE-atomics initializer calls it -- it had been
+resolving through the same accidental static link). The runner now also
+verifies each binary has a `DT_NEEDED` for libc and fails loudly if it does
+not, because the failure mode is silent and points at the wrong component.
 
 It is stricter about tags than real hardware, which is a feature: an arm64
 core IGNORES bits 56-63 on a dereference, so a path that forgets to mask still

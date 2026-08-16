@@ -130,6 +130,35 @@ if [ ! -f "$SYSROOT/usr/lib/libc.a" ]; then
     exit 1
 fi
 
+# musl-dev ships usr/lib/libc.so as a symlink to ../../lib/ld-musl-aarch64.so.1
+# -- the ldso IS the shared libc -- but the ldso itself lives in the `musl`
+# package, not `musl-dev`, so inside this sysroot that symlink dangles. lld
+# cannot follow it, says nothing, and quietly satisfies -lc from libc.a
+# instead. The result still links and still runs, which is why this survived
+# ten tests and several sessions:
+#
+#   every test binary was STATICALLY linked musl that also carried a
+#   PT_INTERP, so the dynamic musl loaded too and two copies of libc were
+#   live at once.
+#
+# The main thread works, because the ldso sets its TLS up from PT_TLS. Threads
+# do not: pthread_create runs out of the static copy, whose libc.tls_size was
+# never initialized by its own __init_tls, so a spawned thread's TLS block is
+# sized as though the program had none. One __thread variable fits in the
+# slack; the second lands past the end of the mapping and the thread takes a
+# SIGSEGV on first write. Nothing reports a link problem -- it presents as the
+# emulator faulting on a plain TLS store, which is an expensive thing to
+# believe. Copying the ldso in makes -lc resolve to the real shared libc
+# (DT_NEEDED libc.musl-aarch64.so.1 appears, and the binaries become dynamic,
+# which is what -Wl,-dynamic-linker was asking for all along).
+if [ ! -f "$SYSROOT/lib/ld-musl-aarch64.so.1" ]; then
+    mkdir -p "$SYSROOT/lib"
+    cp "$ROOTFS/lib/ld-musl-aarch64.so.1" "$SYSROOT/lib/ld-musl-aarch64.so.1" || {
+        echo "could not copy the musl ldso into $SYSROOT/lib" >&2
+        exit 1
+    }
+fi
+
 # -nostdlibinc above, not -nostdinc: the musl sysroot supplies the C library
 # headers, but stdatomic.h, arm_neon.h and the rest of the compiler's own
 # resource headers still have to come from clang, and several of these tests
@@ -150,6 +179,29 @@ fi
 LIBGCC=$(ls /usr/lib/gcc-cross/aarch64-linux-gnu/*/libgcc.a \
             /usr/lib/gcc/aarch64-linux-gnu/*/libgcc.a 2>/dev/null | head -1 || true)
 
+# libgcc's LSE-atomics initializer calls __getauxval to read HWCAP. Alpine
+# defines that alias in libc.a but the shared libc exports only getauxval, so
+# linking against the real shared musl (which is what we now do) leaves it
+# undefined -- it was previously satisfied by accident, through the same
+# unintended static link that broke thread TLS. One forwarding shim settles it
+# for every test, and keeps the outline-atomics dispatch working, which matters
+# here: __aarch64_ldadd4_relax is exactly the helper Android's RefBase crash
+# goes through, so these tests must exercise the same lowering the device does.
+SHIM_SRC=$WORK/getauxval_shim.c
+SHIM_OBJ=$WORK/getauxval_shim.o
+if [ ! -f "$SHIM_OBJ" ] || [ "$SHIM_SRC" -nt "$SHIM_OBJ" ]; then
+    cat >"$SHIM_SRC" <<'SHIM'
+#include <sys/auxv.h>
+unsigned long __getauxval(unsigned long type);
+unsigned long __getauxval(unsigned long type) { return getauxval(type); }
+SHIM
+    clang --target=aarch64-linux-musl -O2 -c -nostdlibinc \
+        -isystem "$SYSROOT/usr/include" -o "$SHIM_OBJ" "$SHIM_SRC" || {
+        echo "could not build the __getauxval shim" >&2
+        exit 1
+    }
+fi
+
 fail=0
 for test_name in "${TESTS[@]}"; do
     src=$SRC/tests/manual/arm64/$test_name.c
@@ -164,12 +216,28 @@ for test_name in "${TESTS[@]}"; do
             -nostdlib -pie -Wl,-dynamic-linker,/lib/ld-musl-aarch64.so.1 \
             "$SYSROOT/usr/lib/Scrt1.o" "$SYSROOT/usr/lib/crti.o" \
             -o "$out" "$src" \
+            "$SHIM_OBJ" \
             -L"$SYSROOT/usr/lib" -lc ${LIBGCC:+"$LIBGCC"} \
             "$SYSROOT/usr/lib/crtn.o" 2>"$WORK/$test_name.cc.log"; then
         echo "FAIL $test_name (did not compile)"
         head -10 "$WORK/$test_name.cc.log" >&2
         fail=1
         continue
+    fi
+
+    # The link above must produce a DYNAMIC musl binary. If -lc ever falls back
+    # to libc.a again (a dangling libc.so is all it takes) the binary still
+    # builds and still runs, and the damage shows up only as threads with
+    # undersized TLS -- read as an emulator fault, at the cost of a session.
+    # See the ldso copy near the sysroot setup. readelf is not guaranteed
+    # present, so this checks when it can and stays quiet when it cannot.
+    if command -v readelf >/dev/null 2>&1; then
+        if ! readelf -dW "$out" 2>/dev/null | grep -q 'NEEDED.*libc'; then
+            echo "FAIL $test_name (linked static musl but kept a PT_INTERP:" \
+                 "no DT_NEEDED for libc -- threads will get undersized TLS)"
+            fail=1
+            continue
+        fi
     fi
 
     output=$(timeout 300 qemu-aarch64-static "$ISH" -r "$ROOTFS" "/$test_name" 2>&1 |
