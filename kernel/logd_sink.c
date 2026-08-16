@@ -94,9 +94,17 @@ static char logd_path[MAX_PATH + 1];
 static char logd_host_path[MAX_PATH + 1];
 // Held for the sink's lifetime; see unix_socket_host_path_for.
 static struct inode_data *logd_inode;
+// Set before the drain thread is woken, so it can tell "the sink is going
+// away" from an ordinary datagram. See logd_stop().
+static volatile bool logd_stopping;
 static unsigned long logd_records;
 static unsigned long logd_malformed;
 static int logd_last_err;
+// Which operation failed, not just its errno. "error -1" told us EPERM and
+// nothing else; the cause was the bind, at a path that was wrong because it
+// was computed before sock_tmp_prefix had been set. Naming the step is the
+// difference between that and another round trip.
+static const char *logd_last_step = "";
 
 // Android priorities are 0..7; the letter is what logcat prints and what
 // anyone reading dmesg will recognise.
@@ -191,10 +199,15 @@ static void *logd_drain(void *arg) {
     char line[LOGD_MAX_RECORD + 128];
     for (;;) {
         ssize_t n = recv(fd, pkt, sizeof(pkt), 0);
+        // Checked before anything else, and before any lock: this is how the
+        // thread leaves. Closing the fd under a blocking recv does NOT
+        // reliably return, so the teardown wakes us with a datagram instead.
+        if (logd_stopping)
+            break;
         if (n < 0) {
             if (errno == EINTR)
                 continue;
-            break; // the socket was closed under us: this sink is done
+            break;
         }
         if (n == 0)
             continue;
@@ -217,23 +230,60 @@ static void *logd_drain(void *arg) {
     return NULL;
 }
 
-// Tears down a running sink. Called with logd_lock held.
-static void logd_stop_locked(void) {
-    if (!logd_running)
+// Tears down a running sink. Called WITHOUT logd_lock, deliberately.
+//
+// Two things here are load-bearing and both were learned by hanging on them:
+//
+//  - The drain thread is woken with a datagram, not by closing the fd. A
+//    blocking recv(2) does not reliably return when another thread closes the
+//    descriptor, so the close-then-join version wedged forever -- and since
+//    this runs from a write to /proc/ish/logd, it wedged the writing process
+//    too. It only escaped notice because the first device to try it had no
+//    running sink to stop.
+//  - The lock is NOT held across pthread_join. The drain thread takes
+//    logd_lock to bump its counters, so joining while holding it deadlocks the
+//    pair.
+static void logd_stop(void) {
+    lock(&logd_lock, 0);
+    if (!logd_running) {
+        unlock(&logd_lock);
         return;
+    }
+    logd_running = false;
+    logd_stopping = true;
     int fd = logd_fd;
     logd_fd = -1;
-    logd_running = false;
-    // Closing the fd is what ends the drain thread's blocking recv.
+    pthread_t thread = logd_thread;
+    char host[MAX_PATH + 1];
+    snprintf(host, sizeof(host), "%s", logd_host_path);
+    unlock(&logd_lock);
+
+    // One datagram to our own address, purely to return the blocked recv.
+    int waker = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (waker >= 0) {
+        struct sockaddr_un un;
+        memset(&un, 0, sizeof(un));
+        un.sun_family = AF_UNIX;
+        if (strlen(host) < sizeof(un.sun_path)) {
+            strcpy(un.sun_path, host);
+            (void) !sendto(waker, "", 1, 0, (struct sockaddr *) &un, sizeof(un));
+        }
+        close(waker);
+    }
+
+    pthread_join(thread, NULL);
     if (fd >= 0)
         close(fd);
-    pthread_join(logd_thread, NULL);
-    if (logd_host_path[0] != '\0')
-        unlink(logd_host_path);
+    if (host[0] != '\0')
+        unlink(host);
+
+    lock(&logd_lock, 0);
     if (logd_inode != NULL) {
         inode_release(logd_inode);
         logd_inode = NULL;
     }
+    logd_stopping = false;
+    unlock(&logd_lock);
 }
 
 int logd_sink_create(const char *prefix) {
@@ -252,11 +302,14 @@ int logd_sink_create(const char *prefix) {
     snprintf(dir, sizeof(dir), "%.*s%s", (int) prefix_len, prefix, LOGD_SOCKET_DIR);
     snprintf(path, sizeof(path), "%.*s%s", (int) prefix_len, prefix, LOGD_SOCKET_PATH);
 
+    logd_stop(); // takes and releases logd_lock itself; must not be held here
+
     lock(&logd_lock, 0);
-    logd_stop_locked();
     logd_last_err = 0;
+    logd_last_step = "";
 
     // /dev/socket is init's directory; nothing else creates it here.
+    logd_last_step = "mkdir /dev/socket";
     int err = generic_mkdirat(AT_PWD, dir, 0755);
     if (err < 0 && err != _EEXIST)
         goto fail;
@@ -265,15 +318,18 @@ int logd_sink_create(const char *prefix) {
     // boot has an id whose host socket is long gone, and bind() refuses to
     // reuse an existing name anyway.
     generic_unlinkat(AT_PWD, path);
+    logd_last_step = "mknod logdw";
     err = generic_mknodat(AT_PWD, path, S_IFSOCK | 0666, 0);
     if (err < 0)
         goto fail;
 
+    logd_last_step = "resolve host path";
     err = unix_socket_host_path_for(path, logd_host_path, sizeof(logd_host_path),
                                     &logd_inode);
     if (err < 0)
         goto fail;
 
+    logd_last_step = "socket()";
     int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (fd < 0) {
         err = errno_map();
@@ -289,6 +345,7 @@ int logd_sink_create(const char *prefix) {
     }
     strcpy(un.sun_path, logd_host_path);
     unlink(logd_host_path); // ours from a previous run, if anything
+    logd_last_step = "bind() the host socket";
     if (bind(fd, (struct sockaddr *) &un, sizeof(un)) < 0) {
         // The real errno, not a guess. Reporting EADDRINUSE for every bind
         // failure sent the first device diagnosis down the wrong path: the
@@ -320,7 +377,6 @@ fail:
         logd_inode = NULL;
     }
     logd_last_err = err;
-    logd_host_path[0] = '\0';
     snprintf(logd_path, sizeof(logd_path), "%s", path);
     unlock(&logd_lock);
     return err;
@@ -343,8 +399,13 @@ void logd_sink_start(void) {
 int logd_sink_show(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     lock(&logd_lock, 0);
     if (!logd_running) {
-        proc_printf(buf, "no sink: %s (error %d)\n",
-                    logd_path[0] != '\0' ? logd_path : LOGD_SOCKET_PATH, logd_last_err);
+        proc_printf(buf, "no sink: %s (error %d at: %s)\n",
+                    logd_path[0] != '\0' ? logd_path : LOGD_SOCKET_PATH,
+                    logd_last_err, logd_last_step[0] != '\0' ? logd_last_step : "?");
+        // The host path is what identifies a wrong sock_tmp_prefix, so keep it
+        // on the failure line rather than clearing it.
+        if (logd_host_path[0] != '\0')
+            proc_printf(buf, "tried host %s\n", logd_host_path);
     } else {
         proc_printf(buf, "path %s\n", logd_path);
         proc_printf(buf, "host %s\n", logd_host_path);

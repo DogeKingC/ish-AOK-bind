@@ -233,5 +233,42 @@ int main(int argc, char **argv) {
     }
 
     close(fd);
+
+    // Rebuilding a RUNNING sink. This hung: the teardown closed the socket and
+    // joined the drain thread, but a blocking recv(2) does not reliably return
+    // when another thread closes the fd, so the write to /proc/ish/logd never
+    // came back. It escaped the first device run only because the sink there
+    // had failed at boot, leaving nothing to stop. The alarm() at the top of
+    // main is what turns a regression here into a failure rather than a hang.
+    int pfd = open("/proc/ish/logd", O_WRONLY);
+    if (pfd >= 0) {
+        check(write(pfd, "/", 1) == 1, "rebuilding a live sink returns");
+        close(pfd);
+        char again[4096];
+        if (proc_ish_logd(again, sizeof(again)) == 0)
+            check(strstr(again, "no sink") == NULL, "and the rebuilt sink is up");
+
+        // And it still works afterwards.
+        int fd2 = socket(AF_UNIX, SOCK_DGRAM, 0);
+        struct sockaddr_un un2;
+        memset(&un2, 0, sizeof(un2));
+        un2.sun_family = AF_UNIX;
+        snprintf(un2.sun_path, sizeof(un2.sun_path), "%s", LOGDW);
+        if (fd2 >= 0 && connect(fd2, (struct sockaddr *) &un2, sizeof(un2)) == 0) {
+            char rec2[512];
+            const char *msg2 = "after the rebuild 0xREBUILT";
+            size_t l2 = build_record(rec2, LOG_ID_MAIN, ANDROID_LOG_ERROR, "ishRebuild", msg2);
+            if (write(fd2, rec2, l2) == (ssize_t) l2) {
+                int seen2 = 0;
+                for (int i = 0; i < 50 && !seen2; i++) {
+                    usleep(20000);
+                    seen2 = kmsg_contains(msg2) == 1;
+                }
+                check(seen2, "and still delivers records");
+            }
+            close(fd2);
+        }
+    }
+
     return finish_suite("logd_sink");
 }

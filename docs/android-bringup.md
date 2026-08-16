@@ -361,6 +361,15 @@ Within two datagrams of the first real capture, both previously invisible:
   buffer size: Invalid argument`. Nothing in `kernel/` or `fs/` implements
   either `F_SETPIPE_SZ` or `F_GETPIPE_SZ`. Small, and now the top of the
   remaining work.
+- **The boot-time sink never came up on device, and it was an ordering bug.**
+  `logd_sink_start()` ran 372 lines before `sock_tmp_prefix` was set in
+  `-[AppDelegate boot]`, so the sink bound its host socket at the literal
+  `/tmp/ishsock.<id>` -- outside the app sandbox on a real device, hence
+  `EPERM`. It worked in the simulator, where the `#if !TARGET_OS_SIMULATOR`
+  leaves the default alone and `/tmp` is writable, and it worked when rebuilt
+  by hand through `/proc/ish/logd` afterwards, which is exactly what made it
+  look like anything other than an ordering problem. The call now sits after
+  the assignment, with a comment saying why it may not move back.
 - **A servicemanager `SIGABRT`**, reported by libc as `Fatal signal 6
   (SIGABRT), code -1 (SI_QUEUE) in tid 83 (servicemanager)`. This one is NOT
   yet understood and may well be an artefact of the capture run, which killed

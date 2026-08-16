@@ -2479,9 +2479,7 @@ static TerminalViewController *CreateTerminalViewController(void) {
     // never outlives the session that wrote it. Without it every libbinder
     // client spins on servicemanager.ready and never opens the driver above.
     property_area_create();
-    // Somewhere for Android's liblog to write, so a failing process says why
-    // instead of dying silently. See kernel/logd_sink.c.
-    logd_sink_start();
+
 
     generic_mkdirat(AT_PWD, "/dev/pts", 0755);
 
@@ -2855,6 +2853,20 @@ static TerminalViewController *CreateTerminalViewController(void) {
     NSString *sockTmp = [NSTemporaryDirectory() stringByAppendingString:@"ishsock"];
     sock_tmp_prefix = strdup(sockTmp.UTF8String);
 #endif
+
+    // Somewhere for Android's liblog to write, so a failing process says why
+    // instead of dying silently. See kernel/logd_sink.c.
+    //
+    // AFTER sock_tmp_prefix, and that is the whole point of it being here
+    // rather than up with the device nodes. The sink binds a host socket at
+    // sock_tmp_prefix.<id>, and until the line above runs that prefix is the
+    // literal "/tmp/ishsock" -- a path outside the app sandbox on a real
+    // device, so the bind failed with EPERM and the sink was never up. It
+    // worked in the simulator (where the #if leaves the default alone and /tmp
+    // is writable) and it worked when rebuilt by hand later through
+    // /proc/ish/logd, which is what made it look like something other than an
+    // ordering bug.
+    logd_sink_start();
     
     tty_drivers[TTY_CONSOLE_MAJOR] = &ios_console_driver;
     set_console_device(TTY_CONSOLE_MAJOR, 1);
