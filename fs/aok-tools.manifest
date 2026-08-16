@@ -32,5 +32,6 @@ crypto/install-crypto-accel.sh
 crypto/ish_provider.c
 crypto/README.md
 android/chroot-setup.sh
+android/crash-probe.sh
 android/root-profile.sh
 android/README.md

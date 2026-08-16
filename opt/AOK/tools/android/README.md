@@ -39,6 +39,37 @@ cat /proc/ish/property_area
 A process that already started keeps the area it mapped, so restart the
 process too.
 
+## When a daemon dies with a signal
+
+```sh
+sh /AOK/tools/android/crash-probe.sh -r 19,20 idmap2d
+```
+
+That reproduces the crash and prints, in one go: the exit status, the daemon's
+own output, the fault block, and any logging it managed before dying. The
+order matters and the script exists because getting it wrong wastes the
+reproduction -- the memory dump has to be armed *before* the run, and `dmesg`
+has to be read back unfiltered, since the fault block is not a `logd/` line.
+
+The two lines to look for are `pc-backing` and `lr-backing`. Each names a
+library and a resolved `file+0x...` offset, which disassembles directly on a
+development machine:
+
+```sh
+llvm-objdump -d --start-address=0x11010 --stop-address=0x11090 \
+    system/lib64/libutils.so
+```
+
+`lr-backing` is the one that is easy to overlook and usually the one you want:
+an outline-atomics helper builds no stack frame, so the faulting `pc` names a
+compiler stub and only the link register names the code that called it.
+
+There are no tombstones on this platform and there will not be -- `crash_dump64`
+needs a `tombstoned` socket that does not exist -- so this is the whole
+account of a native crash. It has been enough: `idmap2d`'s was identified as
+`RefBase::incStrong` on an object with a null `mRefs` from exactly this output,
+with no debugger and no symbols.
+
 ## As an iSH root
 
 `root-profile.sh` is the session profile: copy it into the tree as

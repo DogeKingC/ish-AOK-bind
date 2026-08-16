@@ -275,6 +275,11 @@ need_in tests/manual/setup-regressions.sh pipe_size
 # --- Android chroot setup --------------------------------------------------
 need_file opt/AOK/tools/android/chroot-setup.sh
 need_file opt/AOK/tools/android/root-profile.sh
+# One command for the whole crash-reproduction sequence, which has a fixed
+# order that is expensive to get wrong: arm the memdump BEFORE the run, and
+# read dmesg back UNFILTERED (grep logd/ drops the fault block).
+need_file opt/AOK/tools/android/crash-probe.sh
+need_in fs/aok-tools.manifest android/crash-probe.sh "shipped to /AOK/tools on the device"
 need_in fs/aok-tools.manifest android/chroot-setup.sh "shipped to /AOK/tools on the device"
 need_file docs/android-bringup.md
 # Builds the tree everything above is tested against. Its DT_NEEDED closure
