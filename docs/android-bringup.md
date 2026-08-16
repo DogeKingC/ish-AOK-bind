@@ -370,13 +370,71 @@ Within two datagrams of the first real capture, both previously invisible:
   by hand through `/proc/ish/logd` afterwards, which is exactly what made it
   look like anything other than an ordering problem. The call now sits after
   the assignment, with a comment saying why it may not move back.
-- **A servicemanager `SIGABRT`**, reported by libc as `Fatal signal 6
-  (SIGABRT), code -1 (SI_QUEUE) in tid 83 (servicemanager)`. This one is NOT
-  yet understood and may well be an artefact of the capture run, which killed
-  and immediately restarted servicemanager -- a fresh one finding the binder
-  context manager still claimed would `CHECK`-fail and abort. Servicemanager
-  is healthy in ordinary use on the same build (see below). Do not treat it as
-  a known bug until it has been reproduced from a clean start.
+- **A servicemanager `SIGABRT`** -- since **resolved, and it was not a bug**.
+  It was an artefact of the capture run, which killed and immediately
+  restarted servicemanager. A clean start on the same build produces no abort
+  at all. Recorded because the wrong conclusion was available and cheap: a
+  fatal signal in a log looks like a finding.
+
+### What the daemons say now
+
+With the sink up, running each HAL-free daemon and reading its own words:
+
+| daemon | outcome |
+|---|---|
+| `servicemanager` | starts, registers, serves `checkService` |
+| `incidentd` | starts, registers `incident` |
+| `apexd` | **exits 0** -- runs to completion |
+| `installd` | `Could not find ANDROID_DATA` -> with `ANDROID_DATA=/data` set it reaches `installd firing up`, then `SIGSEGV` at `0x0` |
+| `idmap2d` | logs `Starting`, registers `idmap`, then `SIGSEGV` at `0x4` in a **binder thread** |
+| `hwservicemanager` | absent from the image |
+
+`installd`'s environment is the kind of thing that was simply invisible before:
+one log line, one variable, and it gets from "exit 1, silently" to running its
+own startup. It is set by init in a real Android, which is why nothing here
+supplies it.
+
+Both remaining crashes are null dereferences, and neither is understood yet.
+
+**There are no tombstones, and there will not be.** Android's own account of a
+native crash comes from `debuggerd`, which forks `crash_dump64` (it lives in
+`/apex/com.android.runtime/bin/`, not `/system/bin`). That process execs fine
+by hand, but in the crash path it hangs and bionic gives up after ~30s with
+`crash_dump helper failed to exec, or was killed` -- the 31 seconds between the
+crash line and that line in `dmesg` is the whole diagnosis. It needs
+`tombstoned` on `/dev/socket/tombstoned` to hand it somewhere to write, and
+that socket does not exist. A tombstoned sink is buildable the same way the
+logd one was, but it passes file descriptors rather than datagrams, so it is a
+bigger job than `kernel/logd_sink.c` and has not been done.
+
+**Do not go looking for a stack trace before reading what is already there.**
+iSH reports a fatal guest fault itself, with more than a tombstone would give
+for this purpose:
+
+```
+ERROR: 5(segv) [i386] page fault on 0 at 0x804988f (write)
+opcode window around 0x804988f: 00 8b 45 fc [c7]00 01 00 00 00 b8 ...
+stack at ffffdd58, base at ffffdd68, ip at 804988f
+```
+
+That was in `dmesg` the whole time. It went unnoticed for a round because every
+command in this session filtered `dmesg` through `grep logd/`, which drops it.
+An hour went into deciding whether to add a fault-location printk before
+noticing the emulator already prints one. **Grep `dmesg` for `page fault` and
+`ERROR:` as well as `logd/`.**
+
+### A restart leaves a socket that looks alive
+
+`/dev/socket/logdw` in a tree is a fakefs inode, so it SURVIVES an app restart
+-- but the host socket behind it does not. `ls -la` then shows a perfectly good
+`srw-rw-rw-` that nothing is bound to, and Android's logging silently goes
+nowhere again. `chroot-setup.sh` rebuilds it, which is why it now writes
+`/proc/ish/logd`; the trap is only for someone checking by hand and concluding
+from the node that the sink is fine.
+
+The other half of the same restart is the documented one: mounts are gone, so
+`/proc` is not in the tree and every Android daemon dies early with
+`Bad boot_id: ''`. Both are one `chroot-setup.sh` away.
 
 ### The merge did not break Android
 
@@ -485,10 +543,16 @@ that tree's `dev/__properties__`.
 
 ## Anticipated order of remaining work
 
-1. **`F_SETPIPE_SZ`**, which bionic's crash handler uses and iSH does not
-   implement -- see "What logging found immediately" above. It is the first
-   concrete gap the log sink exposed, and it is small.
-2. Whatever the first real service needs after that. Do not build ahead of the
+1. **The two null dereferences.** `installd` faults at `0x0` just after
+   `installd firing up`; `idmap2d` faults at `0x4` in a binder thread just
+   after registering `idmap`. Start from iSH's own `page fault ... opcode
+   window` line in `dmesg` -- it names the guest PC, which `addr2line` resolves
+   against the binary -- rather than waiting on a tombstone that will not come.
+2. **A `tombstoned` sink**, if those two do not yield to the above. It would
+   give Android's own stack traces for every native crash. Same shape as
+   `kernel/logd_sink.c` but with fd passing, so a bigger job; worth it only if
+   the crashes resist the cheaper route.
+3. Whatever the first real service needs after that. Do not build ahead of the
    evidence: every wall so far has been something other than the one predicted,
    and the cheap diagnostics (`/proc/ish/binder`, `/proc/ish/property_area`,
    `dmesg`, `binder_ping`) have each been worth more than a round of
