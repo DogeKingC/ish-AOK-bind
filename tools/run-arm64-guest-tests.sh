@@ -240,7 +240,20 @@ for test_name in "${TESTS[@]}"; do
         fi
     fi
 
-    output=$(timeout 300 qemu-aarch64-static "$ISH" -r "$ROOTFS" "/$test_name" 2>&1 |
+    # iSH's printk goes to file descriptor 555 (LOG_HANDLER_DPRINTF in
+    # kernel/log.c), not to stderr. Unredirected, that fd is closed and every
+    # kernel-side diagnostic this harness could give you is silently dropped --
+    # including the whole `ERROR: ... page fault ... pc-backing ...` block,
+    # which is the single most useful thing iSH prints. A guest test that dies
+    # of a SIGSEGV therefore looked like a test that produced no output, with
+    # the explanation thrown away microseconds earlier.
+    #
+    # Captured to a file rather than merged into stdout: on a passing run it is
+    # just noise (a boot banner per test), and on a failing one you want all of
+    # it, not the tail that happened to interleave.
+    klog=$WORK/$test_name.klog
+    : >"$klog"
+    output=$( { timeout 300 qemu-aarch64-static "$ISH" -r "$ROOTFS" "/$test_name" 2>&1 555>"$klog"; } |
              grep -v '^warning: setup step failed')
     echo "$output"
     # Prefix, not exact: several of these tests append a summary to the verdict
@@ -249,6 +262,15 @@ for test_name in "${TESTS[@]}"; do
         echo "PASS $test_name"
     else
         echo "FAIL $test_name (no PASS line)"
+        # The kernel's account of what happened, which is usually the whole
+        # answer when a guest test dies rather than reporting. `page fault`
+        # first, because if there is one it names the guest pc, the library
+        # backing it (pc-backing) and the caller (lr-backing).
+        if [ -s "$klog" ]; then
+            echo "--- kernel log for $test_name ($klog) ---" >&2
+            grep -E 'ERROR:|URGENT:|page fault|backing|opcode window' "$klog" >&2 ||
+                tail -20 "$klog" >&2
+        fi
         fail=1
     fi
 done

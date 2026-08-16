@@ -2,6 +2,7 @@
 #include "fs/proc/ish.h"
 #include "fs/proc/net.h"
 #include "jit/jit.h"
+#include "kernel/calls.h"
 #include "kernel/errno.h"
 #include "kernel/fs.h"
 #include "kernel/binder.h"
