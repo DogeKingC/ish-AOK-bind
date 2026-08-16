@@ -363,6 +363,52 @@ static int proc_ish_update_i386_no_cache_comm(struct proc_entry *UNUSED(entry), 
     return 0;
 }
 
+// Which registers an arm64 page fault dumps memory around. Written as a comma
+// separated list of register numbers ("19,20"), or empty to turn it off. The
+// point of having it here rather than only in the environment is that a phone
+// has no way to set the environment of the app -- see arm64_faultdump_set.
+static int proc_ish_show_arm64_faultdump(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    char spec[64];
+    arm64_faultdump_show(spec, sizeof(spec));
+    if (spec[0] == '\0')
+        proc_printf(buf, "off\n");
+    else
+        proc_printf(buf, "%s\n", spec);
+    return 0;
+}
+
+static int proc_ish_update_arm64_faultdump(struct proc_entry *UNUSED(entry), struct proc_data *data) {
+    size_t start = 0;
+    size_t end = data->size;
+
+    while (start < end && (data->data[start] == ' ' || data->data[start] == '\t' ||
+            data->data[start] == '\r' || data->data[start] == '\n'))
+        start++;
+    while (end > start && (data->data[end - 1] == ' ' || data->data[end - 1] == '\t' ||
+            data->data[end - 1] == '\r' || data->data[end - 1] == '\n'))
+        end--;
+
+    size_t len = end - start;
+    if (len >= 64)
+        return _EINVAL;
+
+    char spec[64];
+    memcpy(spec, &data->data[start], len);
+    spec[len] = '\0';
+    // "off" and "none" spell the empty setting, because echoing an empty string
+    // through a shell is awkward enough to be worth not requiring.
+    if (strcmp(spec, "off") == 0 || strcmp(spec, "none") == 0)
+        spec[0] = '\0';
+    // Reject anything that is not digits and commas rather than silently
+    // ignoring the unparseable parts: a typo here costs a whole crash
+    // reproduction to notice.
+    for (size_t i = 0; spec[i] != '\0'; i++)
+        if ((spec[i] < '0' || spec[i] > '9') && spec[i] != ',')
+            return _EINVAL;
+    arm64_faultdump_set(spec);
+    return 0;
+}
+
 static void proc_ish_defaults_getname(struct proc_entry *entry, char *buf) {
     strcpy(buf, entry->name);
 }
@@ -670,6 +716,7 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"amd64_jit", S_IFREG | 0644, .show = proc_ish_show_amd64_jit, .update = proc_ish_update_amd64_jit},
     {"amd_jit", S_IFREG | 0644, .show = proc_ish_show_amd64_jit, .update = proc_ish_update_amd64_jit},
     {"amd64_jit_fuse", S_IFREG | 0644, .show = proc_ish_show_amd64_jit_fuse, .update = proc_ish_update_amd64_jit_fuse},
+    {"arm64_faultdump", S_IFREG | 0644, .show = proc_ish_show_arm64_faultdump, .update = proc_ish_update_arm64_faultdump},
     {"arm64_jit_fuse", S_IFREG | 0644, .show = proc_ish_show_arm64_jit_fuse, .update = proc_ish_update_arm64_jit_fuse},
     {"i386_jit_fuse", S_IFREG | 0644, .show = proc_ish_show_i386_jit_fuse, .update = proc_ish_update_i386_jit_fuse},
     {"riscv64_jit_fuse", S_IFREG | 0644, .show = proc_ish_show_riscv64_jit_fuse, .update = proc_ish_update_riscv64_jit_fuse},

@@ -615,6 +615,13 @@ int_t sys_semctl_guest(int_t semid, int_t semnum, int_t cmd, guest_addr_t arg);
 struct tgroup;
 void sysv_sem_exit(struct tgroup *group);
 
+// Which registers an arm64 page fault dumps guest memory around, as a comma
+// separated list of register numbers ("19,20"). Backs /proc/ish/arm64_faultdump
+// so it can be set from a guest shell -- the ISH_ARM64_FAULT_MEMDUMP
+// environment variable it also reads is unreachable on iOS. Empty = off.
+void arm64_faultdump_set(const char *spec);
+void arm64_faultdump_show(char *out, size_t size);
+
 // Syscall dispatch is selected from current->abi. The i386 path is live today;
 // amd64 keeps a separate bring-up path because it needs different syscall
 // numbers and a different register ABI.

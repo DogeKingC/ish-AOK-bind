@@ -4821,11 +4821,47 @@ static bool handle_i386_stack_store_gpf(struct cpu_state *cpu);
 
 void dump_mem(guest_addr_t start, uint_t len);
 
-// ISH_ARM64_FAULT_MEMDUMP="1,3" dumps guest memory around x1 and x3 on an
-// arm64 page fault (0x40 before to 0x140 after each register value).
+// Which registers to dump guest memory around on an arm64 page fault: a comma
+// separated list of register numbers, "1,3" for x1 and x3. Empty = off.
+//
+// This used to be readable ONLY from ISH_ARM64_FAULT_MEMDUMP in the
+// environment, which quietly made it a development-machine feature: on iOS
+// getenv returns the APP's environment, and nothing a guest shell exports can
+// reach it. So the one diagnostic that could show a faulting object's memory
+// was unavailable on the only machine where the interesting faults happen.
+// /proc/ish/arm64_faultdump is the same setting by the route every other knob
+// here uses; the environment variable still works and seeds the default, so
+// existing notes and scripts are unaffected.
+static lock_t arm64_faultdump_lock = LOCK_INITIALIZER;
+static char arm64_faultdump_spec[64];
+static bool arm64_faultdump_spec_valid;
+
+static void arm64_faultdump_get(char *out, size_t size) {
+    lock(&arm64_faultdump_lock, 0);
+    if (!arm64_faultdump_spec_valid) {
+        const char *env = getenv("ISH_ARM64_FAULT_MEMDUMP");
+        strlcpy(arm64_faultdump_spec, env != NULL ? env : "", sizeof(arm64_faultdump_spec));
+        arm64_faultdump_spec_valid = true;
+    }
+    strlcpy(out, arm64_faultdump_spec, size);
+    unlock(&arm64_faultdump_lock);
+}
+
+void arm64_faultdump_set(const char *spec) {
+    lock(&arm64_faultdump_lock, 0);
+    strlcpy(arm64_faultdump_spec, spec != NULL ? spec : "", sizeof(arm64_faultdump_spec));
+    arm64_faultdump_spec_valid = true;
+    unlock(&arm64_faultdump_lock);
+}
+
+void arm64_faultdump_show(char *out, size_t size) {
+    arm64_faultdump_get(out, size);
+}
+
 static void dump_arm64_fault_memdump(const struct cpu_state *cpu) {
-    const char *spec = getenv("ISH_ARM64_FAULT_MEMDUMP");
-    if (spec == NULL)
+    char spec[64];
+    arm64_faultdump_get(spec, sizeof(spec));
+    if (spec[0] == '\0')
         return;
     char buf[64];
     strlcpy(buf, spec, sizeof(buf));
@@ -4892,6 +4928,31 @@ static void record_guest_fault_event(const char *kind, const struct cpu_state *c
                  (unsigned long long) cpu->amd64_regs[amd64_rbp],
                  (unsigned long long) cpu->amd64_regs[amd64_rsp],
                  (unsigned long long) cpu->amd64_rip);
+    } else if (current != NULL && current->abi == GUEST_ABI_ARM64) {
+        // arm64 had no branch here at all, so a fault on THIS FORK'S SHIPPING
+        // ARCHITECTURE fell through to the i386 case and printed eax/eip out of
+        // a 32-bit register view of an aarch64 task -- numbers that are not
+        // merely useless but actively misleading.
+        //
+        // x30 is the one that matters most and is the reason this was noticed.
+        // A null-pointer atomic faults inside an outline-atomics helper
+        // (__aarch64_ldadd4_relax and friends), which builds no frame, so the
+        // only record of who asked for it is the link register. Without x30 a
+        // crash in one of those stubs is unattributable, which is exactly the
+        // state idmap2d's fault was in.
+        snprintf(detail, sizeof(detail),
+                 "opcode window: %s\n"
+                 "x0=%#llx x1=%#llx x2=%#llx x3=%#llx\n"
+                 "x29(fp)=%#llx x30(lr)=%#llx sp=%#llx pc=%#llx",
+                 opcode,
+                 (unsigned long long) cpu->arm64_regs[arm64_x0],
+                 (unsigned long long) cpu->arm64_regs[arm64_x1],
+                 (unsigned long long) cpu->arm64_regs[arm64_x2],
+                 (unsigned long long) cpu->arm64_regs[arm64_x3],
+                 (unsigned long long) cpu->arm64_regs[arm64_x29],
+                 (unsigned long long) cpu->arm64_regs[arm64_x30],
+                 (unsigned long long) cpu->arm64_sp,
+                 (unsigned long long) cpu->arm64_pc);
     } else {
         snprintf(detail, sizeof(detail),
                  "opcode window: %s\n"
@@ -5031,6 +5092,21 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
                              "seeing the tag"
                            : "unmapped as well, so the tag is not what killed it");
             dump_addr_backing("  pc-backing", current_fault_ip(cpu));
+            // And where the call came FROM. pc-backing alone was not enough
+            // for the crash that prompted this: idmap2d faulted inside an
+            // outline-atomics dispatch stub (__aarch64_ldadd4_relax and
+            // friends), which builds no stack frame, so pc named a compiler
+            // helper and nothing named the caller. x30 does, and it is the
+            // only thing that does -- dump_stack below walks the EMULATOR's
+            // stack, not the guest's.
+            //
+            // Printed unconditionally rather than only when pc is a helper: at
+            // the point of the fault we cannot tell a helper from ordinary
+            // code, and one extra line is cheaper than another device round
+            // trip. When the call was a plain leaf fault this just repeats the
+            // caller, which is still worth having.
+            if (cpu->arm64_regs[arm64_x30] != 0)
+                dump_addr_backing("  lr-backing", cpu->arm64_regs[arm64_x30]);
             dump_arm64_fault_memdump(cpu);
             arm64_watch_dump();
         }
@@ -5529,11 +5605,29 @@ static void dump_addr_backing(const char *label, guest_addr_t addr) {
         generic_getpath(data->fd, path);
     // file_offset is the region's offset at its first page; add the address's
     // distance into this page's mapping via pt->offset (offset within data).
-    printk("%s %#llx: %s%s flags=%#x data_off=%zu file_off=%zu\n",
+    //
+    // Then add the offset within the page and print the sum, because that sum
+    // is the number a human actually needs and computing it by hand off three
+    // printed fields is where the mistakes happen. `file+0x...` here feeds
+    // straight into `llvm-addr2line -e <file> 0x...` (or `objdump -d
+    // --start-address=`), which is the whole reason to know the backing at all.
+    // The same arithmetic is what jit/hle.c does to identify a mapped libc.
+    //
+    // Getting this from the guest side instead means racing `/proc/<pid>/maps`
+    // against a process that is dying, and ASLR makes a capture from any other
+    // run worthless. That race was tried twice and lost twice; this line is
+    // what it was trying to reconstruct.
+    size_t file_off = (size_t) data->file_offset + (size_t) pt->offset
+                    + (size_t) (addr & (PAGE_SIZE - 1));
+    bool anon = data->fd == NULL && data->name == NULL;
+    printk("%s %#llx: %s%s flags=%#x data_off=%zu file_off=%zu",
            label, (unsigned long long) addr,
            path[0] ? path : "[anon]",
-           (data->fd == NULL && data->name == NULL) ? " (anonymous/JIT)" : "",
+           anon ? " (anonymous/JIT)" : "",
            pt->flags, (size_t) pt->offset, (size_t) data->file_offset);
+    if (!anon && path[0])
+        printk(" -> %s+%#zx", path, file_off);
+    printk("\n");
 }
 
 static void dump_opcode_window(guest_addr_t ip) {
