@@ -451,14 +451,34 @@ unconditionally on an arm64 fault: without it a crash in one of those stubs is
 unattributable, and `dump_stack` walks the emulator's stack, not the guest's.
 
 Two hypotheses were cheap enough to test and both are **ruled out** by
-`tests/manual/arm64/thread_identity.c` under the local harness: binder pool
-threads sharing a stack, and binder pool threads sharing a thread pointer.
-Under iSH every spawned thread gets its own high mmap'd stack and its own
-`TPIDR_EL0`, TLS stays private under concurrent traffic, and a once-written
-object pointer survives concurrent relaxed atomics through it. The device's
-identical `tpidr` across three runs is a deterministic allocator, not sharing.
-(`sp` around `0xffffe800` for a pool thread is still unexplained and is the one
-loose thread left in that register block.)
+`tests/manual/arm64/thread_identity.c` under the local harness: binder threads
+sharing a stack, and binder threads sharing a thread pointer. Under iSH every
+spawned thread gets its own high mmap'd stack and its own `TPIDR_EL0`, TLS
+stays private under concurrent traffic, and a once-written object pointer
+survives concurrent relaxed atomics through it. The device's identical `tpidr`
+across three runs is a deterministic allocator, not sharing.
+
+**And the faulting task is the MAIN thread, despite being called
+`binder:2981_2`.** That looked like a pool thread running on the initial stack,
+which would have been alarming. It is not: `makeBinderThreadName()` formats
+`binder:<getpid()>_<seq>`, and iSH prints the faulting task's *tid*. Across all
+three reproductions the tid and the pid inside the name are the same number
+(`2981(binder:2981_2)`, `3976(binder:3976_2)`, `4071(binder:4071_2)`), which a
+spawned thread's could not be. `ProcessState::giveThreadPoolName()` renames the
+calling thread, and `idmap2d` calls it on main before `joinThreadPool()`. So
+`sp` near `0xffffe800` is simply the process's initial stack, and there is
+nothing wrong with it.
+
+The sequence is therefore: main thread, inside `joinThreadPool()`, gets
+`BR_SPAWN_LOOPER`, calls `spawnPooledThread()`, which builds the name
+`binder:2981_3` (that is the `":2981_3"` sitting in `x7`) and does
+`sp<PoolThread>::make(...)` -> `new PoolThread` -> `RefBase`'s constructor ->
+`incStrong`. Worth noting for whoever picks this up: `Thread` inherits
+`virtual public RefBase`, so the `this` in `x20` is a virtual-base subobject
+pointer reached through a vtable offset, not the address `new` returned. "The
+object was never constructed", "the constructor's store was lost" and "the
+virtual-base offset was wrong" are three different bugs and the memory dump
+below distinguishes them.
 
 What remains is to look at the object itself. `/proc/ish/arm64_faultdump`
 exists for exactly that: `echo 19,20 > /proc/ish/arm64_faultdump` makes the next
