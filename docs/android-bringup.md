@@ -268,6 +268,12 @@ Two things about it that used to cost rounds and no longer should:
   absurd output with a note rather than firing fifty messages that cannot
   land. Still: keep commands narrow. `head`, `grep` and `tail` at the far end
   beat twenty parts every time.
+- **Never `pkill -f <pattern>` for something you named in the command.**
+  ish-remote runs each command through `sh -c`, so the command TEXT is that
+  shell's argv -- and `pkill -f servicemanager` in a command that mentions
+  servicemanager matches the listener itself and kills the channel mid-run.
+  It exits 143 and everything after it is lost. Use `pkill -x servicemanager`,
+  or kill by pid, or avoid the word.
 - **Keepalive is now the default.** It used to be opt-in, and forgetting it
   meant the listener stopped answering the moment iSH left the foreground --
   which reads exactly like the channel being dead. `--no-keepalive` if you
@@ -295,6 +301,64 @@ exist here. It ends up in `dmesg` only because `/dev/kmsg` accepts writes;
 `android::base`'s KernelLogger writes there. If `dmesg` is silent about a
 crash, check that `/dev/kmsg` in that tree is a character device (1,11) and not
 a regular file -- a plain file at that path swallows every message.
+
+## Logging: the sink, and what it found
+
+`/dev/socket/logdw` exists and drains into the kernel log (`kernel/logd_sink.c`),
+so Android's own account of a failure now reaches `dmesg`. It is NOT logd:
+there is no ring buffer, no reader socket and no `logcat`. Real logd cannot be
+used here because it does not open its own sockets -- it asks init for them via
+`android_get_control_socket("logdw")`, which reads an fd out of
+`ANDROID_SOCKET_logdw` -- and there is no init. Same wall as the property area,
+same answer: supply the thing rather than build the daemon that supplies it.
+
+**The wire format was measured, not assumed.** Binding the socket from an
+ordinary guest process and dumping what a real Android binary sent gave
+
+```
+04 | 53 00 | 8d 06 81 6a | 18 ee 1f 02 | 07 | 6c 69 62 63 00 | "Fatal signal 6 ..."
+id   tid=83   sec           nsec         F    "libc"
+```
+
+-- an 11-byte packed header (id, tid, realtime sec/nsec), a priority byte, a
+NUL-terminated tag, a NUL-terminated message. The seconds field was the wall
+clock at capture time, which is what makes the alignment a fact rather than a
+reading. That capture trick is worth keeping: a guest process can bind the
+socket itself, so liblog's output can be inspected without involving the sink
+at all.
+
+### What logging found immediately
+
+Within two datagrams of the first real capture, both previously invisible:
+
+- **`F_SETPIPE_SZ` is not implemented.** bionic's crash handler sets the pipe
+  buffer size when spawning `crash_dump` and gets `EINVAL`: `failed to set pipe
+  buffer size: Invalid argument`. Nothing in `kernel/` or `fs/` implements
+  either `F_SETPIPE_SZ` or `F_GETPIPE_SZ`. Small, and now the top of the
+  remaining work.
+- **A servicemanager `SIGABRT`**, reported by libc as `Fatal signal 6
+  (SIGABRT), code -1 (SI_QUEUE) in tid 83 (servicemanager)`. This one is NOT
+  yet understood and may well be an artefact of the capture run, which killed
+  and immediately restarted servicemanager -- a fresh one finding the binder
+  context manager still claimed would `CHECK`-fail and abort. Servicemanager
+  is healthy in ordinary use on the same build (see below). Do not treat it as
+  a known bug until it has been reproduced from a clean start.
+
+### The merge did not break Android
+
+Checked on device against build 548, i.e. after the 108-commit upstream sync
+that included the arm64 `br`/`blr`/`ret` return-cache change -- exactly the
+kind of thing that could break a large binary quietly:
+
+```
+Found 2 services:
+0	incident: [android.os.IIncidentManager]
+1	manager: [android.os.IServiceManager]
+
+manager    Service manager: found
+incident   Service incident: found
+nosuch     Service nosuch: not found
+```
 
 ## Two ways to be wrong for a long time
 
@@ -387,11 +451,9 @@ that tree's `dev/__properties__`.
 
 ## Anticipated order of remaining work
 
-1. **logd**, or a socket sink at `/dev/socket/logdw`, so Android's own logging
-   is visible without relying on the kmsg path. This is now the top of the
-   list: with `checkService` working, a client can resolve a service and
-   actually call it, and the next thing to go wrong will explain itself only
-   through logging that currently does not exist.
+1. **`F_SETPIPE_SZ`**, which bionic's crash handler uses and iSH does not
+   implement -- see "What logging found immediately" above. It is the first
+   concrete gap the log sink exposed, and it is small.
 2. Whatever the first real service needs after that. Do not build ahead of the
    evidence: every wall so far has been something other than the one predicted,
    and the cheap diagnostics (`/proc/ish/binder`, `/proc/ish/property_area`,

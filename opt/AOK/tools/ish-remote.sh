@@ -60,6 +60,11 @@
 #     it, and for anything real, point ISH_REMOTE_BASE at your own ntfy server.
 #   - Never put this in a launch/boot command. It is a thing you start by hand
 #     for a session and stop afterwards.
+#   - Beware `pkill -f`. Each command runs under `sh -c`, so the command TEXT
+#     is that shell's argv: `pkill -f foo` inside a command that mentions foo
+#     matches this listener and kills the channel mid-command (it exits 143 and
+#     the rest of the output is lost). `pkill -x`, or a pid, or a different
+#     word.
 #
 # Tunables (environment):
 #   ISH_REMOTE_BASE      relay base URL           (default https://ntfy.sh)

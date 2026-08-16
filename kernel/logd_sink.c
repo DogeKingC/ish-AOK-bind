@@ -24,13 +24,23 @@
 // enough for the guest's connect("/dev/socket/logdw") to land on a socket this
 // file owns. Nothing in liblog has to change, and nothing else in iSH does.
 //
-// THE WIRE FORMAT is liblog's, and it is worth saying plainly that it is
-// transcribed from Android's headers rather than measured here: a datagram is
-// a packed 11-byte header (log id, tid, realtime sec/nsec) followed by a
-// priority byte, a NUL-terminated tag and a NUL-terminated message. If that is
-// wrong, or a future liblog changes it, the parse below fails the length or
-// termination checks and the payload is emitted raw instead of being dropped
-// -- so a bad guess costs readability, not the log line. Check the raw form
+// THE WIRE FORMAT is liblog's, and it was MEASURED rather than assumed. A
+// datagram is a packed 11-byte header -- log id, tid (u16), realtime sec and
+// nsec (u32 each) -- then a priority byte, a NUL-terminated tag and a
+// NUL-terminated message. Captured from a real Android binary's liblog on
+// device, by binding this socket from an ordinary guest process and dumping
+// what arrived:
+//
+//   04 | 53 00 | 8d 06 81 6a | 18 ee 1f 02 | 07 | 6c 69 62 63 00 | "Fatal ..."
+//   id   tid=83   sec              nsec      F    "libc"           message
+//
+// id 4 is the crash buffer, and the seconds field was the wall clock at the
+// time of capture, which is what makes the alignment unambiguous rather than
+// merely plausible.
+//
+// The parse is still total: a packet that fails the length or termination
+// checks is emitted RAW instead of being dropped, so a future liblog that
+// changes this costs readability rather than the log line. Check the raw form
 // against this comment before assuming the socket is broken.
 
 #include <errno.h>
