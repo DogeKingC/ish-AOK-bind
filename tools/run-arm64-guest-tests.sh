@@ -45,6 +45,15 @@
 #   tools/cross-aarch64.ini; without that -fuse-ld=lld clang falls back to the
 #   host binutils ld, which fails earlier still with "unrecognised emulation
 #   mode: aarch64linux" during linker detection.
+# ALPINE 3.22, NOT 3.21, AND THE VERSION IS LOAD-BEARING. jit/hle-table.inc
+# identifies a libc by the exact 64 bytes at each hooked function's entry, and
+# its musl fingerprints were taken from `musl-alpine3.22`. This harness used to
+# fetch 3.21, whose musl is built differently enough not to match any of them --
+# so HLE never engaged here at all, and every test that exists to cover it
+# (hle_loop, tagged_pointer's HLE leak, hle_callee_saved) was quietly running
+# against the plain interpreted path. `ISH_HLE_STATS=1` printing no "hle stats"
+# line is how to check that; do check it after changing either URL below.
+#
 # Plus, downloaded on first run into the work dir: an Alpine aarch64 minirootfs
 # and the matching musl-dev, which is what the guest test binaries link against
 # (they must be musl binaries -- musl's memset/memcpy are the SIMD routines the
@@ -64,8 +73,8 @@ BUILD=$WORK/build
 ROOTFS=$WORK/rootfs
 SYSROOT=$WORK/musl-sysroot
 
-ALPINE_URL=${ISH_ALPINE_AARCH64_URL:-https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.4-aarch64.tar.gz}
-MUSL_DEV_URL=${ISH_MUSL_DEV_AARCH64_URL:-https://dl-cdn.alpinelinux.org/alpine/v3.21/main/aarch64/musl-dev-1.2.5-r11.apk}
+ALPINE_URL=${ISH_ALPINE_AARCH64_URL:-https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/aarch64/alpine-minirootfs-3.22.0-aarch64.tar.gz}
+MUSL_DEV_URL=${ISH_MUSL_DEV_AARCH64_URL:-https://dl-cdn.alpinelinux.org/alpine/v3.22/main/aarch64/musl-dev-1.2.5-r12.apk}
 
 TESTS=("$@")
 if [ ${#TESTS[@]} -eq 0 ]; then
@@ -253,7 +262,18 @@ for test_name in "${TESTS[@]}"; do
     # it, not the tail that happened to interleave.
     klog=$WORK/$test_name.klog
     : >"$klog"
-    output=$( { timeout 300 qemu-aarch64-static "$ISH" -r "$ROOTFS" "/$test_name" 2>&1 555>"$klog"; } |
+    # HLE defaults to OFF (jit/hle.c; ISH_HLE=1 on the CLI, a toggle in the
+    # app). So the tests that exist to cover it were not covering it: hle_loop,
+    # hle_callee_saved and tagged_pointer's HLE leak all ran against the plain
+    # interpreted path and passed for the wrong reason. Turn it on for exactly
+    # those, and leave the rest on the default path so both are exercised.
+    # Confirm with ISH_HLE_STATS=1: a run that hooks nothing prints no
+    # "hle stats" line, which is what this fixes.
+    hle_env=()
+    case $test_name in
+        hle_*|tagged_pointer) hle_env=(ISH_HLE=1) ;;
+    esac
+    output=$( { env "${hle_env[@]}" timeout 300 qemu-aarch64-static "$ISH" -r "$ROOTFS" "/$test_name" 2>&1 555>"$klog"; } |
              grep -v '^warning: setup step failed')
     echo "$output"
     # Prefix, not exact: several of these tests append a summary to the verdict

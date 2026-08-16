@@ -562,15 +562,26 @@ store was dropped, or x19 did not come back intact and the store landed
 somewhere else -- which would leave `mRefs` zero and raise no fault at the time,
 matching the evidence exactly.
 
-`tests/manual/arm64/hle_callee_saved.c` asserts that ABI directly. It passes
-under the harness -- **and that is not yet evidence**, because with
-`ISH_HLE_STATS=1` the harness prints no HLE stats at all (nor does `hle_loop`):
-`jit/hle-table.inc` identifies a libc by the exact 64 bytes at each function's
-entry, and the harness's Alpine musl build is not among the fingerprinted ones.
-So on that host the test is a control. `operator new` is not itself hooked, but
-an allocator runs `mem*`/`str*` internally, so an HLE'd call -- leaving the
-emulator, running native C, returning -- happens inside every allocation on a
-libc that IS fingerprinted. bionic is. Run the probe on the device.
+`tests/manual/arm64/hle_callee_saved.c` asserts that ABI directly, and **HLE
+is now ruled out**, on three independent grounds:
+
+- With HLE genuinely engaged (`ISH_HLE=1`, confirmed by `ISH_HLE_STATS=1`
+  reporting `hle stats: 255 calls`), x19-x28 come back intact across every
+  hooked function and across `malloc`.
+- `jit/hle-table.inc` contains only `glibc-2.41-devuan`, `musl-alpine3.22` and
+  `musl-riscv64-alpine`. **There is no bionic fingerprint at all**, so nothing
+  in an Android process is ever hooked.
+- HLE is **off by default** anyway (`jit/hle.c`: `ISH_HLE=1` on the CLI, a
+  toggle in the app).
+
+Getting to that took catching two ways the test could have lied. First, the
+harness's musl was Alpine 3.21 while the fingerprints are from 3.22, so no
+function matched. Second -- and this was the real one -- HLE is off unless
+asked for, so `hle_loop`, `tagged_pointer`'s HLE leak and this probe had all
+been passing against the plain interpreted path. **The tests that existed to
+cover HLE were not covering it.** The runner now sets `ISH_HLE=1` for exactly
+those tests, and `ISH_HLE_STATS=1` printing no `hle stats` line is how to check
+that claim rather than trust it.
 
 **Two setup facts this cost a round each to learn.** `idmap2d` needs
 `servicemanager` already running, or it exits 1 with `Failed to start: -129`
@@ -748,16 +759,17 @@ that tree's `dev/__properties__`.
    For `idmap2d` the function is known (`RefBase::incStrong` with a null
    `mRefs`) and so is the object's state: a valid vptr with `mRefs` unwritten,
    deterministically. See that section for what it rules out. The next step is
-   `tests/manual/arm64/hle_callee_saved.c` run ON THE DEVICE. The constructor
-   is now disassembled (see the idmap2d section): the missing store addresses
-   the object through `x19`, held across `bl _Znwm@plt`. Either the store was
-   dropped or `x19` did not survive the call. A minimal C++ virtual-inheritance
-   repro passes under the harness, and so does the register probe -- but with
-   `ISH_HLE_STATS=1` the harness prints no HLE stats at all, so **that pass is
-   a control and rules nothing out**: `jit/hle-table.inc` matches a libc by its
-   exact entry bytes and the harness's musl is not one of them. `gcc` is on the
-   device, so compile and run the probe there, against bionic, where the
-   fingerprints do match.
+   the store itself. The constructor is disassembled (see the idmap2d section):
+   the missing store addresses the object through `x19`, held across
+   `bl _Znwm@plt`. Either the store was dropped or `x19` did not survive the
+   call. HLE is ruled out (three ways, above), a minimal C++
+   virtual-inheritance repro passes under the harness, and the register probe
+   passes both under the harness with HLE on and on the device against Alpine
+   musl. So the remaining candidates are narrower: the store's own translation
+   in that block, a stale mapping between the write and the later read, or
+   something in the caller that reuses x19. Take them one at a time, and check
+   each claim the way the HLE one was checked -- by confirming the mechanism
+   actually ran.
 
    Apply the same treatment to `installd` rather than assuming it is the same
    bug: its fault address is `0x0`, not `0x4`, so it is at best the same

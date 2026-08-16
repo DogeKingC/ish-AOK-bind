@@ -159,6 +159,10 @@ need_in tests/manual/setup-regressions.sh thread_identity
 need_file tests/manual/arm64/hle_callee_saved.c
 need_in fs/aok-tests.manifest             arm64/hle_callee_saved.c
 need_in tests/manual/setup-regressions.sh hle_callee_saved
+# HLE defaults to OFF, so the tests that exist to cover it were passing
+# against the plain interpreted path. The runner turns it on for those.
+need_in tools/run-arm64-guest-tests.sh "ISH_HLE=1" \
+    "the HLE tests actually run with HLE enabled"
 
 # --- arm64 fault diagnostics ------------------------------------------------
 # A guest fault has to name the library and offset it happened at, and the one
