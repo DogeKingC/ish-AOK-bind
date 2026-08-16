@@ -198,6 +198,30 @@ int main(int argc, char **argv) {
     }
     check(seen_raw, "an unparsed packet is reported raw, not dropped");
 
+    // The binary buffers (events/stats/security) carry a 4-byte tag id and
+    // typed values -- no priority byte, no NUL-terminated strings. Running the
+    // text parse over one produced `logd/events ?/ (1128:1128):` on device: an
+    // empty tag and an empty message, which is worse than saying nothing.
+    char ev[64];
+    struct android_log_header evh;
+    memset(&evh, 0, sizeof(evh));
+    evh.id = 2; // events
+    evh.tid = 99;
+    size_t eoff = 0;
+    memcpy(ev + eoff, &evh, sizeof(evh)); eoff += sizeof(evh);
+    uint32_t event_tag = 1397638484;
+    memcpy(ev + eoff, &event_tag, sizeof(event_tag)); eoff += sizeof(event_tag);
+    ev[eoff++] = 0x00; ev[eoff++] = 0x11; ev[eoff++] = 0x22; ev[eoff++] = 0x33;
+    check(write(fd, ev, eoff) == (ssize_t) eoff, "write an events-buffer record");
+    int seen_bin = 0;
+    for (int i = 0; i < 50 && !seen_bin; i++) {
+        usleep(20000);
+        seen_bin = kmsg_contains("logd/events binary") == 1;
+    }
+    check(seen_bin, "a binary buffer is reported as binary, not parsed as text");
+    check(kmsg_contains("tag=1397638484") == 1,
+          "and its event tag id is reported");
+
     char state[4096];
     if (proc_ish_logd(state, sizeof(state)) == 0) {
         check(strstr(state, "no sink") == NULL, "/proc/ish/logd reports a live sink");

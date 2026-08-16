@@ -312,6 +312,31 @@ used here because it does not open its own sockets -- it asks init for them via
 `ANDROID_SOCKET_logdw` -- and there is no init. Same wall as the property area,
 same answer: supply the thing rather than build the daemon that supplies it.
 
+**Confirmed end to end on device**, with a real `servicemanager` writing
+through it:
+
+```
+logd/main W/libc(1128:1128): Using old property service protocol ("ro.property_service.version" is not set)
+logd/main E/cutils-trace(1132:1132): Error opening trace file: No such file or directory (2)
+logd/main W/libbinder.BackendUnifiedServiceManager(1132:1132): Thread Pool max thread count is 0.
+    Cannot cache binder as linkToDeath cannot be implemented. serviceName: manager
+```
+
+That last line is worth keeping in view: libbinder is saying the process has no
+binder thread pool, so it cannot `linkToDeath` and will not cache the binder.
+Nothing needs it yet; something will.
+
+**Two things the device found that the guest test could not.** The events
+buffer arrived as `logd/events ?/ (1128:1128):` -- empty tag, empty message.
+events, stats and security are Android's BINARY buffers: a 4-byte tag id and
+typed values, with no priority byte and no NUL-terminated strings, so the text
+parse produced a line that said nothing. They are now reported as binary with
+their tag id, and the guest test covers it. Separately, the boot-time sink for
+the outer root failed with "error -98", which was a lie: every bind failure
+returned a hardcoded `EADDRINUSE`. It reports the real errno now. **A masked
+errno is worse than no errno** -- it sends the reader somewhere specific and
+wrong.
+
 **The wire format was measured, not assumed.** Binding the socket from an
 ordinary guest process and dumping what a real Android binary sent gave
 

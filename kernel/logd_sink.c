@@ -108,8 +108,37 @@ static char logd_priority_letter(uint8_t prio) {
 // Formats one datagram into `out`. Deliberately total: anything that does not
 // parse is still rendered, because a dropped line is exactly the failure this
 // file exists to prevent.
+// events, stats and security are the BINARY buffers: their payload is a
+// 4-byte tag id followed by typed values, with no priority byte and no
+// NUL-terminated strings. Running the text parse over one produces a line with
+// an empty tag and an empty message, which is worse than saying nothing --
+// observed on device as `logd/events ?/ (1128:1128):`.
+static bool logd_buffer_is_binary(uint8_t id) {
+    return id == 2 /* events */ || id == 5 /* stats */ || id == 6 /* security */;
+}
+
 static size_t logd_format(const char *pkt, size_t len, uint32_t sender_pid,
                           char *out, size_t out_size) {
+    if (len > sizeof(struct android_log_header) + 2 &&
+        logd_buffer_is_binary((uint8_t) pkt[0])) {
+        struct android_log_header hdr;
+        memcpy(&hdr, pkt, sizeof(hdr));
+        const char *body = pkt + sizeof(hdr);
+        size_t body_len = len - sizeof(hdr);
+        uint32_t event_tag = 0;
+        if (body_len >= sizeof(event_tag))
+            memcpy(&event_tag, body, sizeof(event_tag));
+        // The tag id indexes event-log-tags, which is a file we do not have,
+        // so report the number and the size rather than inventing a name. A
+        // short hex preview is enough to tell two events apart.
+        int n = snprintf(out, out_size, "logd/%s binary (%u:%u): tag=%u, %zu bytes",
+                         hdr.id < sizeof(logd_buffer_names) / sizeof(logd_buffer_names[0])
+                             ? logd_buffer_names[hdr.id] : "buf",
+                         sender_pid, hdr.tid, event_tag, body_len);
+        if (n > 0)
+            return (size_t) n < out_size ? (size_t) n : out_size - 1;
+    }
+
     if (len > sizeof(struct android_log_header) + 2) {
         struct android_log_header hdr;
         memcpy(&hdr, pkt, sizeof(hdr));
@@ -247,7 +276,7 @@ int logd_sink_create(const char *prefix) {
 
     int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (fd < 0) {
-        err = _EIO;
+        err = errno_map();
         goto fail;
     }
     struct sockaddr_un un;
@@ -261,8 +290,12 @@ int logd_sink_create(const char *prefix) {
     strcpy(un.sun_path, logd_host_path);
     unlink(logd_host_path); // ours from a previous run, if anything
     if (bind(fd, (struct sockaddr *) &un, sizeof(un)) < 0) {
+        // The real errno, not a guess. Reporting EADDRINUSE for every bind
+        // failure sent the first device diagnosis down the wrong path: the
+        // boot-time sink failed with "error -98" when the actual cause was
+        // something else entirely, and the number said nothing about it.
+        err = errno_map();
         close(fd);
-        err = _EADDRINUSE;
         goto fail;
     }
 
