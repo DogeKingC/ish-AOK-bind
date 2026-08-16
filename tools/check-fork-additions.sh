@@ -225,6 +225,20 @@ need_in fs/real.c  S_ISSOCK \
     "realfs can create a socket inode, or no unix socket binds on a realfs root"
 need_in fs/aok-tests.manifest             logd_sink.c
 need_in tests/manual/setup-regressions.sh logd_sink
+need_in opt/AOK/tools/android/chroot-setup.sh /proc/ish/logd \
+    "a chroot gets its own logdw, or Android logs into the outer root's socket"
+
+# --- pipe capacity ----------------------------------------------------------
+# F_SETPIPE_SZ/F_GETPIPE_SZ. bionic's crash handler sets a pipe's size before
+# spawning crash_dump; without these it got EINVAL on every Android crash.
+# The numeric constants are deliberate: <fcntl.h> only defines the names under
+# _GNU_SOURCE, so a `#if defined(F_SETPIPE_SZ)` guard silently compiles the
+# forwarding path OUT and a Linux host answers from the fallback.
+need_file tests/manual/pipe_size.c
+need_in fs/fd.c F_SETPIPE_SZ_ "pipe capacity is settable"
+need_in fs/fd.c F_GETPIPE_SZ_
+need_in fs/aok-tests.manifest             pipe_size.c
+need_in tests/manual/setup-regressions.sh pipe_size
 
 # --- Android chroot setup --------------------------------------------------
 need_file opt/AOK/tools/android/chroot-setup.sh

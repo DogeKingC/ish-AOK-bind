@@ -1,3 +1,4 @@
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include "debug.h"
@@ -342,8 +343,27 @@ static int fd_setown(struct fd *fd, pid_t_ who) {
 #define F_OFD_SETLKW_ 38
 
 #define F_DUPFD_CLOEXEC_ 1030
+#define F_SETPIPE_SZ_ 1031
+#define F_GETPIPE_SZ_ 1032
 #define F_ADD_SEALS_ 1033
 #define F_GET_SEALS_ 1034
+
+// Pipe capacity. bionic's crash handler sets it before spawning crash_dump and
+// logged "failed to set pipe buffer size: Invalid argument" on every Android
+// crash here, because neither command existed -- found the moment Android's own
+// logging became visible (kernel/logd_sink.c).
+//
+// A guest pipe is a real host pipe (fs/pipe.c), so on a host that has these
+// commands they are forwarded and the answer is the truth. Darwin has no
+// equivalent: its pipes size themselves, growing to BIG_PIPE_SIZE on demand.
+//
+// On that host we report that capacity rather than failing, and -- this is the
+// part that matters -- F_SETPIPE_SZ NEVER claims more than the pipe actually
+// has. Linux's own F_SETPIPE_SZ returns the size it really used, which may
+// differ from the request, so a caller that checks the return value is being
+// told the truth either way. Answering with the requested number would be a
+// lie a caller could act on, by writing that much and expecting not to block.
+#define PIPE_CAPACITY_DARWIN 65536
 #define CLOSE_RANGE_UNSHARE_ (1U << 1)
 #define CLOSE_RANGE_CLOEXEC_ (1U << 2)
 
@@ -754,6 +774,37 @@ static dword_t sys_fcntl_common(fd_t f, dword_t cmd, guest_addr_t arg, bool gues
             STRACE("fcntl(%d, F_GET_SEALS)", f);
             ret = memfd_get_seals(fd);
             break;
+
+        case F_SETPIPE_SZ_:
+        case F_GETPIPE_SZ_: {
+            bool set = cmd == F_SETPIPE_SZ_;
+            STRACE("fcntl(%d, F_%sPIPE_SZ, %d)", f, set ? "SET" : "GET", arg);
+            if (!S_ISFIFO(fd->stat.mode)) {
+                ret = _EINVAL; // Linux: these are pipes only
+                break;
+            }
+            if (set && (int_t) arg <= 0) {
+                ret = _EINVAL;
+                break;
+            }
+#if defined(__linux__)
+            // The NUMBERS, not the names. <fcntl.h> only defines
+            // F_SETPIPE_SZ/F_GETPIPE_SZ under _GNU_SOURCE, which this file does
+            // not set, so `#if defined(F_SETPIPE_SZ)` is false here and the
+            // whole forwarding path silently vanished -- a Linux host answered
+            // from the fallback below without touching the pipe. Linux's values
+            // are the guest's values, so the constants above serve for both.
+            if (fd->real_fd >= 0) {
+                int host = fcntl(fd->real_fd, set ? F_SETPIPE_SZ_ : F_GETPIPE_SZ_,
+                                 (int) arg);
+                ret = host < 0 ? errno_map() : (dword_t) host;
+                break;
+            }
+#endif
+            // No host support: report the capacity, never more than it is.
+            ret = PIPE_CAPACITY_DARWIN;
+            break;
+        }
 
         default:
             STRACE("fcntl(%d, %d)", f, cmd);

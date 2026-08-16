@@ -107,6 +107,27 @@ else
     fail=1
 fi
 
+# --- the logd sink ---------------------------------------------------------
+# Same problem as the property area, same fix. iSH creates
+# /dev/socket/logdw at boot in the OUTER root, which a chroot cannot see, so
+# without this an Android process inside the tree finds no socket and its
+# logging goes nowhere -- silently, which is the failure mode the sink exists
+# to end. Writing the tree's path to /proc/ish/logd rebuilds it there.
+#
+# Not fatal if it fails: everything else still works, you just go back to
+# diagnosing Android blind. See kernel/logd_sink.c.
+if [ -w /proc/ish/logd ]; then
+    if echo "$ROOT" > /proc/ish/logd; then
+        note "built dev/socket/logdw ($(head -1 /proc/ish/logd))"
+    else
+        echo "  WARNING: could not build dev/socket/logdw -- Android's own logs"
+        echo "           will not reach dmesg ($(head -1 /proc/ish/logd))"
+    fi
+else
+    echo "  WARNING: no /proc/ish/logd (an iSH-AOK older than the logd sink?);"
+    echo "           Android's own logs will not reach dmesg"
+fi
+
 # --- mounts ----------------------------------------------------------------
 # Lost on every restart. Mounting something twice on the same point would
 # shadow the first, so each is skipped when already present.
