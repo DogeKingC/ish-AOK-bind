@@ -161,6 +161,7 @@ arm64/ands_bcond_fusion.c
 arm64/hle_loop.c
 arm64/tagged_pointer.c
 arm64/thread_identity.c
+arm64/hle_callee_saved.c
 riscv64/ptrace_regset.c
 riscv64/jalr_retcache.c
 arm64/ret_retcache.c

@@ -154,6 +154,11 @@ need_in tools/run-arm64-guest-tests.sh __getauxval \
 need_file tests/manual/arm64/thread_identity.c
 need_in fs/aok-tests.manifest             arm64/thread_identity.c
 need_in tests/manual/setup-regressions.sh thread_identity
+# The ABI assertion around the crash: RefBase::RefBase holds `this` in x19
+# across a PLT call into another library and stores through it afterwards.
+need_file tests/manual/arm64/hle_callee_saved.c
+need_in fs/aok-tests.manifest             arm64/hle_callee_saved.c
+need_in tests/manual/setup-regressions.sh hle_callee_saved
 
 # --- arm64 fault diagnostics ------------------------------------------------
 # A guest fault has to name the library and offset it happened at, and the one

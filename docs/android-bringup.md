@@ -525,6 +525,53 @@ environment only, which on iOS is the *app's* environment -- so the one
 diagnostic that could answer this was unreachable on the only machine where the
 bug happens.
 
+### The constructor, disassembled
+
+`binutils` is on the device and the Alpine root is aarch64, so libutils can be
+disassembled in place -- no pulling the file off:
+
+```sh
+nm -D --defined-only libutils.so | grep _ZN7android7RefBaseC2Ev
+objdump -d --start-address=0x1d9b4 --stop-address=0x1da44 libutils.so
+```
+
+```
+1d9c0: adrp x8, 24000
+1d9c4: add  x8, x8, #0x5d8      ; x8 = 0x245d8  <- exactly the vptr observed
+1d9c8: mov  x19, x0             ; x19 = this
+1d9cc: str  x8, [x0]            ; *this = vptr            <- landed
+1d9d0: mov  w0, #0x18
+1d9d4: bl   _Znwm@plt           ; operator new(24)
+1d9dc: str  x19, [x0, #8]       ; impl->mBase = this
+1d9e0: ldr  d0, [x8, #352]
+1d9e4: str  wzr, [x0, #16]
+1d9e8: str  d0, [x0]
+1d9ec: str  x0, [x19, #8]       ; this->mRefs = impl      <- did not land
+1d9f8: ret
+```
+
+Two things this settles. `RefBase::RefBase()` **did** run on this object: the
+vtable it computes is `0x245d8`, which is exactly what the dump shows at
+`this+0`. And `operator new` returned a **usable** pointer -- otherwise
+`str x19, [x0, #8]` two instructions later would have faulted at address 8,
+and it did not. So "the allocation failed" is dead.
+
+What is left is `str x0, [x19, #8]`. It addresses the object through **x19, a
+callee-saved register held across a call into another library**. Either the
+store was dropped, or x19 did not come back intact and the store landed
+somewhere else -- which would leave `mRefs` zero and raise no fault at the time,
+matching the evidence exactly.
+
+`tests/manual/arm64/hle_callee_saved.c` asserts that ABI directly. It passes
+under the harness -- **and that is not yet evidence**, because with
+`ISH_HLE_STATS=1` the harness prints no HLE stats at all (nor does `hle_loop`):
+`jit/hle-table.inc` identifies a libc by the exact 64 bytes at each function's
+entry, and the harness's Alpine musl build is not among the fingerprinted ones.
+So on that host the test is a control. `operator new` is not itself hooked, but
+an allocator runs `mem*`/`str*` internally, so an HLE'd call -- leaving the
+emulator, running native C, returning -- happens inside every allocation on a
+libc that IS fingerprinted. bionic is. Run the probe on the device.
+
 **Two setup facts this cost a round each to learn.** `idmap2d` needs
 `servicemanager` already running, or it exits 1 with `Failed to start: -129`
 (`Status::EX_TRANSACTION_FAILED`) and never reaches the crash at all. And
@@ -701,13 +748,16 @@ that tree's `dev/__properties__`.
    For `idmap2d` the function is known (`RefBase::incStrong` with a null
    `mRefs`) and so is the object's state: a valid vptr with `mRefs` unwritten,
    deterministically. See that section for what it rules out. The next step is
-   a LOCAL reproduction rather than another device round -- a C++ shape with
-   `virtual public` inheritance and a pointer member assigned in the base
-   constructor, built for aarch64 and run under
-   `tools/run-arm64-guest-tests.sh`. If it reproduces there the loop drops from
-   minutes to seconds; if it does not, that narrows it to something the tiny
-   case is missing (the VTT path, the PLT call into another library, or the
-   allocation), and each of those is separately testable.
+   `tests/manual/arm64/hle_callee_saved.c` run ON THE DEVICE. The constructor
+   is now disassembled (see the idmap2d section): the missing store addresses
+   the object through `x19`, held across `bl _Znwm@plt`. Either the store was
+   dropped or `x19` did not survive the call. A minimal C++ virtual-inheritance
+   repro passes under the harness, and so does the register probe -- but with
+   `ISH_HLE_STATS=1` the harness prints no HLE stats at all, so **that pass is
+   a control and rules nothing out**: `jit/hle-table.inc` matches a libc by its
+   exact entry bytes and the harness's musl is not one of them. `gcc` is on the
+   device, so compile and run the probe there, against bionic, where the
+   fingerprints do match.
 
    Apply the same treatment to `installd` rather than assuming it is the same
    bug: its fault address is `0x0`, not `0x4`, so it is at best the same
