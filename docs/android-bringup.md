@@ -480,14 +480,57 @@ object was never constructed", "the constructor's store was lost" and "the
 virtual-base offset was wrong" are three different bugs and the memory dump
 below distinguishes them.
 
-What remains is to look at the object itself. `/proc/ish/arm64_faultdump`
-exists for exactly that: `echo 19,20 > /proc/ish/arm64_faultdump` makes the next
-arm64 fault dump guest memory around `x19` and `x20`, so the next reproduction
-shows whether the object is entirely zero (never constructed) or constructed
-with only `mRefs` missing (a lost store). It used to be readable only from
-`ISH_ARM64_FAULT_MEMDUMP` in the environment, which on iOS is the *app's*
-environment -- so the one diagnostic that could answer this was unreachable on
-the only machine where the bug happens.
+### The object has a valid vptr and a null `mRefs`
+
+`/proc/ish/arm64_faultdump` answered this. `sh /AOK/tools/android/crash-probe.sh
+-r 19,20 idmap2d`, with `servicemanager` running, dumps the object:
+
+```
+memdump around x20=0x7ffda5197448:
+7ffda5197408: 00000000 00000000 ... 0000ffff 00000000
+7ffda5197428: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+7ffda5197448: bc9b55d8 00007fff 00000000 00000000 00000000 00000000 00000000 00000000
+```
+
+`[this+0]` is `0x7fffbc9b55d8`, which is inside libutils (base `0x7fffbc991000`,
+so file offset `0x245d8`, in `.data.rel.ro` -- a vtable). `[this+8]`, which is
+`mRefs`, is zero, and the whole rest of the object is zero.
+
+So of the three candidates:
+
+- **Not "never constructed".** A vptr was stored. Fresh heap is zero, and
+  something wrote a real vtable pointer into it.
+- **Not "the virtual-base offset is wrong now".** `x20` points at a properly
+  formed `RefBase` subobject: a genuine libutils vtable sits at `x20+0`.
+- **What is left is that the store of `mRefs` did not land** -- and it is
+  deterministic, byte for byte, across four reproductions.
+
+Worth carrying forward: `x27` is `0xb0` below `x20` in every reproduction, and
+`x8` is `0xb0`. That is the virtual-base offset -- `x27` is the `PoolThread`
+and `x20` its `RefBase` subobject at `+0xb0`. Because `Thread` inherits
+`virtual public RefBase`, the subobject's vptr is set by the *most-derived*
+constructor through the VTT, not necessarily by `RefBase::RefBase()` itself.
+So "a vptr is present" does not prove `RefBase::RefBase()` ran at this address;
+it proves *a* constructor wrote *a* vptr there. A remaining possibility is that
+`RefBase::RefBase()` ran against a different vbase offset than the one used
+later, which would look identical from the corpse.
+
+`new` returning null is a poor fit and should not be assumed without evidence:
+the `PoolThread` allocation itself (larger, moments earlier) plainly succeeded,
+since `x27` and `x20` point at real memory. A few dozen bytes failing right
+after that is implausible.
+
+The knob that made this readable used to be `ISH_ARM64_FAULT_MEMDUMP` in the
+environment only, which on iOS is the *app's* environment -- so the one
+diagnostic that could answer this was unreachable on the only machine where the
+bug happens.
+
+**Two setup facts this cost a round each to learn.** `idmap2d` needs
+`servicemanager` already running, or it exits 1 with `Failed to start: -129`
+(`Status::EX_TRANSACTION_FAILED`) and never reaches the crash at all. And
+`pgrep -f servicemanager` matches the driving shell's own argv when run through
+`ish-remote.sh`, exactly as `pkill -f` does, so a "is it already running?"
+guard silently skips starting it. Start it unconditionally.
 
 **There are no tombstones, and there will not be.** Android's own account of a
 native crash comes from `debuggerd`, which forks `crash_dump64` (it lives in
@@ -655,14 +698,16 @@ that tree's `dev/__properties__`.
    `lr-backing`, the library and file offset of both the faulting instruction
    and its caller -- rather than waiting on a tombstone that will not come.
 
-   For `idmap2d` the function is now known (`RefBase::incStrong` with a null
-   `mRefs`, see above) and the next step is one command on device:
-   `echo 19,20 > /proc/ish/arm64_faultdump`, reproduce, and read the memory
-   dump. An object that is entirely zero was never constructed; an object with
-   a plausible vptr and only `mRefs` missing is a lost store, which is an
-   emulator bug and a very different search. Do not guess between those two --
-   the guess is free to make and expensive to be wrong about, and the dump
-   settles it.
+   For `idmap2d` the function is known (`RefBase::incStrong` with a null
+   `mRefs`) and so is the object's state: a valid vptr with `mRefs` unwritten,
+   deterministically. See that section for what it rules out. The next step is
+   a LOCAL reproduction rather than another device round -- a C++ shape with
+   `virtual public` inheritance and a pointer member assigned in the base
+   constructor, built for aarch64 and run under
+   `tools/run-arm64-guest-tests.sh`. If it reproduces there the loop drops from
+   minutes to seconds; if it does not, that narrows it to something the tiny
+   case is missing (the VTT path, the PLT call into another library, or the
+   allocation), and each of those is separately testable.
 
    Apply the same treatment to `installd` rather than assuming it is the same
    bug: its fault address is `0x0`, not `0x4`, so it is at best the same

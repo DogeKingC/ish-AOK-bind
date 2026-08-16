@@ -204,7 +204,19 @@ jobs:
           # "did not compile". Missing them entirely does not look like a
           # missing package -- meson just reports that the compiler "cannot
           # compile programs" and names nothing.
-          sudo apt-get install -y clang lld llvm qemu-user-static \
+          #
+          # binutils is named explicitly for readelf, even though the runner
+          # image has it. run-arm64-guest-tests.sh uses readelf to assert each
+          # test binary is dynamically linked against musl, and that check is
+          # written to SKIP ITSELF when readelf is absent rather than fail --
+          # the right behaviour for a developer box, the wrong thing to leave
+          # implicit in CI, where a silently skipped check is a check that is
+          # not running. What it guards against is a sysroot whose libc.so
+          # symlink dangles: -lc then falls back to libc.a, every test binary
+          # becomes static musl carrying a PT_INTERP, and spawned threads get
+          # TLS sized as though the program had none. That fails as an
+          # emulator bug, not as a link problem.
+          sudo apt-get install -y clang lld llvm qemu-user-static binutils \
               gcc-aarch64-linux-gnu libsqlite3-dev:arm64 \
               libgcc-13-dev:arm64 libstdc++-13-dev:arm64
           # Installing a gcc cross package can take /usr/include/asm with it,
@@ -328,7 +340,7 @@ jobs:
             DETAIL=$'Conflicting files:\n\n```\n'"$CONFLICTED"$'\n```'
           else
             REASON="The merge was clean, but the merged tree failed its checks."
-            DETAIL="One of: this fork's own code did not survive the merge (tools/check-fork-additions.sh), the build failed, the unit/e2e tests failed, this fork's i386 guest regression tests failed (tools/run-guest-tests.sh -- binder/ashmem behaviour), or the arm64 guest tests failed under qemu-user (tools/run-arm64-guest-tests.sh -- the arm64 gadget set, which nothing else here compiles). The run log says which."
+            DETAIL="One of: this fork's own code did not survive the merge (tools/check-fork-additions.sh), the build failed, the unit/e2e tests failed, this fork's i386 guest regression tests failed (tools/run-guest-tests.sh -- binder/ashmem behaviour), or the arm64 guest tests failed under qemu-user (tools/run-arm64-guest-tests.sh -- the arm64 gadget set, which nothing else here compiles). The run log says which. Two of those fail in ways worth naming in advance: (1) meson.build now passes -Werror=implicit-function-declaration, matching what the Xcode project already passes, so an upstream commit with a missing declaration stops the build HERE rather than only in the iOS build -- that is the flag working, and the fix is the missing #include, not removing the flag; (2) tools/run-arm64-guest-tests.sh refuses to run a test binary that has no DT_NEEDED for libc, which means its musl sysroot lost the ldso and every test would otherwise run against a statically linked libc with broken thread TLS."
           fi
           # The baseline verdict goes near the top: it decides whether the
           # next step is "fix the merge" or "fix/wait on upstream", and that
