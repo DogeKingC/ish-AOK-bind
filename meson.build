@@ -6,6 +6,20 @@ if cc.get_id() == 'clang'
     add_project_arguments('-Wimplicit-fallthrough', '-Wtautological-constant-in-range-compare', language: 'c')
 endif
 
+# A missing declaration must fail the DEVELOPMENT build, because it already
+# fails the two builds that matter and are slow to hear from. gcc treats an
+# implicit function declaration as a warning among hundreds; clang makes it an
+# error, and the Xcode project passes -Werror=implicit-function-declaration
+# explicitly. So a forgotten #include compiles clean here and breaks both the
+# iOS build and the aarch64 cross build -- and the iOS failure does not even
+# name the cause, it surfaces as
+#     error: Internal inconsistency error: never received target ended message
+#     for target ID '6' (in target 'Ninja')
+# which reads as a flaky Xcode build system rather than as a compile error in
+# the meson sub-build. That cost two IPA builds to work out. Matching Xcode's
+# flag here turns it into an instant local failure.
+add_project_arguments('-Werror=implicit-function-declaration', language: 'c')
+
 if get_option('b_sanitize').split(',').contains('undefined')
     add_project_arguments('-fno-sanitize=alignment', language: 'c')
 endif
