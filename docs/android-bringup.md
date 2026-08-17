@@ -617,7 +617,50 @@ An hour went into deciding whether to add a fault-location printk before
 noticing the emulator already prints one. **Grep `dmesg` for `page fault` and
 `ERROR:` as well as `logd/`.**
 
-### Open: `stp` with writeback re-faults forever on a post-`fork` stack page
+### FIXED: the re-fault guard was killing healthy programs
+
+**Resolved.** The bug was the diagnostic, not the memory. `SAME_FAULT_LIMIT`
+counted faults with the same `(addr, ip)` and reset only when a *different* one
+arrived. musl's `fork()` pushes the same callee prologue frame at the same stack
+address every call, so a program that forks in a loop produces an identical
+fault each time: sixteen healthy copy-on-write breaks, each resolved correctly,
+counted as a spin and answered with SIGSEGV.
+
+The panel said so in one run, after six hypotheses had been eliminated one per
+device round:
+
+```
+arm64 panel: retry=0  addr=0xffffe9b0 ... hostpage=0xffffc000
+  0xffffe000 flags=0x5a W=1 COW=1 anon=1 shared=0 refs=2   <== faulting
+```
+
+`W=1 COW=1 refs=2` is an ordinary post-fork shared page. And the sixteen
+"retries" spanned `21:17:17` to `21:21:01` -- four minutes. Nothing spinning
+takes four minutes.
+
+**The fix took two attempts, and the first one's failure is the useful part.**
+Elapsed time (a 20ms window) fixed `socket_kill`, `accept_kill` and
+`concurrent_exec_tlb` and left `clone_error_cleanup` and
+`fifo_open_creat_deadlock` dying exactly as before -- they loop tightly enough
+to fit sixteen legitimate faults inside 20ms. Widening the window is not
+available: "fast" is not what distinguishes a tight fork loop from a spin, and
+any threshold loose enough for the former lets the latter through.
+
+Syscall count is the discriminator. A genuine spin re-executes one instruction
+and makes **no** syscalls; a program legitimately re-faulting is going round a
+loop that does one. `handle_interrupt` bumps a per-thread `guest_syscall_seq`,
+and the guard only counts repeats where it has not moved. All five tests pass.
+
+Two corrections worth keeping. Calling those five "one bug" on the strength of
+identical fault blocks was too strong -- they shared a symptom and a mechanism
+but not a fix, and two needed a strictly better discriminator. And the guard
+itself is a reminder that a safety net added for one real bug (tagged pointers)
+can become the cause of the next five.
+
+**`idmap2d` is NOT this bug**, which was predicted and then checked rather than
+assumed: it still faults at `libutils.so+0x1aa80` with `lr` at `+0x11030`, a
+silently lost heap store with no re-fault at all. It remains open, below.
+
 
 Found by running the whole guest suite on a device (122 pass, and this). Five
 tests die with SIGSEGV there, and two of them -- `socket_kill` and
