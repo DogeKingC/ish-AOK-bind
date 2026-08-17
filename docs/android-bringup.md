@@ -737,11 +737,51 @@ regressions they were written for (the clone-error-path use-after-free and the
 arm64 stale-TLB use-after-free on execve, issue #469). They are collateral. Do
 not go looking for those two bugs on the strength of these crashes.
 
-The common factor across all five is simply that they fork -- but plain forking
-is not enough, because `fork_parent_store.c` forks 200+ times across five
-shapes and passes on the same device. Something about how these tests fork, or
-how much other work the process has done first, is still missing from the
-repro.
+The common factor across all five is that they fork -- but plain forking is not
+enough. Three repros now fail to reproduce it on the same device, each
+eliminating something:
+
+| repro | rules out |
+|---|---|
+| `cow_store_restart.c` | the store form, and copy-on-write: `str`, `stp`, `stp` with pre-index writeback and real prologues all complete on COW stack and heap |
+| `fork_parent_store.c` | the fork window itself: 200+ forks, children SIGKILLed mid-push, signals blocked musl-style, a live `SIGCHLD` handler |
+| `parked_wait_store.c` | the blocking-wait/`sigunwind` path: children killed out of `recv()` on AF_UNIX and TCP, and out of `accept()` |
+
+All three pass on the device **with and without `-v`**, which had to be checked
+-- see below.
+
+### The lever: `-v` turns the bug off
+
+`socket_kill` is not flaky. Measured, it fails **14 out of 14** runs. But:
+
+```
+socket_kill -v   -> rc=0    (passes, every time)
+socket_kill      -> rc=139  (SIGSEGV, every time)
+```
+
+Deterministic in both directions. All `-v` does is make `test_logf` print, so
+the difference is a handful of extra `write()` calls between rounds.
+
+That was nearly an expensive mistake in the other direction: the first
+`socket_kill` run that passed was one where `-v` had been passed, and it was
+briefly read as "the bug is intermittent/load-dependent". It is not. Load makes
+no difference at all (6/6 failures under three concurrent exec loops). And
+because all three repros above had been run **with** `-v` on the device, every
+one of their eliminations had to be re-run without it before being trusted.
+They hold either way, but they were one flag away from being worthless.
+
+**This is the handle for whoever picks it up.** An intervening syscall between
+the clone and the faulting push makes the fault go away, which is exactly what
+a **stale software TLB entry in the parent** would look like: `mem_ptr_fault`
+consults the real mapping and reports the page present and writable (which the
+log says outright), while the JIT's per-thread TLB keeps handing the store a
+stale entry, so it re-faults until `SAME_FAULT_LIMIT` gives up. A syscall
+refreshes that TLB and the symptom vanishes.
+
+That is also the theme of issue #469 (`concurrent_exec_tlb`: the per-thread
+software TLB surviving `execve`, resynced only by comparing change counters
+that can collide). Same subsystem, different trigger. Start at the arm64 JIT's
+TLB refresh on return from a syscall/clone, not at the store gadgets.
 
 ### `/dev/kmsg` can be a regular file, and everything still "works"
 

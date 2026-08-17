@@ -168,6 +168,9 @@ need_in tests/manual/setup-regressions.sh cow_store_restart
 need_file tests/manual/arm64/fork_parent_store.c
 need_in fs/aok-tests.manifest             arm64/fork_parent_store.c
 need_in tests/manual/setup-regressions.sh fork_parent_store
+need_file tests/manual/arm64/parked_wait_store.c
+need_in fs/aok-tests.manifest             arm64/parked_wait_store.c
+need_in tests/manual/setup-regressions.sh parked_wait_store
 # HLE defaults to OFF, so the tests that exist to cover it were passing
 # against the plain interpreted path. The runner turns it on for those.
 need_in tools/run-arm64-guest-tests.sh "ISH_HLE=1" \
