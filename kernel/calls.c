@@ -4813,6 +4813,7 @@ static void dump_amd64_hlt_zero_sentinel_state(const struct cpu_state *cpu);
 static void dump_amd64_loader_state(const struct cpu_state *cpu);
 static void dump_amd64_store_trace(const struct cpu_state *cpu);
 static void dump_fault_pt_state(guest_addr_t addr);
+static void dump_arm64_fault_panel(guest_addr_t addr, unsigned retry, void *resolved);
 static bool amd64_verbose_fault_trace_enabled(void);
 static bool handle_i386_read_fault_gpf(struct cpu_state *cpu);
 static bool handle_i386_write_fault_gpf(struct cpu_state *cpu);
@@ -5032,6 +5033,10 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
     guest_addr_t fault_ip = current_fault_ip(cpu);
     bool looping = false;
     if (cpu->segfault_addr == last_fault_addr && fault_ip == last_fault_ip) {
+        // Every time round, so the panel shows whether the state EVOLVES
+        // across retries (a race) or is identical sixteen times (a logic bug).
+        if (current != NULL && current->abi == GUEST_ABI_ARM64)
+            dump_arm64_fault_panel(cpu->segfault_addr, same_fault_count, NULL);
         if (++same_fault_count > SAME_FAULT_LIMIT) {
             looping = true;
             same_fault_count = 0;
@@ -5113,6 +5118,7 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
             // could be stated without anyone being able to see what "there"
             // meant.
             dump_fault_pt_state(cpu->segfault_addr);
+            dump_arm64_fault_panel(cpu->segfault_addr, 0, ptr);
             dump_addr_backing("  pc-backing", current_fault_ip(cpu));
             // And where the call came FROM. pc-backing alone was not enough
             // for the crash that prompted this: idmap2d faulted inside an
@@ -5160,6 +5166,86 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
         dump_stack(8);
         deliver_signal(current, SIGSEGV_, info);
     }
+}
+
+// One shot at everything, instead of one hypothesis per device round.
+//
+// Six theories about the re-faulting arm64 store have now been killed one at a
+// time -- the store form, copy-on-write, the fork window, the blocking-wait
+// path, the gadget's change-counter check, and host page mirroring -- at
+// roughly a device round each. That is the expensive way to do it. This prints
+// the whole differential at the moment of failure so a single reproduction
+// eliminates classes rather than one guess.
+//
+// What each line is for:
+//
+//   cfg          real_page_size vs PAGE_SIZE decides whether host page
+//                mirroring is even compiled in as live (it is gated on their
+//                being equal), so this settles ON THE DEVICE what was
+//                previously settled by reading the source. requires_write_
+//                revalidate and the changes counter say whether the JIT's
+//                write slow path and TLB flush are armed at all.
+//   retry        printed EVERY time round the loop, not once. If the flags
+//                change between retries this is a race; if they are identical
+//                sixteen times it is a logic bug that no amount of timing work
+//                will find. Nothing else distinguishes those two, and they
+//                call for completely different searches.
+//   resolved     what mem_ptr_fault handed back. The log's claim is that the
+//                page "is there"; this is the pointer that claim rests on.
+//   host page    every guest page sharing the faulting address's HOST page.
+//                On a 16 KB host that is four guest pages, and a protection
+//                change to one is a protection change to all four -- so a
+//                neighbour with different flags is a lead, and identical
+//                flags across all four rules the aliasing idea out.
+//   prot cache   whether the per-host-page protection cache exists for this
+//                mapping, since a stale entry there is a documented previous
+//                cause of exactly this symptom (emu/memory.c's comment about
+//                faulting forever on a page the page tables call writable).
+static void dump_arm64_fault_panel(guest_addr_t addr, unsigned retry, void *resolved) {
+    enum { PANEL_BUDGET = 40 }; // ~2 loops' worth; enough to see evolution
+    static unsigned panel_count;
+    if (panel_count >= PANEL_BUDGET)
+        return;
+    panel_count++;
+
+    struct mem *mem = current != NULL ? current->mem : NULL;
+    if (mem == NULL)
+        return;
+
+    if (retry == 0)
+        printk("arm64 panel cfg: real_page_size=%zu guest PAGE_SIZE=%d "
+               "mirroring_live=%d write_revalidate=%d changes=%llu\n",
+               real_page_size, (int) PAGE_SIZE,
+               (int) mem_host_page_mirroring_available(),
+               (int) mem->mmu.requires_write_revalidate,
+               (unsigned long long) atomic_load(&mem->mmu.changes));
+
+    read_lock(&mem->lock);
+    // Every guest page in the same host page, so a 16 KB host page shows all
+    // four. Falls back to the faulting page alone if the host page is smaller.
+    size_t hp = real_page_size > PAGE_SIZE ? real_page_size : PAGE_SIZE;
+    guest_addr_t host_base = addr & ~(guest_addr_t) (hp - 1);
+    printk("arm64 panel: retry=%u addr=%#llx resolved=%p hostpage=%#llx\n",
+           retry, (unsigned long long) addr, resolved,
+           (unsigned long long) host_base);
+    for (guest_addr_t a = host_base; a < host_base + hp; a += PAGE_SIZE) {
+        struct pt_entry *pt = mem_pt(mem, PAGE(a));
+        if (pt == NULL) {
+            printk("  %#llx unmapped%s\n", (unsigned long long) a,
+                   PAGE(a) == PAGE(addr) ? "   <== faulting" : "");
+            continue;
+        }
+        printk("  %#llx flags=%#x W=%d COW=%d anon=%d shared=%d off=%#zx "
+               "data=%p refs=%u protcache=%s%s\n",
+               (unsigned long long) a, pt->flags,
+               !!(pt->flags & P_WRITE), !!(pt->flags & P_COW),
+               !!(pt->flags & P_ANONYMOUS), !!(pt->flags & P_SHARED),
+               pt->offset, (void *) pt->data,
+               pt->data != NULL ? (unsigned) pt->data->refcount : 0u,
+               (pt->data != NULL && pt->data->host_page_prot != NULL) ? "yes" : "no",
+               PAGE(a) == PAGE(addr) ? "   <== faulting" : "");
+    }
+    read_unlock(&mem->lock);
 }
 
 static void dump_fault_pt_state(guest_addr_t addr) {

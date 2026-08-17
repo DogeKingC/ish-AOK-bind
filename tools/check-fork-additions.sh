@@ -192,6 +192,10 @@ need_in fs/proc/ish.c  arm64_faultdump \
 # actually looking at. amd64 always had it, arm64 never did.
 need_in kernel/calls.c "dump_fault_pt_state(cpu->segfault_addr)" \
     "an arm64 fault prints the faulting page's table state"
+# The whole differential in one reproduction, printed on EVERY retry, rather
+# than one hypothesis per device round -- six were killed serially that way.
+need_in kernel/calls.c dump_arm64_fault_panel \
+    "the arm64 re-fault loop prints the full page/config panel per retry"
 
 # --- permissive SELinux stub ----------------------------------------------
 need_file fs/selinuxfs.c
