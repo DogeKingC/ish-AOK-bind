@@ -5029,10 +5029,34 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
     static __thread guest_addr_t last_fault_addr;
     static __thread guest_addr_t last_fault_ip;
     static __thread unsigned same_fault_count;
+    static __thread uint64_t last_fault_ns;
     enum { SAME_FAULT_LIMIT = 16 };
+    // A genuine spin retires no instructions between faults, so its sixteen
+    // repeats land inside a few microseconds. Anything slower is the guest
+    // making progress and coming back here legitimately.
+    //
+    // That distinction is the whole correctness of this guard, and leaving it
+    // out cost five device test failures. Matching on address and ip alone,
+    // socket_kill and four others were killed by a SPURIOUS SIGSEGV: musl's
+    // fork() pushes the same callee prologue frame at the same stack address
+    // every call, so a program that forks in a loop produces an identical
+    // (addr, ip) fault each time -- sixteen healthy copy-on-write breaks, each
+    // resolved correctly, counted as a spin. The device log showed FOUR MINUTES
+    // between two of the "retries", and the faulting page reading
+    // `W=1 COW=1 refs=2`: an ordinary shared post-fork page, resolving fine.
+    //
+    // Resetting on successful resolution instead would be wrong and would
+    // disable the guard outright: the tagged-pointer bug this exists for also
+    // resolved successfully every time and re-faulted anyway. Progress is the
+    // discriminator, not resolution.
+    enum { SAME_FAULT_WINDOW_NS = 20 * 1000 * 1000 }; // 20ms
+    struct timespec fault_ts;
+    clock_gettime(CLOCK_MONOTONIC, &fault_ts);
+    uint64_t fault_ns = (uint64_t) fault_ts.tv_sec * 1000000000ull + (uint64_t) fault_ts.tv_nsec;
     guest_addr_t fault_ip = current_fault_ip(cpu);
     bool looping = false;
-    if (cpu->segfault_addr == last_fault_addr && fault_ip == last_fault_ip) {
+    if (cpu->segfault_addr == last_fault_addr && fault_ip == last_fault_ip &&
+            fault_ns - last_fault_ns <= SAME_FAULT_WINDOW_NS) {
         // Every time round, so the panel shows whether the state EVOLVES
         // across retries (a race) or is identical sixteen times (a logic bug).
         if (current != NULL && current->abi == GUEST_ABI_ARM64)
@@ -5069,6 +5093,7 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
         last_fault_ip = fault_ip;
         same_fault_count = 0;
     }
+    last_fault_ns = fault_ns;
 
     void *ptr = looping ? NULL
                         : mem_ptr_fault(current->mem, fault_addr,
