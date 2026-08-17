@@ -52,10 +52,37 @@ static void check(int cond, const char *what) {
 // Only the device numbers matter -- a char device (1,11) anywhere is /dev/kmsg.
 // On a root where mknod in /dev is not permitted (a realfs root without
 // CAP_MKNOD, e.g. the CLI build), fall back to a tmpfs we can create it on.
+// Is this path the kmsg CHARACTER DEVICE, rather than something that merely
+// exists at that name? A regular file at /dev/kmsg reads back exactly what was
+// written to it, so every positive check here passes and every negative one
+// fails -- "the message text is logged" ok, "the <N> prefix is not part of it"
+// FAIL -- which reads as the kernel having stopped stripping prefixes.
+//
+// That is not hypothetical: it is the state a device was found in, and
+// chroot-setup.sh already warns about it for the Android tree ("plain-file
+// kmsg ... its dying words go into the file instead of dmesg"). The outer root
+// can be in it too. Ten confusing assertion failures across this file and
+// logd_sink.c came from accepting a 24-byte regular file as the log device.
+static int kmsg_is_device(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0)
+        return 0;
+    if (!S_ISCHR(st.st_mode))
+        return 0;
+    // Only the numbers matter; a char device (1,11) anywhere is /dev/kmsg.
+    return major(st.st_rdev) == MEM_DEV_MAJOR && minor(st.st_rdev) == KMSG_DEV_MINOR;
+}
+
 static int kmsg_setup_device(void) {
     snprintf(kmsg_path, sizeof(kmsg_path), "/dev/kmsg");
-    if (access(kmsg_path, F_OK) == 0)
+    if (kmsg_is_device(kmsg_path))
         return 0;
+    // Present but not the device: say so, then fall through to the fallback
+    // below rather than testing against a file that echoes writes back.
+    struct stat st;
+    if (stat(kmsg_path, &st) == 0 && !S_ISCHR(st.st_mode))
+        test_logf("/dev/kmsg is not a character device (mode %#o) -- "
+                  "using a private one instead\n", (unsigned) st.st_mode);
     if (mknod(kmsg_path, S_IFCHR | 0666, makedev(MEM_DEV_MAJOR, KMSG_DEV_MINOR)) == 0)
         return 0;
 

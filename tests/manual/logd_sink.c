@@ -63,10 +63,28 @@ struct android_log_header {
 // Only the device numbers matter -- a char device (1,11) anywhere is
 // /dev/kmsg. On a realfs root mknod in /dev is not permitted, so fall back to
 // a tmpfs, exactly as tests/manual/kmsg.c does.
+// Must be the character device, not merely a name that exists. A regular file
+// at /dev/kmsg reads back what was written to IT, so the sink's records -- which
+// go to the real kernel log, and show up in dmesg -- are never found, and this
+// file reports seven failures that all mean "we read the wrong thing". A
+// device was found in exactly that state; see the same guard in kmsg.c.
+static int kmsg_is_device(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0)
+        return 0;
+    if (!S_ISCHR(st.st_mode))
+        return 0;
+    return major(st.st_rdev) == MEM_DEV_MAJOR && minor(st.st_rdev) == KMSG_DEV_MINOR;
+}
+
 static int kmsg_setup_device(void) {
     snprintf(kmsg_path, sizeof(kmsg_path), "/dev/kmsg");
-    if (access(kmsg_path, F_OK) == 0)
+    if (kmsg_is_device(kmsg_path))
         return 0;
+    struct stat kst;
+    if (stat(kmsg_path, &kst) == 0 && !S_ISCHR(kst.st_mode))
+        test_logf("/dev/kmsg is not a character device (mode %#o) -- "
+                  "using a private one instead\n", (unsigned) kst.st_mode);
     if (mknod(kmsg_path, S_IFCHR | 0666, makedev(MEM_DEV_MAJOR, KMSG_DEV_MINOR)) == 0)
         return 0;
     int mknod_errno = errno;
