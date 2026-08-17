@@ -163,6 +163,7 @@ arm64/tagged_pointer.c
 arm64/thread_identity.c
 arm64/hle_callee_saved.c
 arm64/cow_store_restart.c
+arm64/fork_parent_store.c
 riscv64/ptrace_regset.c
 riscv64/jalr_retcache.c
 arm64/ret_retcache.c

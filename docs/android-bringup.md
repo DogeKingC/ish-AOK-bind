@@ -690,12 +690,30 @@ reports as present and writable while the actual store keeps failing. That is
 why `cow_store_restart.c` passes: none of its phases push a fresh frame below
 `sp` in the parent in the window right after `clone` returns.
 
-**Next step.** Extend the repro along that axis rather than the COW one: in the
-parent, immediately on return from `clone`/`fork`, call into a function deep
-enough to push below the pre-clone `sp`, in a loop, with the stack near
-`0xffffe000`. The suspects are the fork path's handling of the parent's own
-memory (`kernel/fork.c` / `mem_ptr_fault`'s writable resolution) rather than
-the store-pair gadget, since every store form is now known good.
+**The parent-side fork window is not it either.**
+`tests/manual/arm64/fork_parent_store.c` does exactly that: forks and, in the
+parent, immediately pushes new frames below the sp that was live when `clone`
+returned -- plain, with the child SIGKILLed while pushing, with signals blocked
+across the fork the way musl does it, with a real `SIGCHLD` handler running on
+that stack, and with eight children killed together (`socket_kill`'s count). On
+the initial stack, pages pre-dirtied so they are present rather than missing.
+
+All five phases pass **on the device**. Two hypotheses down.
+
+**Where that leaves it.** Both eliminations were designed to be informative
+either way, and together they say the trigger is not the store form, not
+copy-on-write, and not the fork window on its own. What is left is something
+`socket_kill` and `proc_stat_monotonic` do BEFORE forking. `socket_kill` is a
+socket test, and its own header describes the machinery it exercises: tasks
+parked in a **host blocking wait**, poked with SIGUSR1, unwound through the
+`sigunwind_start()` point (`socket_wait_ready`, `socket_blocking_syscall_begin`,
+`fs/poll.c`'s `poll_wait`, `fs/real.c`'s `realfs_wait_readable`). That unwind
+leaves a host wait and restores guest context, which is exactly the kind of
+path that can return with a stale software TLB while `mem_ptr_fault` still
+reports the page present and writable -- the observed contradiction.
+
+So the next repro axis is: park a task in a blocking socket wait, poke it out of
+that wait, and THEN have it push frames / store. Not another fork variation.
 
 The other three SIGSEGVs (`accept_kill`, `clone_error_cleanup`,
 `fifo_open_creat_deadlock`) are not yet attributed. Two are regression tests
