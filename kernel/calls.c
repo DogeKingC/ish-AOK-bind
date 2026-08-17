@@ -5029,11 +5029,18 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
     static __thread guest_addr_t last_fault_addr;
     static __thread guest_addr_t last_fault_ip;
     static __thread unsigned same_fault_count;
-    static __thread uint64_t last_fault_ns;
     enum { SAME_FAULT_LIMIT = 16 };
-    // A genuine spin retires no instructions between faults, so its sixteen
-    // repeats land inside a few microseconds. Anything slower is the guest
-    // making progress and coming back here legitimately.
+    // A genuine spin re-executes one instruction and makes NO SYSCALLS. A
+    // program that legitimately re-faults at the same address is going round a
+    // loop that does (fork, open, write), so its syscall count moves between
+    // faults. That is the discriminator.
+    //
+    // Elapsed time was tried first and is NOT good enough. A 20ms window fixed
+    // socket_kill, accept_kill and concurrent_exec_tlb, and left
+    // clone_error_cleanup and fifo_open_creat_deadlock still dying: both loop
+    // tightly enough to fit sixteen legitimate copy-on-write faults inside
+    // 20ms. Any threshold wide enough for them would be wide enough to let a
+    // real spin through, because "fast" is not what distinguishes these.
     //
     // That distinction is the whole correctness of this guard, and leaving it
     // out cost five device test failures. Matching on address and ip alone,
@@ -5049,14 +5056,12 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
     // disable the guard outright: the tagged-pointer bug this exists for also
     // resolved successfully every time and re-faulted anyway. Progress is the
     // discriminator, not resolution.
-    enum { SAME_FAULT_WINDOW_NS = 20 * 1000 * 1000 }; // 20ms
-    struct timespec fault_ts;
-    clock_gettime(CLOCK_MONOTONIC, &fault_ts);
-    uint64_t fault_ns = (uint64_t) fault_ts.tv_sec * 1000000000ull + (uint64_t) fault_ts.tv_nsec;
+    extern __thread uint64_t guest_syscall_seq;
+    static __thread uint64_t last_fault_syscall_seq;
     guest_addr_t fault_ip = current_fault_ip(cpu);
     bool looping = false;
     if (cpu->segfault_addr == last_fault_addr && fault_ip == last_fault_ip &&
-            fault_ns - last_fault_ns <= SAME_FAULT_WINDOW_NS) {
+            guest_syscall_seq == last_fault_syscall_seq) {
         // Every time round, so the panel shows whether the state EVOLVES
         // across retries (a race) or is identical sixteen times (a logic bug).
         if (current != NULL && current->abi == GUEST_ABI_ARM64)
@@ -5093,7 +5098,7 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
         last_fault_ip = fault_ip;
         same_fault_count = 0;
     }
-    last_fault_ns = fault_ns;
+    last_fault_syscall_seq = guest_syscall_seq;
 
     void *ptr = looping ? NULL
                         : mem_ptr_fault(current->mem, fault_addr,
@@ -6461,8 +6466,27 @@ void handle_timer_interrupt(__attribute__((unused)) struct cpu_state *cpu) {
     return;
 }
 
+// Bumped on every syscall this thread makes. The re-fault guard below uses it
+// as its definition of "the guest made progress": a genuine spin re-executes
+// one instruction and makes no syscalls at all, while a program legitimately
+// re-faulting at the same address is going round a loop that does (fork, open,
+// write). Nothing cheaper separates those two -- see the guard for why elapsed
+// time does not.
+__thread uint64_t guest_syscall_seq;
+
 void handle_interrupt(int interrupt) {
     struct cpu_state *cpu = &current->cpu;
+
+    switch (interrupt) {
+        case INT_SYSCALL:
+        case INT_AMD64_SYSCALL:
+        case INT_ARM64_SVC:
+        case INT_RISCV64_ECALL:
+            guest_syscall_seq++;
+            break;
+        default:
+            break;
+    }
 
     switch (interrupt) {
         case INT_SYSCALL:
