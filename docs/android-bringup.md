@@ -657,6 +657,34 @@ but not a fix, and two needed a strictly better discriminator. And the guard
 itself is a reminder that a safety net added for one real bug (tagged pointers)
 can become the cause of the next five.
 
+**Two things ruled out for `idmap2d`, cheaply.**
+
+*Page state cannot explain it.* Both stores in `RefBase::RefBase` target the
+SAME 4 KB page -- `str x8, [x0]` at offset 0 (which landed, the vptr is in
+memory) and `str x0, [x19, #8]` at offset 8 (which did not). Page tables, COW
+state and TLB entries are all per-page, so no page-level measurement can
+distinguish them. Dumping the object's page state would have been a wasted
+round; what differs between the two stores is a cross-library `bl _Znwm@plt`
+and a callee-saved base register, not anything about the page.
+
+*Instruction fusion is not it either.* `/proc/ish/arm64_jit_fuse` toggles the
+arm64 fusion families at runtime (`bcond`, `ldst`, `ldcmp`), and `ldst` in
+particular fuses adjacent load/stores -- of which that constructor has a run of
+four. All four arms were tried in one command, no rebuild:
+
+| fusion | idmap2d |
+|---|---|
+| all off | 139 |
+| `ldst` off | 139 |
+| `ldcmp` off | 139 |
+| `bcond` off | 139 |
+| baseline | 139 |
+
+Identical every time, so the whole fusion layer is cleared. Note the shape of
+that measurement: one command, four arms, a feature family eliminated rather
+than a single guess. `retcache` is the remaining runtime knob in that file and
+is the obvious next arm.
+
 **`idmap2d` is NOT this bug**, which was predicted and then checked rather than
 assumed: it still faults at `libutils.so+0x1aa80` with `lr` at `+0x11030`, a
 silently lost heap store with no re-fault at all. It remains open, below.
