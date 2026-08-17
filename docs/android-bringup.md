@@ -617,6 +617,38 @@ An hour went into deciding whether to add a fault-location printk before
 noticing the emulator already prints one. **Grep `dmesg` for `page fault` and
 `ERROR:` as well as `logd/`.**
 
+### `/dev/kmsg` can be a regular file, and everything still "works"
+
+Found by running the guest suite on a device: `/dev/kmsg` in the outer root was
+a 24-byte **regular file**, not the character device (1,11).
+
+```
+$ ls -l /dev/kmsg
+-rw-r--r--    1 root     root            24 /dev/kmsg
+```
+
+Nothing reports an error, because writing to it succeeds and reading it back
+returns what was written. That is exactly what makes it expensive:
+
+- Android's `KernelLogger` writes its dying words there, so they land in the
+  file instead of `dmesg` and are never seen. `chroot-setup.sh` fixes this for
+  the tree; the OUTER root is not covered by anything.
+- `tests/manual/kmsg.c` reported that the kernel had stopped stripping `<N>`
+  priority prefixes -- every positive check passing and every negative one
+  failing -- because a file echoes back the raw record.
+- `tests/manual/logd_sink.c` reported seven failures meaning "the sink is not
+  delivering", while the sink was working fine and its records were in `dmesg`
+  the whole time. The test was reading the file.
+
+Both tests now require `S_ISCHR` and major 1 / minor 11, falling back to a
+private node on tmpfs. Only the device numbers matter, so a `(1,11)` node
+anywhere reads the same ring -- which is what makes the fallback exact rather
+than a workaround.
+
+To fix a root by hand: `rm /dev/kmsg && mknod /dev/kmsg c 1 11 && chmod 666
+/dev/kmsg`. Check with `ls -l` before believing any kmsg-based measurement, the
+same way mounts get checked before believing `Bad boot_id: ''`.
+
 ### A restart leaves a socket that looks alive
 
 `/dev/socket/logdw` in a tree is a fakefs inode, so it SURVIVES an app restart
