@@ -770,6 +770,47 @@ because all three repros above had been run **with** `-v` on the device, every
 one of their eliminations had to be re-run without it before being trusted.
 They hold either way, but they were one flag away from being worthless.
 
+**Two more eliminations, from reading rather than running.**
+
+The arm64 gadget fast path *does* consult the change counter -- `write_prep` in
+`jit/guest-arm64/gadgets.h` loads `TLB_mem_changes` and `MMU_changes`, compares,
+and branches to `arm64_resolve_write_ptr` on a mismatch -- and `mem_changed()`
+is called on the COW break (via `pt_map`) and on both sides of a fork. So "the
+arm64 gadgets never notice a flush is due" is wrong.
+
+The host-page-protection theory is wrong too, and for a reason worth writing
+down. `mem_mirror_host_page_protection()` skips its `mprotect` when its
+per-host-page cache already reads the desired value, and there is a comment at
+`emu/memory.c:733` recording a previous bug of exactly our shape from that
+cache going stale -- "leaving the guest to fault forever on a page its own page
+tables call writable". But:
+
+```c
+static bool mem_can_mirror_host_page_protections(void) {
+    return real_page_size == PAGE_SIZE;
+}
+```
+
+Mirroring is only enabled when the **host** page size equals the guest's 4 KB.
+iOS on arm64 uses 16 KB pages, so on the device the whole mechanism is inert:
+`mem_ensure_host_writable()` returns 0 on its first line and
+`requires_write_revalidate` is false. It cannot be the cause there.
+
+**What that leaves.** With mirroring off, an anonymous stack page is
+host-writable by construction, so the repeated fault is not a host protection
+fault at all. `mem_ptr_fault` succeeds -- that is why the message says the page
+is there -- and the retried store still evaluates to not-writable and traps
+again. The rejection is therefore on the GUEST side: the page-table flags
+(`P_WRITE`/`P_COW`) or the TLB entry state after resolution, not the host
+mapping and not the store gadget.
+
+**And why no repro will ever come off the harness.** `real_page_size` differs
+between the two hosts, which changes which code is even live. Anything reasoned
+out on the x86_64 harness about this path is about a different configuration
+than the device runs. Four repros were written before that was noticed; that is
+the cost of not checking which branches a host actually takes before building
+tests for them.
+
 **This is the handle for whoever picks it up.** An intervening syscall between
 the clone and the faulting push makes the fault go away, which is exactly what
 a **stale software TLB entry in the parent** would look like: `mem_ptr_fault`
