@@ -680,10 +680,35 @@ four. All four arms were tried in one command, no rebuild:
 | `bcond` off | 139 |
 | baseline | 139 |
 
-Identical every time, so the whole fusion layer is cleared. Note the shape of
-that measurement: one command, four arms, a feature family eliminated rather
-than a single guess. `retcache` is the remaining runtime knob in that file and
-is the obvious next arm.
+Identical every time, so the whole fusion layer is cleared.
+
+*And every other runtime knob with it.* Widening that to the full set --
+`arm64_jit_fuse` (including `retcache`) plus the `/proc/ish/defaults` toggles --
+all seven arms crash identically:
+
+| arm | idmap2d |
+|---|---|
+| baseline | 139 |
+| `retcache=0` | 139 |
+| all JIT fusion off | 139 |
+| `enable_multicore=false` | 139 |
+| `enable_hle=false` | 139 |
+| `enable_extralocking=false` | 139 |
+| `enable_crypto_accel=false` | 139 |
+
+**`enable_multicore=false` still failing is the one that matters.** It rules out
+the whole class of concurrency explanations at once: this is not a race, not a
+memory-ordering problem, not a cross-thread visibility issue. It is
+deterministic on a single core, which is a much smaller search.
+
+**A caution about how nearly this went wrong.** The first attempt at this matrix
+returned rc=134 (SIGABRT) on all seven arms and looked like a clean sweep. It
+was worthless: `servicemanager` was not running, so `idmap2d` exited before ever
+reaching the faulting code, and seven arms had tested nothing. Every arm now
+prints whether it still reached the real crash (139) rather than merely
+"changed", and the run starts by asserting the baseline is 139. A matrix whose
+arms cannot be shown to have exercised the target is a green suite that tested
+nothing -- the same trap as the `-v` flag and the un-hooked HLE.
 
 **`idmap2d` is NOT this bug**, which was predicted and then checked rather than
 assumed: it still faults at `libutils.so+0x1aa80` with `lr` at `+0x11030`, a
