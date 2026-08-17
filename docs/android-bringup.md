@@ -617,6 +617,60 @@ An hour went into deciding whether to add a fault-location printk before
 noticing the emulator already prints one. **Grep `dmesg` for `page fault` and
 `ERROR:` as well as `logd/`.**
 
+### Open: `stp` with writeback re-faults forever on a post-`fork` stack page
+
+Found by running the whole guest suite on a device (122 pass, and this). Five
+tests die with SIGSEGV there, and two of them -- `socket_kill` and
+`proc_stat_monotonic` -- land on the identical instruction:
+
+```
+ERROR: 10123(socket_kill) [arm64] fault on 0xffffe9b0 at 0x7fffbdb7c9f0 keeps
+  resolving and re-faulting (16 times); delivering SIGSEGV rather than spinning
+  -- the access cannot complete even though the page is there
+  pc-backing -> /lib/ld-musl-aarch64.so.1+0x609f0
+  lr-backing -> /lib/ld-musl-aarch64.so.1+0x48b3c
+```
+
+`lr-backing` is what makes this readable, and it is why that line was added.
+Disassembling on the device (binutils is there, the root is aarch64):
+
+```
+fork+...:  48b38:  bl   609f0                  <- musl's fork() calls it
+           48b3c:  tbnz w22, #31, 48b64        <- the return address
+   609f0:  stp x29, x30, [sp, #-32]!           <- pc: the callee's prologue
+```
+
+So the faulting instruction is an ordinary **prologue push -- `stp` with
+pre-index writeback** -- storing to a stack page that **is mapped**, called from
+`fork()`, where the stack is freshly copy-on-write. The emulator resolves the
+page, restarts, and faults again, sixteen times, until `SAME_FAULT_LIMIT`
+(`kernel/calls.c`) gives up and delivers SIGSEGV rather than spinning forever.
+
+That cap was added for the tagged-pointer work and is doing exactly what it was
+built for: turning an infinite spin into a diagnosable failure that names the
+instruction.
+
+**Why this matters beyond the five tests.** It is the same family as idmap2d's
+missing `mRefs`: a store that does not land. Here the emulator notices and
+re-faults; there it went silently nowhere. A store-pair-with-writeback whose
+fault-restart path is wrong would produce both symptoms depending on whether
+the page needed resolving. Do not assume they are the same bug -- but check
+`stp`'s restart path before assuming they are not.
+
+**Next step, and it is local.** The arm64 harness can host this: fork, then in
+the child make a call deep enough that its prologue `stp` writes an untouched
+COW stack page. If that reproduces under `tools/run-arm64-guest-tests.sh`, the
+loop drops to seconds and the suspects are the pre-indexed store-pair gadget
+and the write-fault restart contract in `jit/guest-arm64/`.
+
+The other three SIGSEGVs (`accept_kill`, `clone_error_cleanup`,
+`fifo_open_creat_deadlock`) are not yet attributed. Two are regression tests
+whose documented failure mode IS a crash (`clone_error_cleanup` for the
+clone-error-path use-after-free, `concurrent_exec_tlb` for the arm64 stale-TLB
+use-after-free on execve, issue #469), so they may be reporting live
+regressions rather than being victims of the above. Each needs its own fault
+block read before it is claimed either way.
+
 ### `/dev/kmsg` can be a regular file, and everything still "works"
 
 Found by running the guest suite on a device: `/dev/kmsg` in the outer root was
