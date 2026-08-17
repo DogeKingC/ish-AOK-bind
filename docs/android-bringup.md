@@ -715,13 +715,33 @@ reports the page present and writable -- the observed contradiction.
 So the next repro axis is: park a task in a blocking socket wait, poke it out of
 that wait, and THEN have it push frames / store. Not another fork variation.
 
-The other three SIGSEGVs (`accept_kill`, `clone_error_cleanup`,
-`fifo_open_creat_deadlock`) are not yet attributed. Two are regression tests
-whose documented failure mode IS a crash (`clone_error_cleanup` for the
-clone-error-path use-after-free, `concurrent_exec_tlb` for the arm64 stale-TLB
-use-after-free on execve, issue #469), so they may be reporting live
-regressions rather than being victims of the above. Each needs its own fault
-block read before it is claimed either way.
+**All five SIGSEGVs are one bug.** They were left unattributed until each fault
+block had been read, and reading them settles it: `accept_kill`,
+`clone_error_cleanup`, `fifo_open_creat_deadlock`, `concurrent_exec_tlb` and
+`socket_kill` every one report
+
+```
+[arm64] fault on 0xffffeXXX at 0x7fffbdf7c9f0 keeps resolving and re-faulting
+  (16 times) ... the access cannot complete even though the page is there
+  pc-backing -> /lib/ld-musl-aarch64.so.1+0x609f0
+  lr-backing -> /lib/ld-musl-aarch64.so.1+0x48b3c
+```
+
+Identical pc, identical lr, fault address `sp-0x20` in each -- the same
+`stp x29, x30, [sp, #-32]!` reached from the same call site in musl's `fork()`.
+Only the stack address differs, because the processes differ.
+
+This matters twice over. It turns five device failures into one, and it means
+`clone_error_cleanup` and `concurrent_exec_tlb` are **not** reporting the
+regressions they were written for (the clone-error-path use-after-free and the
+arm64 stale-TLB use-after-free on execve, issue #469). They are collateral. Do
+not go looking for those two bugs on the strength of these crashes.
+
+The common factor across all five is simply that they fork -- but plain forking
+is not enough, because `fork_parent_store.c` forks 200+ times across five
+shapes and passes on the same device. Something about how these tests fork, or
+how much other work the process has done first, is still missing from the
+repro.
 
 ### `/dev/kmsg` can be a regular file, and everything still "works"
 
