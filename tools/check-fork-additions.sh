@@ -188,6 +188,10 @@ need_in kernel/calls.c arm64_faultdump_set \
     "the fault memdump is settable at runtime, not only from the environment"
 need_in fs/proc/ish.c  arm64_faultdump \
     "and is exposed at /proc/ish/arm64_faultdump"
+# "the page is there" is the emulator's conclusion; this prints what it is
+# actually looking at. amd64 always had it, arm64 never did.
+need_in kernel/calls.c "dump_fault_pt_state(cpu->segfault_addr)" \
+    "an arm64 fault prints the faulting page's table state"
 
 # --- permissive SELinux stub ----------------------------------------------
 need_file fs/selinuxfs.c

@@ -5042,6 +5042,22 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
                    current->pid, current->comm, guest_abi_desc(current->abi).name,
                    (unsigned long long) cpu->segfault_addr,
                    (unsigned long long) fault_ip, SAME_FAULT_LIMIT);
+            // "The page is there" is the emulator's conclusion, not a fact
+            // anyone has checked. This is the one place that can print what it
+            // is actually looking at, and every remaining theory about this
+            // loop is a claim about these flags: whether P_WRITE is set,
+            // whether P_COW survived the break, and whether the entry is even
+            // the one the store is addressing.
+            //
+            // Five device failures reduce to this loop (socket_kill,
+            // accept_kill, clone_error_cleanup, fifo_open_creat_deadlock,
+            // concurrent_exec_tlb, all at the same musl prologue push), and
+            // four repro attempts could not reach it off-device -- host page
+            // mirroring is compiled around real_page_size == PAGE_SIZE, so an
+            // x86_64 harness does not even run the same branches. The only way
+            // this gets answered is from the device, which means printing it
+            // here rather than reasoning about it anywhere else.
+            dump_fault_pt_state(cpu->segfault_addr);
         }
     } else {
         last_fault_addr = cpu->segfault_addr;
@@ -5091,6 +5107,12 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
                              "cap tripped, so something below here is still "
                              "seeing the tag"
                            : "unmapped as well, so the tag is not what killed it");
+            // The page-table state for the FAULTING address, not the pc. On
+            // amd64 this has always been printed; arm64 never had it, which is
+            // why "the access cannot complete even though the page is there"
+            // could be stated without anyone being able to see what "there"
+            // meant.
+            dump_fault_pt_state(cpu->segfault_addr);
             dump_addr_backing("  pc-backing", current_fault_ip(cpu));
             // And where the call came FROM. pc-backing alone was not enough
             // for the crash that prompted this: idmap2d faulted inside an
