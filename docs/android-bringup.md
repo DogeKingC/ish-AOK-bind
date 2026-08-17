@@ -657,11 +657,45 @@ fault-restart path is wrong would produce both symptoms depending on whether
 the page needed resolving. Do not assume they are the same bug -- but check
 `stp`'s restart path before assuming they are not.
 
-**Next step, and it is local.** The arm64 harness can host this: fork, then in
-the child make a call deep enough that its prologue `stp` writes an untouched
-COW stack page. If that reproduces under `tools/run-arm64-guest-tests.sh`, the
-loop drops to seconds and the suspects are the pre-indexed store-pair gadget
-and the write-fault restart contract in `jit/guest-arm64/`.
+**Copy-on-write is NOT the trigger.** That was the first hypothesis and it is
+wrong. `tests/manual/arm64/cow_store_restart.c` forks and then, in the child,
+writes freshly-COW stack *and* heap pages with a plain `str`, an `stp` without
+writeback, an `stp` with pre-index writeback, and real compiler prologues
+recursing down untouched pages. It passes under the harness **and on the
+device**. So faulting stores in every one of those forms complete correctly on
+real hardware; the file is kept as the regression lock for that.
+
+**What the full register block says instead.** Re-running `socket_kill` with
+`/proc/ish/arm64_faultdump` armed:
+
+```
+ERROR: 1888(socket_kill) [arm64] fault on 0xffffe9b0 at 0x7fffbdb7c9f0 keeps
+  resolving and re-faulting (16 times)
+  x8=0x87  x19=0xffffeb38  x22=0x775  x29=0xffffe9d0  x30=0x7fffbdb64b3c
+  sp=0xffffe9d0 pc=0x7fffbdb7c9f0
+```
+
+- `sp` is `0xffffe9d0` and the fault address is `0xffffe9b0` -- exactly
+  `sp - 0x20`, the `stp x29, x30, [sp, #-32]!` target. Confirmed, not inferred.
+- `x22 = 0x775` is 1909, a plausible pid, and the caller's next instruction
+  (`lr`, at `fork+...`) is `tbnz w22, #31` -- the check for a negative
+  `clone()` return. **So this is the PARENT, immediately after `clone()`
+  returned the child's pid.**
+- `x8 = 0x87` is 135, `rt_sigprocmask` on the asm-generic table -- the syscall
+  register still holding musl's signal-mask juggling around the fork.
+
+So the case is not "a child writes a COW page". It is **the parent, just back
+from `clone`, pushing a NEW frame below `sp`** onto a page `mem_ptr_fault`
+reports as present and writable while the actual store keeps failing. That is
+why `cow_store_restart.c` passes: none of its phases push a fresh frame below
+`sp` in the parent in the window right after `clone` returns.
+
+**Next step.** Extend the repro along that axis rather than the COW one: in the
+parent, immediately on return from `clone`/`fork`, call into a function deep
+enough to push below the pre-clone `sp`, in a loop, with the stack near
+`0xffffe000`. The suspects are the fork path's handling of the parent's own
+memory (`kernel/fork.c` / `mem_ptr_fault`'s writable resolution) rather than
+the store-pair gadget, since every store form is now known good.
 
 The other three SIGSEGVs (`accept_kill`, `clone_error_cleanup`,
 `fifo_open_creat_deadlock`) are not yet attributed. Two are regression tests

@@ -159,6 +159,12 @@ need_in tests/manual/setup-regressions.sh thread_identity
 need_file tests/manual/arm64/hle_callee_saved.c
 need_in fs/aok-tests.manifest             arm64/hle_callee_saved.c
 need_in tests/manual/setup-regressions.sh hle_callee_saved
+# Every faulting-store form against copy-on-write pages. Eliminated COW as
+# the cause of the re-faulting prologue store seen on device; kept as the
+# lock that says those forms still work.
+need_file tests/manual/arm64/cow_store_restart.c
+need_in fs/aok-tests.manifest             arm64/cow_store_restart.c
+need_in tests/manual/setup-regressions.sh cow_store_restart
 # HLE defaults to OFF, so the tests that exist to cover it were passing
 # against the plain interpreted path. The runner turns it on for those.
 need_in tools/run-arm64-guest-tests.sh "ISH_HLE=1" \

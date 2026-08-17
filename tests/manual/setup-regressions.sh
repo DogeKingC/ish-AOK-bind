@@ -147,6 +147,7 @@ if [ "$is_arm64_guest" -eq 1 ]; then
     need_file arm64/tagged_pointer.c
     need_file arm64/thread_identity.c
     need_file arm64/hle_callee_saved.c
+    need_file arm64/cow_store_restart.c
 fi
 if [ "$is_riscv64_guest" -eq 1 ]; then
     need_file riscv64/ptrace_regset.c
@@ -521,7 +522,7 @@ if [ "$is_amd64_guest" -eq 1 ]; then
     all_tests="$all_tests amd64_regress avx_regress amd64_incdec"
 fi
 if [ "$is_arm64_guest" -eq 1 ]; then
-    all_tests="$all_tests atomics64 arm64_regress vector_smoke smc_stale_block ret_retcache stlr_ldar_publish ptrace_singlestep ands_bcond_fusion hle_loop tagged_pointer thread_identity hle_callee_saved"
+    all_tests="$all_tests atomics64 arm64_regress vector_smoke smc_stale_block ret_retcache stlr_ldar_publish ptrace_singlestep ands_bcond_fusion hle_loop tagged_pointer thread_identity hle_callee_saved cow_store_restart"
 fi
 if [ "$is_riscv64_guest" -eq 1 ]; then
     all_tests="$all_tests ptrace_regset jalr_retcache"
