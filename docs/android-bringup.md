@@ -710,6 +710,40 @@ prints whether it still reached the real crash (139) rather than merely
 arms cannot be shown to have exercised the target is a green suite that tested
 nothing -- the same trap as the `-v` flag and the un-hooked HLE.
 
+**The next measurement, and the tool for it.** What is left is narrow and
+specific: single-core, deterministic, `str x0, [x19, #8]` does not land while
+`str x8, [x0]` eight bytes away does. So: does that store execute at all, and
+with what base?
+
+`/proc/ish/arm64_watch` answers it. iSH always recorded every store's
+`(ip, addr, oldval)` in a ring, but filtered on the address's low 16 bits or on
+the stored value -- neither of which repeats between runs under ASLR -- and was
+configurable only from `ISH_ARM64_WATCH_LO16`, which on iOS reads the *app's*
+environment and so was unreachable from a phone. Both are fixed:
+
+```sh
+echo all:200 > /proc/ish/arm64_watch    # record every store, dump last 200 on a fault
+echo off     > /proc/ish/arm64_watch
+```
+
+"Record everything" is the only filter that survives a re-run. Set it BEFORE
+launching the process -- `arm64_watch_enabled()` decides
+`requires_write_revalidate` at `mem_init`, so a process already running will not
+start funnelling its stores through it. Then:
+
+```sh
+echo all:200 > /proc/ish/arm64_watch
+( chroot /root/android-sys /system/bin/servicemanager & ) ; sleep 4
+chroot /root/android-sys /system/bin/idmap2d
+dmesg | grep -A 200 "arm64 watch ring"
+```
+
+The ring entries around the crash say whether a store to `object+8` ever
+happened and what address it used. If it is absent, the store never executed
+and the question becomes control flow. If it is present with a wrong address,
+`x19` did not survive the `bl _Znwm@plt` -- which the register probe says it
+should, so that would be a real find.
+
 **`idmap2d` is NOT this bug**, which was predicted and then checked rather than
 assumed: it still faults at `libutils.so+0x1aa80` with `lr` at `+0x11030`, a
 silently lost heap store with no re-fault at all. It remains open, below.
