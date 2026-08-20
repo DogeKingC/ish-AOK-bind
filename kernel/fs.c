@@ -782,6 +782,35 @@ static dword_t sys_mknodat_common(fd_t at_f, guest_addr_t path_addr, mode_t_ mod
     if (path_err)
         return path_err;
     STRACE("mknodat(%d, \"%s\", %#x, %#x)", at_f, path, mode, dev);
+    // A mode with NO type bits means a regular file. Linux says so explicitly
+    // -- sys_mknod's switch runs `case 0:' into `case S_IFREG:' -- and it is a
+    // normal way to create one. Passing the bare mode through instead built a
+    // tmpfs inode that was of no type at all, and the first write() to it hit
+    // an assert and took the whole app down with it. Five crash reports from
+    // build 548, two device families, two iOS versions, all this one thing.
+    if ((mode & S_IFMT) == 0)
+        mode |= S_IFREG;
+    // ...and a mode with a type that is not one of Linux's five is not a file
+    // of any kind. Linux checks this at the syscall boundary (may_mknod, called
+    // from do_mknodat) and returns EINVAL; without the same check a value like
+    // 0x3000 walks straight through generic_mknodat, which only rejects DIR and
+    // LNK, and builds a tmpfs inode whose type answers no S_IS*() question.
+    // Every later operation on it then hits an assert -- read, pread, pwrite and
+    // ftruncate each abort the WHOLE app, not just the caller, and mknod is not
+    // privileged for these types, so any guest process could do it. Closing it
+    // here means such an inode can no longer be created at all; the asserts
+    // those paths still carry became errno returns as well, on the principle
+    // that an assert reachable from a syscall argument is the wrong tool.
+    switch (mode & S_IFMT) {
+        case S_IFREG: case S_IFCHR: case S_IFBLK: case S_IFIFO: case S_IFSOCK:
+            break;
+        default:
+            // S_IFDIR and S_IFLNK reach generic_mknodat, which has said EINVAL
+            // to both since before this check existed; leaving them to it keeps
+            // one answer per type in one place.
+            if (!S_ISDIR(mode) && !S_ISLNK(mode))
+                return _EINVAL;
+    }
     apply_umask(&mode);
     struct fd *at = at_fd(at_f);
     if (at == NULL)
@@ -1134,10 +1163,14 @@ static dword_t sys_preadv_common(fd_t fd_no, guest_addr_t iovec_addr, dword_t io
     size_t io_size = iovec_size(iovec, iovec_count);
     if (io_size > MAX_RW_COUNT)
         io_size = MAX_RW_COUNT;
-    char *buf = malloc(io_size + 1);
-    if (buf == NULL) {
-        free(iovec);
-        return _ENOMEM;
+    char stack_buf[256] __attribute__((aligned(16)));
+    char *buf = stack_buf;
+    if (io_size + 1 > sizeof(stack_buf)) {
+        buf = malloc(io_size + 1);
+        if (buf == NULL) {
+            free(iovec);
+            return _ENOMEM;
+        }
     }
     struct fd *fd = f_get(fd_no);
     ssize_t res;
@@ -1179,7 +1212,8 @@ static dword_t sys_preadv_common(fd_t fd_no, guest_addr_t iovec_addr, dword_t io
         }
     }
 out:
-    free(buf);
+    if (buf != stack_buf)
+        free(buf);
     free(iovec);
     return res;
 }
@@ -1206,10 +1240,14 @@ static dword_t sys_pwritev_common(fd_t fd_no, guest_addr_t iovec_addr, dword_t i
     size_t io_size = iovec_size(iovec, iovec_count);
     if (io_size > MAX_RW_COUNT)
         io_size = MAX_RW_COUNT;
-    char *buf = malloc(io_size + 1);
-    if (buf == NULL) {
-        free(iovec);
-        return _ENOMEM;
+    char stack_buf[256] __attribute__((aligned(16)));
+    char *buf = stack_buf;
+    if (io_size + 1 > sizeof(stack_buf)) {
+        buf = malloc(io_size + 1);
+        if (buf == NULL) {
+            free(iovec);
+            return _ENOMEM;
+        }
     }
     ssize_t res = 0;
     size_t offset = 0;
@@ -1249,7 +1287,8 @@ static dword_t sys_pwritev_common(fd_t fd_no, guest_addr_t iovec_addr, dword_t i
     task_may_block_end();
     io_account_write(fd, res);
 out:
-    free(buf);
+    if (buf != stack_buf)
+        free(buf);
     free(iovec);
     return res;
 }

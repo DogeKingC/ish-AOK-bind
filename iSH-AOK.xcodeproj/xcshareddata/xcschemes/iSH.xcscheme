@@ -57,6 +57,7 @@
    </TestAction>
    <LaunchAction
       buildConfiguration = "Debug-ApplePleaseFixFB19282108"
+      customLLDBInitFile = "$(SRCROOT)/ish-lldb.lldbinit"
       selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
       enableASanStackUseAfterReturn = "YES"
@@ -131,6 +132,7 @@
    </AnalyzeAction>
    <ArchiveAction
       buildConfiguration = "Release"
+      customArchiveName = "iSH-AOK"
       revealArchiveInOrganizer = "YES">
    </ArchiveAction>
 </Scheme>

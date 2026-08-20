@@ -1332,7 +1332,15 @@ the emulator a tagged pointer any more.
 `tools/run-arm64-guest-tests.sh` cross-builds iSH for aarch64-linux (clang,
 `tools/cross-aarch64.ini`) and runs `tests/manual/arm64/*` under qemu-user
 against a real Alpine aarch64 rootfs, so the arm64 gadget set executes for
-real on an x86_64 development machine. All eleven tests pass there today.
+real on an x86_64 development machine. All fifteen tests pass there today.
+
+It needs `-Dnative_bash=disabled`, which the runner passes for it. Native
+bash brings `deps/bash/lib/sh/getenv.c`, force-included with
+`kernel/native_libc.h`, so it defines the same
+`nlibc_getenv`/`setenv`/`unsetenv`/`putenv` that `kernel/native_libc.c` does.
+ld64 and GNU ld pick one archive member and never notice; lld -- which the
+cross file requires for this target -- fails the link with four duplicate
+symbols, at the last step of a full cross build.
 
 **Every test binary it built used to be statically linked musl carrying a
 `PT_INTERP`,** and nothing said so. `musl-dev` ships `usr/lib/libc.so` as a

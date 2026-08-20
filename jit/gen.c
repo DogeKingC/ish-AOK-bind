@@ -10853,6 +10853,15 @@ static inline bool gen_pop_reg_fused(struct gen_state *state, enum arg thing,
     } \
 } while (0)
 #else
+// The fused reg,imm family is written in jit/gadgets-aarch64/math.S and has no
+// x86_64 counterpart, so on an x86_64 host there is nothing to point at: the
+// reference alone is a link error, which is why no x86_64 host could link this
+// at all. Fall back to the unfused expansion, which is what the runtime knob
+// (/proc/ish/i386_jit_fuse, jit.h) already does when a family is switched off
+// -- so this host takes a path the code supports rather than a new one.
+//
+// Same shape as the eight other `#if defined(__aarch64__)' guards above, which
+// exist for exactly this reason.
 // Fusion is an optimisation, so a host without the gadgets takes the plain
 // expansion and is merely slower, never wrong.
 #define losf(o, src, dst, z) los(o, src, dst, z)

@@ -104,7 +104,21 @@ mkdir -p "$WORK"
 
 # --- the emulator -----------------------------------------------------------
 if [ ! -d "$BUILD" ]; then
-    meson setup "$BUILD" "$SRC" --cross-file "$SRC/tools/cross-aarch64.ini" >"$WORK/setup.log" 2>&1 || {
+    # -Dnative_bash=disabled is required here, not a preference. Native bash
+    # brings deps/bash/lib/sh/getenv.c, which is force-included with
+    # kernel/native_libc.h and so defines nlibc_getenv/setenv/unsetenv/putenv --
+    # the same four symbols kernel/native_libc.c defines. ld64 (iOS) and GNU ld
+    # (the x86_64 Linux build) both resolve it by archive-member selection and
+    # never pull the second definition; lld, which tools/cross-aarch64.ini
+    # requires for this target, reports four duplicate symbols and the link
+    # fails at the very last step, after a full compile.
+    #
+    # Nothing here needs a native shell: this harness cross-builds the emulator
+    # only to run guest binaries under qemu-user. Disabling it costs the arm64
+    # gate nothing and keeps meson.build identical to upstream's, which is
+    # where this fork used to carry a whole non-Darwin gate of its own.
+    meson setup "$BUILD" "$SRC" --cross-file "$SRC/tools/cross-aarch64.ini" \
+            -Dnative_bash=disabled >"$WORK/setup.log" 2>&1 || {
         echo "meson setup failed; see $WORK/setup.log" >&2
         tail -20 "$WORK/setup.log" >&2
         exit 1

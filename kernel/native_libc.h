@@ -60,11 +60,35 @@
 #endif
 #include <poll.h>
 #include <signal.h>
+#include <syslog.h>
+#include <sys/mman.h>
 #include <sys/ioctl.h>
+/* Before the `flock(a, b)' macro below: glibc DECLARES flock in <sys/file.h>,
+ * and a function-like macro matches that declaration -- rewriting
+ * `flock (int __fd, int __operation)' into `nlibc_flock((int __fd), ...)',
+ * which gcc reports as "expected declaration specifiers" and clang as
+ * "conflicting types for 'nlibc_flock'". Letting the real header land first
+ * leaves nothing for the macro to mangle. Darwin declares it elsewhere, which
+ * is why this never mattered here. */
+#include <sys/file.h>
 #include <sys/mount.h>
+#if defined(__linux__)
+/* struct statfs is declared by <sys/mount.h> on Darwin and by <sys/vfs.h> on
+ * glibc, where <sys/mount.h> gives only the mount(2) flags. Without this the
+ * type is incomplete everywhere nlibc_statfs touches it. */
+#include <sys/vfs.h>
+#endif
 #include <sys/select.h>
 #include <sys/time.h>
+/* Not on Linux: glibc dropped <sys/sysctl.h> in 2.32 and musl never had it.
+ * Nothing here needs its contents -- nlibc_sysctl and nlibc_sysctlbyname take
+ * plain types and only set ENOTSUP, and no CTL_* constant is used anywhere in
+ * the tree -- so the include exists to declare the real thing before the
+ * `#define sysctl nlibc_sysctl' below renames the callers. Where the header is
+ * absent there is no real declaration to precede, and the rename still works. */
+#if defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/sysctl.h>
+#endif
 #include <grp.h>
 #include <pwd.h>
 #include <stdnoreturn.h>
@@ -95,11 +119,17 @@ int nlibc_lstat(const char *path, struct stat *st);
 int nlibc_fstat(int fd, struct stat *st);
 ssize_t nlibc_readlink(const char *path, char *buf, size_t bufsize);
 char *nlibc_realpath(const char *path, char *resolved);
+int nlibc_fstatat(int dirfd, const char *path, struct stat *st, int flags);
+int nlibc_unlinkat(int dirfd, const char *path, int flags);
 
 /* --- directories -------------------------------------------------------- */
 DIR *nlibc_opendir(const char *path);
 struct dirent *nlibc_readdir(DIR *dir);
 int nlibc_closedir(DIR *dir);
+/* The descriptor behind a DIR. Ours, necessarily: nlibc_opendir hands back a
+ * private struct rather than a host DIR, so the host's dirfd() would read a
+ * field out of a layout that is not there. */
+int nlibc_dirfd(DIR *dir);
 
 /* --- mutation ----------------------------------------------------------- */
 int nlibc_unlink(const char *path);
@@ -134,6 +164,25 @@ int nlibc_putchar(int c);
 void nlibc_perror(const char *s);
 /* Flush the wrapped standard streams; see the note in nlibc_std_stream. */
 void nlibc_flush_std(void);
+/* Flush without ever waiting on a lock. What a shutdown path wants in place of
+ * fflush(NULL), which hangs for ever on a stream whose lock a departed native
+ * program's thread still holds. See the .c. */
+void nlibc_flush_stream_if_lockable(FILE *stream);
+void nlibc_flush_all_streams(void);
+/* Just the calling thread's streams -- that is, one native program's. */
+void nlibc_flush_thread_streams(void);
+/* fflush, except that NULL means "the streams this program owns" rather than
+ * "every stream in the process". See the .c. */
+int nlibc_fflush(FILE *stream);
+/* fclose, plus dropping the stream from the registry fileno() reads. */
+int nlibc_fclose(FILE *stream);
+/* klogctl(2) against the guest's ring buffer, the one AOK fills. */
+int nlibc_klogctl(int type, char *bufp, int len);
+
+/* True when this thread is too close to the end of its stack to recurse
+ * again. See the comment on the definition: overrunning it takes the whole
+ * app, not one program. */
+int nlibc_stack_exhausted(void);
 /* The guest fd a stream was built over. NOT the host's fileno, which answers
  * -1 for a funopen stream and sets EBADF -- see the .c. */
 int nlibc_fileno(FILE *stream);
@@ -156,11 +205,25 @@ pid_t nlibc_getppid(void);
 int nlibc_getgroups(int size, gid_t list[]);
 int nlibc_setuid(uid_t uid);
 int nlibc_setgid(gid_t gid);
+/* The EFFECTIVE half of the same family, over the guest's setresuid/setresgid.
+ * Not an afterthought: a native "child" is a host THREAD of this app, so a host
+ * seteuid that succeeded would move the whole app's credentials. */
+int nlibc_seteuid(uid_t uid);
+int nlibc_setegid(gid_t gid);
+int nlibc_setgroups(int size, const gid_t *list);
 int nlibc_initgroups(const char *user, gid_t group);
 struct passwd *nlibc_getpwuid(uid_t uid);
 struct passwd *nlibc_getpwnam(const char *name);
 struct group *nlibc_getgrgid(gid_t gid);
 struct group *nlibc_getgrnam(const char *name);
+int nlibc_getgrouplist(const char *name, int basegid, int *groups, int *ngroups);
+/* uid/gid -> name, from the GUEST's /etc/passwd and /etc/group. The pair
+ * getpwuid and getgrgid were already routed and these two were not, which is
+ * the whole-family failure this round of work keeps finding. */
+const char *nlibc_user_from_uid(uid_t uid, int nouser);
+const char *nlibc_group_from_gid(gid_t gid, int nogroup);
+/* Password hashing. A refusal, not an implementation -- see the .c. */
+char *nlibc_crypt(const char *key, const char *salt);
 
 /* Signals. A handler is host code, so it cannot be given to the kernel to jump
  * to; SIG_DFL/SIG_IGN reach the kernel and a real handler is held here and run
@@ -172,6 +235,8 @@ int nlibc_sigpending(sigset_t *set);
 int nlibc_sigwait(const sigset_t *set, int *sig);
 /* Runs whatever handlers are pending. Called from native_checkpoint. */
 void nlibc_deliver_signals(void);
+/* The same, reporting how many handlers ran -- see nlibc_sigsuspend. */
+int nlibc_deliver_signals_count(void);
 
 /* Session and process group: plain kernel state, so plain syscalls. */
 pid_t nlibc_setsid(void);
@@ -196,6 +261,32 @@ int nlibc_setenv(const char *name, const char *value, int overwrite);
 int nlibc_unsetenv(const char *name);
 int nlibc_putenv(char *entry);
 
+/* --- option parsing ------------------------------------------------------
+ * getopt's optind/optarg/opterr/optopt/optreset are ONE copy per process in
+ * libSystem, and so is the scanning pointer inside getopt itself. A native
+ * program is a function on a task's thread, so two of them parsing argv at
+ * once share that copy: six concurrent `smallclue ssh-keygen ... -f /tmp/cN`
+ * lost the -f in three of them. These are the per-thread replacements.
+ *
+ * `struct option` is only forward-declared: <getopt.h> completes it for most
+ * consumers and OpenSSH's openbsd-compat/getopt.h for the rest, and including
+ * a header here would decide that for them. The layout is the same everywhere
+ * this builds, so the pointer is all these need. */
+struct option;
+int nlibc_getopt(int argc, char *const argv[], const char *optstring);
+int nlibc_getopt_long(int argc, char *const argv[], const char *optstring,
+        const struct option *longopts, int *longindex);
+int nlibc_getopt_long_only(int argc, char *const argv[], const char *optstring,
+        const struct option *longopts, int *longindex);
+/* The SLOTS, not the values: every one of these has to be assignable -- a
+ * program resets optind to restart a parse and clears opterr to silence the
+ * error messages -- and a call is not an lvalue. Same shape as environ. */
+char **nlibc_optargp(void);
+int *nlibc_optindp(void);
+int *nlibc_opterrp(void);
+int *nlibc_optoptp(void);
+int *nlibc_optresetp(void);
+
 /* --- remaining host-libc holes; see the block comment in the .c ---------- */
 int nlibc_dup(int fd);
 int nlibc_dup2(int oldfd, int newfd);
@@ -206,8 +297,17 @@ int nlibc_poll(void *fds, unsigned nfds, int timeout);
 int nlibc_select(int nfds, void *r, void *w, void *e, void *timeout);
 int nlibc_fork(void);
 int nlibc_execl(const char *path, const char *arg0, ...);
+/* execl's PATH-searching twin. execv, execvp, execl and execve were all routed
+ * and this one was not -- the single form that BOTH takes varargs and walks
+ * PATH, so left alone it resolved an SSH_ASKPASS name against the MAC's PATH
+ * and exec'd a device binary over the app. */
+int nlibc_execlp(const char *file, const char *arg0, ...);
 int nlibc_chroot(const char *path);
 int nlibc_kill(pid_t pid, int sig);
+/* raise() is kill(getpid()), and the guest's kill ends the TASK where the
+ * host's would end the app. Routed rather than tolerated the way abort() is:
+ * kill and signal are already here, so there is nothing to trade off. */
+int nlibc_raise(int sig);
 int nlibc_mknod(const char *path, mode_t mode, dev_t dev);
 int nlibc_mkstemp(char *template);
 int nlibc_utimes(const char *path, const struct timeval times[2]);
@@ -252,6 +352,7 @@ int nlibc_ioctl_tty(int fd, unsigned long request, void *arg);
  * with the same close/poll/select/dup as everything else a native program
  * holds. Every constant and every sockaddr is translated; see the .c. */
 int nlibc_socket(int domain, int type, int protocol);
+int nlibc_socketpair(int domain, int type, int protocol, int fds[2]);
 int nlibc_bind(int fd, const void *addr, socklen_t len);
 int nlibc_connect(int fd, const void *addr, socklen_t len);
 int nlibc_listen(int fd, int backlog);
@@ -265,8 +366,18 @@ ssize_t nlibc_recv(int fd, void *buf, size_t len, int flags);
 ssize_t nlibc_recvfrom(int fd, void *buf, size_t len, int flags,
         void *addr, socklen_t *addrlen);
 int nlibc_shutdown(int fd, int how);
+/* Scatter/gather with ancillary data -- which for OpenSSH means SCM_RIGHTS fd
+ * passing over the mux socket. Every fd inside the cmsg is a GUEST descriptor
+ * and the cmsghdr layout is the guest's, neither of which the host's sendmsg
+ * could have got right. */
+ssize_t nlibc_sendmsg(int fd, const struct msghdr *msg, int flags);
+ssize_t nlibc_recvmsg(int fd, struct msghdr *msg, int flags);
 int nlibc_setsockopt(int fd, int level, int option, const void *value, socklen_t len);
 int nlibc_getsockopt(int fd, int level, int option, void *value, socklen_t *len);
+/* The peer's credentials on a guest AF_UNIX socket, over the guest's
+ * SO_PEERCRED (fs/sock.c). The host's getpeereid answers about a host
+ * descriptor with the same number, i.e. about the iOS account. */
+int nlibc_getpeereid(int fd, uid_t *euid, gid_t *egid);
 
 /* Resolution, from the guest's files rather than the Mac's. */
 int nlibc_getaddrinfo(const char *node, const char *service,
@@ -277,6 +388,29 @@ int nlibc_getnameinfo(const void *addr, socklen_t addrlen, char *host, socklen_t
         char *serv, socklen_t servlen, int flags);
 int nlibc_getifaddrs(struct ifaddrs **ifap);
 void nlibc_freeifaddrs(struct ifaddrs *ifa);
+
+/* The older resolver interface, over the same guest /etc/hosts, guest
+ * /etc/resolv.conf and guest sockets getaddrinfo already uses -- one binary
+ * must not carry two resolvers free to disagree.
+ *
+ * getipnodebyname and freehostent are ONE entry, not two. The caller frees what
+ * getipnodebyname returned; routing either alone hands a pointer from one
+ * allocator to the other's free path, which is corruption rather than a wrong
+ * answer. See the .c. */
+struct hostent *nlibc_gethostbyname(const char *name);
+struct hostent *nlibc_gethostbyname2(const char *name, int af);
+struct hostent *nlibc_gethostbyaddr(const void *addr, socklen_t len, int af);
+struct hostent *nlibc_getipnodebyname(const char *name, int af, int flags,
+        int *error_num);
+struct hostent *nlibc_getipnodebyaddr(const void *addr, size_t len, int af,
+        int *error_num);
+void nlibc_freehostent(struct hostent *he);
+/* /etc/protocols, the neighbour of /etc/services below. */
+void nlibc_setprotoent(int stayopen);
+void nlibc_endprotoent(void);
+struct protoent *nlibc_getprotoent(void);
+struct protoent *nlibc_getprotobyname(const char *name);
+struct protoent *nlibc_getprotobynumber(int proto);
 
 int nlibc_tcflush(int fd, int queue);
 int nlibc_tcdrain(int fd);
@@ -289,6 +423,39 @@ int nlibc_grantpt(int fd);
 int nlibc_unlockpt(int fd);
 char *nlibc_ptsname(int fd);
 char *nlibc_ttyname(int fd);
+/* The whole dance in one call, which is what OpenSSH's sshpty.c asks for. Left
+ * to the host it would allocate a DEVICE pty and hand back host descriptors. */
+struct winsize;
+int nlibc_openpty(int *amaster, int *aslave, char *name,
+        struct termios *termp, struct winsize *winp);
+
+/* --- terminal capabilities -----------------------------------------------
+ * The termcap API, answered from the GUEST's terminfo database rather than a
+ * host library reading a host database. kernel/native_termcap.c has the long
+ * version; the short one is that these six names were missing here, so on a
+ * device -- which ships no terminfo at all -- every capability came back
+ * empty and ZLE could not move the cursor.
+ *
+ * NATIVE_LIBC_OWN_TERMCAP is the same escape hatch NATIVE_LIBC_OWN_GLOB is,
+ * for a program that DEFINES these names itself -- rewriting them there would
+ * rename the definitions and collide with kernel/native_termcap.c. Nothing
+ * uses it today. bash did, while it still compiled its bundled GNU termcap
+ * (deps/bash/lib/termcap); that copy reads /etc/termcap, which none of the
+ * rootfs images ship, so readline resolved nothing and its editor could not
+ * move the cursor either. Those two files are out of bash's build now
+ * (meson.build) and readline comes through here like zsh does. */
+#ifndef NATIVE_LIBC_OWN_TERMCAP
+/* The historical termcap signatures, `char *` throughout rather than
+ * `const char *`. Not a style choice: zsh's Src/prototypes.h declares these
+ * itself for every translation unit that does no terminal handling, and a
+ * declaration we cannot edit is the one the rest has to agree with. */
+int nlibc_tgetent(char *bp, char *name);
+int nlibc_tgetflag(char *id);
+int nlibc_tgetnum(char *id);
+char *nlibc_tgetstr(char *id, char **area);
+char *nlibc_tgoto(char *cap, int col, int row);
+int nlibc_tputs(char *str, int affcnt, int (*putc_fn)(int));
+#endif
 
 /* Odds and ends that answered about the host: its /tmp, its CPU count, its
  * page size, its resource usage. */
@@ -313,6 +480,11 @@ FILE *nlibc_popen(const char *command, const char *mode);
 int nlibc_pclose(FILE *stream);
 pid_t nlibc_waitpid(pid_t pid, int *status, int options);
 pid_t nlibc_wait(int *status);
+/* wait3/wait4: what a native SHELL reaps its children with. The rusage is
+ * zeroed -- AOK has no per-task accounting -- but the reaping is real. */
+struct rusage;
+pid_t nlibc_wait3(int *status, int options, struct rusage *rusage);
+pid_t nlibc_wait4(pid_t pid, int *status, int options, struct rusage *rusage);
 
 /* --- the rest of the kernel surface ------------------------------------- */
 /* Added by walking the syscall table rather than by waiting for a program to
@@ -324,6 +496,44 @@ int nlibc_fsync(int fd);
 int nlibc_fdatasync(int fd);
 int nlibc_ftruncate(int fd, off_t len);
 int nlibc_syncfs(int fd);
+/* sync(2) and the extended-attribute family. Both answer with a constant the
+ * guest's own syscall table already holds -- sync is a success stub there and
+ * every xattr entry is _ENOTSUP -- rather than reaching the DEVICE's buffers
+ * and the DEVICE's filesystem. Neither number reaches the generated header;
+ * the .c says why for each. */
+void nlibc_sync(void);
+/* Darwin's xattr calls take a position and an options word; Linux's take
+ * neither, and split "do not follow symlinks" into separate l-prefixed calls.
+ * Every one of these is an ENOTSUP stub -- see the note above -- so only the
+ * SHAPE has to match the platform, or the `#define getxattr nlibc_getxattr'
+ * below turns glibc's own declaration into a conflicting one. */
+#if defined(__linux__)
+ssize_t nlibc_getxattr(const char *path, const char *name, void *value, size_t size);
+ssize_t nlibc_fgetxattr(int fd, const char *name, void *value, size_t size);
+int nlibc_setxattr(const char *path, const char *name, const void *value,
+        size_t size, int flags);
+int nlibc_fsetxattr(int fd, const char *name, const void *value,
+        size_t size, int flags);
+ssize_t nlibc_listxattr(const char *path, char *names, size_t size);
+ssize_t nlibc_flistxattr(int fd, char *names, size_t size);
+int nlibc_removexattr(const char *path, const char *name);
+int nlibc_fremovexattr(int fd, const char *name);
+#else
+ssize_t nlibc_getxattr(const char *path, const char *name, void *value,
+        size_t size, uint32_t position, int options);
+ssize_t nlibc_fgetxattr(int fd, const char *name, void *value,
+        size_t size, uint32_t position, int options);
+int nlibc_setxattr(const char *path, const char *name, const void *value,
+        size_t size, uint32_t position, int options);
+int nlibc_fsetxattr(int fd, const char *name, const void *value,
+        size_t size, uint32_t position, int options);
+ssize_t nlibc_listxattr(const char *path, char *names, size_t size, int options);
+ssize_t nlibc_flistxattr(int fd, char *names, size_t size, int options);
+int nlibc_removexattr(const char *path, const char *name, int options);
+int nlibc_fremovexattr(int fd, const char *name, int options);
+#endif
+/* nice(3): the host's renices the thread the EMULATOR runs on. */
+int nlibc_nice(int incr);
 pid_t nlibc_gettid(void);
 int nlibc_sched_yield(void);
 mode_t nlibc_umask(mode_t mask);
@@ -362,12 +572,37 @@ struct passwd *nlibc_getpwent(void);
 void nlibc_setservent(int stayopen);
 void nlibc_endservent(void);
 struct servent *nlibc_getservent(void);
+/* The LOOKUPS over that same guest database. ssh calls default_ssh_port() on
+ * essentially every run, and it is getservbyname("ssh", "tcp"). */
+struct servent *nlibc_getservbyname(const char *name, const char *proto);
+struct servent *nlibc_getservbyport(int port, const char *proto);
 void nlibc_setgrent(void);
 void nlibc_endgrent(void);
 struct group *nlibc_getgrent(void);
+/* The login database. The host's utmpx is the DEVICE's session list, and with
+ * $WATCH set a guest shell printed it by name. The guest's /var/run/utmp is
+ * LINUX's 384-byte layout, which Darwin's struct utmpx cannot be pointed at --
+ * so the file is parsed by offset in the .c and a struct utmpx is built from
+ * it. `struct utmpx` is named rather than defined here: <utmpx.h> stays out of
+ * this header (nothing but these six need it) and a pointer to an incomplete
+ * type is all a rewrite of a call site requires. */
+struct utmpx;
+void nlibc_setutxent(void);
+void nlibc_endutxent(void);
+struct utmpx *nlibc_getutxent(void);
+struct utmpx *nlibc_getutxline(const struct utmpx *want);
+struct utmpx *nlibc_getutxid(const struct utmpx *want);
+struct utmpx *nlibc_pututxline(const struct utmpx *line);
+/* Which guest user this is, from that database and then from the guest's
+ * /etc/passwd -- not the Mac's login session, which is what $LOGNAME held. */
+char *nlibc_getlogin(void);
+int nlibc_getlogin_r(char *buf, size_t len);
 int nlibc_execve(const char *path, char *const argv[], char *const envp[]);
 int nlibc_pselect(int nfds, void *r, void *w, void *e,
         const struct timespec *timeout, const sigset_t *sigmask);
+/* sigsuspend, over pselect. See the .c for why an unrouted one hangs a shell
+ * that is waiting for a child. */
+int nlibc_sigsuspend(const sigset_t *mask);
 /* posix_spawn: the general answer to "a native program cannot fork". A program
  * that starts children this way needs no patch at all, which is what retires
  * the per-program spawn seams SmallCLUE and Nextvi both carry. The file-actions
@@ -405,11 +640,36 @@ int nlibc_posix_spawnattr_getpgroup(void **attr, pid_t *out);
 int nlibc_posix_spawnattr_setsigdefault(void **attr, const sigset_t *set);
 int nlibc_posix_spawnattr_setsigmask(void **attr, const sigset_t *set);
 int nlibc_posix_spawn(pid_t *pid, const char *path,
-        const void **fa, const void **attr,
+        void **fa, void **attr,
         char *const argv[], char *const envp[]);
 int nlibc_posix_spawnp(pid_t *pid, const char *file,
-        const void **fa, const void **attr,
+        void **fa, void **attr,
         char *const argv[], char *const envp[]);
+
+/* Logging. The device's log is not the guest's: openlog/syslog land in os_log
+ * or ASL on iOS and in the Mac's syslog on the CLI, where the guest has its own
+ * /dev/log that AOK already serves (fs/sock.c). openlog also sets a
+ * PROCESS-WIDE identity on the host, so one guest task running ssh would rename
+ * the log identity of the whole app. */
+void nlibc_openlog(const char *ident, int option, int facility);
+void nlibc_syslog(int priority, const char *fmt, ...)
+        __attribute__((format(printf, 2, 3)));
+void nlibc_vsyslog(int priority, const char *fmt, va_list ap);
+void nlibc_closelog(void);
+
+/* mmap is the one entry here that must give two DIFFERENT answers in the same
+ * build, so it is a wrapper rather than a rename -- see the .c. */
+void *nlibc_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset);
+int nlibc_munmap(void *addr, size_t len);
+/* msync exists to stay COUPLED to that branch: every mapping nlibc_mmap hands
+ * back is host anonymous memory with nothing to write back, and the day
+ * file-backed MAP_SHARED is allowed it stops being a no-op. */
+int nlibc_msync(void *addr, size_t len, int flags);
+
+/* The running executable's path, which on the host is the app's. There is no
+ * guest answer available to give, so this reports failure -- see the .c for why
+ * that is the right answer rather than a gap, and what a caller falls back to. */
+int nlibc_NSGetExecutablePath(char *buf, uint32_t *bufsize);
 
 void *nlibc_dlopen(const char *path, int mode);
 void *nlibc_dlsym(void *handle, const char *symbol);
@@ -440,10 +700,19 @@ const char *nlibc_dlerror(void);
 #define fstat       nlibc_fstat
 #define readlink    nlibc_readlink
 #define realpath    nlibc_realpath
+/* Object-like, unlike stat above: `fstatat` is only a function name, and
+ * OpenSSH's openbsd-compat/bsd-misc.h declares it with UNNAMED parameters --
+ * `int fstatat(int, const char *, struct stat *, int);` -- which a
+ * function-like macro would try to expand as a call and mangle into implicit
+ * ints. Prototypes are the reason to prefer the object-like form wherever the
+ * name is not also a struct tag. */
+#define fstatat     nlibc_fstatat
+#define unlinkat    nlibc_unlinkat
 
 #define opendir     nlibc_opendir
 #define readdir     nlibc_readdir
 #define closedir    nlibc_closedir
+#define dirfd       nlibc_dirfd
 
 #define unlink      nlibc_unlink
 #define rmdir       nlibc_rmdir
@@ -473,6 +742,15 @@ const char *nlibc_dlerror(void);
 #define putchar     nlibc_putchar
 #define perror      nlibc_perror
 #define fileno      nlibc_fileno
+/* The GUEST's kernel ring buffer. There is no host klogctl on Darwin at all,
+ * and on Linux the host's would be the wrong kernel; see the .c. */
+#define klogctl     nlibc_klogctl
+/* fflush(f) needs no help; fflush(NULL) does -- it is a whole-process
+ * operation in a place where a "process" is one thread. See the .c. */
+#define fflush      nlibc_fflush
+/* fclose reaches nothing on the host, but it does have to drop the stream from
+ * the shim's registry -- otherwise the entry outlives the FILE. See the .c. */
+#define fclose      nlibc_fclose
 #define setlocale   nlibc_setlocale
 
 #define execv       nlibc_execv
@@ -482,6 +760,8 @@ const char *nlibc_dlerror(void);
 #define pclose      nlibc_pclose
 #define waitpid     nlibc_waitpid
 #define wait        nlibc_wait
+#define wait3       nlibc_wait3
+#define wait4       nlibc_wait4
 
 #define dup         nlibc_dup
 #define dup2        nlibc_dup2
@@ -492,10 +772,24 @@ const char *nlibc_dlerror(void);
 #define select      nlibc_select
 #define fork        nlibc_fork
 #define execl       nlibc_execl
+#define execlp      nlibc_execlp
 #define chroot      nlibc_chroot
 #define kill        nlibc_kill
+#define raise       nlibc_raise
 #define mknod       nlibc_mknod
 #define mkstemp     nlibc_mkstemp
+/* OpenSSH's openbsd-compat/openbsd-compat.h carries an UNCONDITIONAL
+ * `#define mkstemp(x) _ssh_mkstemp(x)`, which is included after this header and
+ * simply overwrites the line above -- so every ssh call site expanded to a
+ * name that was NOT routed, and openbsd-compat/mktemp.c then opened with
+ * `#ifdef mkstemp / #undef mkstemp` to make sure its own call reached the host.
+ * The rewrite below catches the rescan: mkstemp(x) -> _ssh_mkstemp(x) ->
+ * nlibc_mkstemp(x). mktemp.c is dropped from the build in meson.build so
+ * nothing defines the host-reaching wrapper; see the note there.
+ *
+ * There is no HAVE_* guard on that macro, so config.h could not have been the
+ * lever, and a -D could not either -- the #undef would have removed it. */
+#define _ssh_mkstemp nlibc_mkstemp
 #define utimes      nlibc_utimes
 #define futimes     nlibc_futimes
 /* Function-like, as with stat above: `statfs` names both a function and a
@@ -513,6 +807,11 @@ const char *nlibc_dlerror(void);
 #define mount(a, b, c, d, e)     nlibc_mount((a), (b), (c), (d), (e))
 #define getmntinfo               nlibc_getmntinfo
 #define uname(a)                 nlibc_uname((a))
+/* Not in libSystem below iOS 18.4 / macOS 15.4, so a weak import that is NULL
+ * on older devices. See the definition for the crash it caused. */
+char *nlibc_strchrnul(const char *s, int c);
+#define strchrnul                nlibc_strchrnul
+
 #define sysctl                   nlibc_sysctl
 #define sysctlbyname             nlibc_sysctlbyname
 #define sleep                    nlibc_sleep
@@ -534,6 +833,9 @@ const char *nlibc_dlerror(void);
 #define getgroups                nlibc_getgroups
 #define setuid                   nlibc_setuid
 #define setgid                   nlibc_setgid
+#define seteuid                  nlibc_seteuid
+#define setegid                  nlibc_setegid
+#define setgroups                nlibc_setgroups
 #define initgroups               nlibc_initgroups
 /* `environ` is a variable, not a call, and it has to stay per-task -- so the
  * rewrite makes it one. SmallCLUE's own `extern char **environ;` becomes a
@@ -541,6 +843,7 @@ const char *nlibc_dlerror(void);
  * it, which is what keeps two concurrently-running native programs from
  * sharing one environment. */
 #define socket                   nlibc_socket
+#define socketpair               nlibc_socketpair
 #define bind                     nlibc_bind
 #define connect                  nlibc_connect
 #define listen                   nlibc_listen
@@ -552,14 +855,28 @@ const char *nlibc_dlerror(void);
 #define recv                     nlibc_recv
 #define recvfrom                 nlibc_recvfrom
 #define shutdown                 nlibc_shutdown
+#define sendmsg                  nlibc_sendmsg
+#define recvmsg                  nlibc_recvmsg
 #define setsockopt               nlibc_setsockopt
 #define getsockopt               nlibc_getsockopt
+#define getpeereid               nlibc_getpeereid
 #define getaddrinfo              nlibc_getaddrinfo
 #define freeaddrinfo             nlibc_freeaddrinfo
 #define gai_strerror             nlibc_gai_strerror
 #define getnameinfo(a,b,c,d,e,f,g) nlibc_getnameinfo((a),(b),(c),(d),(e),(f),(g))
 #define getifaddrs               nlibc_getifaddrs
 #define freeifaddrs              nlibc_freeifaddrs
+#define gethostbyname            nlibc_gethostbyname
+#define gethostbyname2           nlibc_gethostbyname2
+#define gethostbyaddr            nlibc_gethostbyaddr
+#define getipnodebyname          nlibc_getipnodebyname
+#define getipnodebyaddr          nlibc_getipnodebyaddr
+#define freehostent              nlibc_freehostent
+#define setprotoent              nlibc_setprotoent
+#define endprotoent              nlibc_endprotoent
+#define getprotoent              nlibc_getprotoent
+#define getprotobyname           nlibc_getprotobyname
+#define getprotobynumber         nlibc_getprotobynumber
 
 #define tcflush                  nlibc_tcflush
 #define tcdrain                  nlibc_tcdrain
@@ -568,6 +885,15 @@ const char *nlibc_dlerror(void);
 #define unlockpt                 nlibc_unlockpt
 #define ptsname                  nlibc_ptsname
 #define ttyname                  nlibc_ttyname
+#define openpty                  nlibc_openpty
+#ifndef NATIVE_LIBC_OWN_TERMCAP
+#define tgetent                  nlibc_tgetent
+#define tgetflag                 nlibc_tgetflag
+#define tgetnum                  nlibc_tgetnum
+#define tgetstr                  nlibc_tgetstr
+#define tgoto                    nlibc_tgoto
+#define tputs                    nlibc_tputs
+#endif
 #define tmpfile                  nlibc_tmpfile
 #ifndef NATIVE_LIBC_OWN_GLOB
 #define globfree                 nlibc_globfree
@@ -597,6 +923,10 @@ const char *nlibc_dlerror(void);
 #define getpwnam                 nlibc_getpwnam
 #define getgrgid                 nlibc_getgrgid
 #define getgrnam                 nlibc_getgrnam
+#define getgrouplist             nlibc_getgrouplist
+#define user_from_uid            nlibc_user_from_uid
+#define group_from_gid           nlibc_group_from_gid
+#define crypt                    nlibc_crypt
 
 /* --- the rest of the kernel surface ------------------------------------- */
 #define fchmod                   nlibc_fchmod
@@ -606,12 +936,27 @@ const char *nlibc_dlerror(void);
 #define fdatasync                nlibc_fdatasync
 #define ftruncate                nlibc_ftruncate
 #define syncfs                   nlibc_syncfs
+#define sync                     nlibc_sync
+#define getxattr                 nlibc_getxattr
+#define fgetxattr                nlibc_fgetxattr
+#define setxattr                 nlibc_setxattr
+#define fsetxattr                nlibc_fsetxattr
+#define listxattr                nlibc_listxattr
+#define flistxattr               nlibc_flistxattr
+#define removexattr              nlibc_removexattr
+#define fremovexattr             nlibc_fremovexattr
+#define nice                     nlibc_nice
 #define gettid                   nlibc_gettid
 #define sched_yield              nlibc_sched_yield
 #define umask                    nlibc_umask
 #define setreuid                 nlibc_setreuid
 #define setregid                 nlibc_setregid
-#define flock                    nlibc_flock
+/* Function-like, for the reason spelled out at statfs above: `flock` names
+ * both a function and a STRUCT TAG (<fcntl.h>'s record-locking struct), and an
+ * object-like macro rewrites `struct flock lck;` into `struct nlibc_flock`,
+ * which does not exist. zsh's Src/Modules/files.c is where that surfaced. Two
+ * arguments always, in every caller and in POSIX. */
+#define flock(a, b)              nlibc_flock((a), (b))
 #define killpg                   nlibc_killpg
 #define faccessat                nlibc_faccessat
 /* Function-like: `rlimit`, `itimerval`, `tms` and `iovec` are struct tags as
@@ -632,6 +977,15 @@ const char *nlibc_dlerror(void);
 #define getentropy               nlibc_getentropy
 #define mkdtemp                  nlibc_mkdtemp
 #define mktemp                   nlibc_mktemp
+/* Darwin's own name for the same function, and the one zsh actually calls:
+ * config.h defines HAVE__MKTEMP, so Src/utils.c's gettempname() -- every
+ * here-string, process substitution, named pipe and `fc` edit -- declares
+ * `extern char *_mktemp(char *)` and calls THAT. Routing `mktemp` alone left it
+ * behind: the uniqueness check ran against the DEVICE's filesystem while the
+ * file was then created in the guest, so the guest-side collision check never
+ * happened at all. The rewrite catches the extern declaration too, which is
+ * why the signature above has to match it exactly. */
+#define _mktemp                  nlibc_mktemp
 #define pathconf                 nlibc_pathconf
 #define fpathconf                nlibc_fpathconf
 #define confstr                  nlibc_confstr
@@ -641,11 +995,22 @@ const char *nlibc_dlerror(void);
 #define setservent               nlibc_setservent
 #define endservent               nlibc_endservent
 #define getservent               nlibc_getservent
+#define getservbyname            nlibc_getservbyname
+#define getservbyport            nlibc_getservbyport
 #define setgrent                 nlibc_setgrent
 #define endgrent                 nlibc_endgrent
 #define getgrent                 nlibc_getgrent
+#define setutxent                nlibc_setutxent
+#define endutxent                nlibc_endutxent
+#define getutxent                nlibc_getutxent
+#define getutxline               nlibc_getutxline
+#define getutxid                 nlibc_getutxid
+#define pututxline               nlibc_pututxline
+#define getlogin                 nlibc_getlogin
+#define getlogin_r               nlibc_getlogin_r
 #define execve                   nlibc_execve
 #define pselect(a,b,c,d,e,f)     nlibc_pselect((a),(b),(c),(d),(e),(f))
+#define sigsuspend               nlibc_sigsuspend
 #define posix_spawn_file_actions_init    nlibc_posix_spawn_file_actions_init
 #define posix_spawn_file_actions_destroy nlibc_posix_spawn_file_actions_destroy
 #define posix_spawn_file_actions_adddup2 nlibc_posix_spawn_file_actions_adddup2
@@ -661,6 +1026,33 @@ const char *nlibc_dlerror(void);
 #define posix_spawnattr_setsigmask       nlibc_posix_spawnattr_setsigmask
 #define posix_spawn                      nlibc_posix_spawn
 #define posix_spawnp                     nlibc_posix_spawnp
+
+#define openlog                  nlibc_openlog
+#define syslog                   nlibc_syslog
+#define vsyslog                  nlibc_vsyslog
+#define closelog                 nlibc_closelog
+
+#define mmap                     nlibc_mmap
+#define munmap                   nlibc_munmap
+#define msync                    nlibc_msync
+#define _NSGetExecutablePath     nlibc_NSGetExecutablePath
+
+/* Option parsing. The five variables become accessor calls the way `environ`
+ * does, and the scanning functions become ours -- routing only the
+ * variables would leave getopt's own `place` pointer, and getopt_long's
+ * permutation bookkeeping, shared across every native program in the app.
+ *
+ * A later `#include <getopt.h>` (OpenSSH's includes.h reaches one) is fine:
+ * the macros rewrite its declarations into declarations of these, which are
+ * compatible with the definitions above. */
+#define getopt                   nlibc_getopt
+#define getopt_long              nlibc_getopt_long
+#define getopt_long_only         nlibc_getopt_long_only
+#define optarg                   (*nlibc_optargp())
+#define optind                   (*nlibc_optindp())
+#define opterr                   (*nlibc_opterrp())
+#define optopt                   (*nlibc_optoptp())
+#define optreset                 (*nlibc_optresetp())
 
 #define dlopen                   nlibc_dlopen
 #define dlsym                    nlibc_dlsym

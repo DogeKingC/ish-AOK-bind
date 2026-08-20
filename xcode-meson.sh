@@ -242,6 +242,24 @@ EOF
     # the variant for an on-device A/B; see jit/guest-arm64/gadgets.h for why
     # this is host-generation dependent and why it must be measured on ARMv8.0.
     arm64_gret=${ISH_ARM64_GRET:-dmb}
+    # Options added to meson_options.txt after this build dir was set up are
+    # invisible to `meson configure`, which only knows what the dir was
+    # configured with -- so a NEW option silently keeps whatever default was
+    # current when the dir was created, and a changed default never arrives.
+    # native_zsh was added and defaulted on, and an existing DerivedData tree
+    # kept building without zsh and said nothing.
+    #
+    # The per-variable fallback below catches this only for the names it
+    # iterates. This catches it for every option the project declares.
+    declared=$(grep -oE "^option\('[a-z0-9_]+'" "$SRCROOT/meson_options.txt" | sed "s/option('//;s/'//")
+    for opt in $declared; do
+        if ! grep -q "\"name\": \"$opt\"" <<< "$config"; then
+            (set -x; meson setup --reconfigure . "$SRCROOT" --cross-file "$crossfile") || exit $?
+            config=$(meson introspect --buildoptions)
+            break
+        fi
+    done
+
     for var in buildtype log b_ndebug b_sanitize log_handler kernel kconfig guest_archs arm64_gret; do
         if ! old_value=$(python3 -c "import sys, json; v = next(x['value'] for x in json.load(sys.stdin) if x['name'] == '$var'); print(str(v).lower() if isinstance(v, bool) else ','.join(v) if isinstance(v, list) else v)" <<< "$config" 2>/dev/null); then
             # The option is missing from this build dir's cached
@@ -261,6 +279,38 @@ EOF
         fi
     done
 }
+
+# hterm's shipped bundle is a build artifact, not a source file.
+#
+# app/terminal/term.html loads deps/libapps/hterm/dist/js/hterm_all.js, and
+# hterm/dist is gitignored -- so the bundle only exists because somebody ran
+# bin/mkdist at some point, and an edit to hterm's SOURCES silently shipped
+# whatever bundle was already there. A line-height preference added to
+# hterm/js took three builds to appear for exactly that reason, and a fresh
+# clone has no bundle at all.
+#
+# Done here rather than in the "Compile JavaScript" phase because that is a
+# user script phase, and ENABLE_USER_SCRIPT_SANDBOXING (on, deliberately)
+# denies it even reading bin/mkdist. This script is a legacy target's build
+# tool, which is not sandboxed, and it already runs before everything else.
+regenerate_hterm_bundle() {
+    local hterm="$SRCROOT/deps/libapps/hterm"
+    local dist="$hterm/dist/js/hterm_all.js"
+    [ -d "$hterm/js" ] || return 0        # submodule not checked out; not our problem
+    local stale=""
+    if [ ! -f "$dist" ]; then
+        stale="bundle missing"
+    else
+        stale=$(find "$hterm/js" "$SRCROOT/deps/libapps/libdot/js" -name '*.js' -newer "$dist" -print -quit 2>/dev/null || true)
+    fi
+    [ -n "$stale" ] || return 0
+    echo "note: regenerating hterm_all.js ($stale)"
+    (cd "$hterm" && python3 bin/mkdist >/dev/null) || {
+        echo "error: hterm/bin/mkdist failed -- hterm_all.js would be stale" >&2
+        return 1
+    }
+}
+regenerate_hterm_bundle
 
 for arch in "${arch_list[@]}"; do
     configure_arch "$arch"

@@ -353,19 +353,25 @@ need_in kernel/hostinfo.h host_cpu_features "the runtime ARM feature query"
 need_in fs/proc/ish.c     cpu_features      "/proc/ish/cpu_features"
 need_in meson_options.txt ldapr             "the FEAT_LRCPC dispatch variant"
 
-# --- the native subsystem's non-Darwin gate --------------------------------
-# Upstream's native-program work (kernel/native_libc.c) is written against
-# BSD/macOS libc and does not compile on glibc. That is invisible to the iOS
-# build and fatal to this one: a Linux host is where run-guest-tests.sh and
-# run-arm64-guest-tests.sh run, so without the gate the entire test apparatus
-# stops building -- which is exactly what the 108-commit sync did before this.
-# A future sync that drops the gate would reproduce it, and the symptom is a
-# wall of errors in a file nobody here edited.
-need_file kernel/native_stubs.c
-need_in meson.build have_native \
-    "the non-Darwin gate; without it upstream's native libc breaks every Linux gate"
-need_in meson.build "kernel/native_stubs.c" \
-    "and the stub that stands in for it"
+# --- the arm64 harness's native-bash exclusion -----------------------------
+# RETIRED, and worth knowing why rather than rediscovering it: this fork used
+# to carry a whole non-Darwin gate (have_native, kernel/native_stubs.c) because
+# upstream's kernel/native_libc.c was written against BSD/macOS libc and did
+# not compile on glibc, which broke every Linux gate. Upstream has since ported
+# it (build: port the native libc shim to glibc), and the x86_64 Linux build
+# now links the full native subsystem, so the gate is gone and meson.build is
+# byte-identical to upstream's again.
+#
+# What remains is narrower and lives entirely in this fork's own harness.
+# Native bash brings deps/bash/lib/sh/getenv.c, force-included with
+# native_libc.h, so it defines the same nlibc_getenv/setenv/unsetenv/putenv
+# that kernel/native_libc.c does. ld64 and GNU ld pick one archive member and
+# never notice; lld -- which tools/cross-aarch64.ini requires for the aarch64
+# target -- fails the link with four duplicate symbols, at the last step of a
+# full cross build. Without this flag the arm64 gate, the only automated cover
+# the arm64 gadget set has anywhere, does not build at all.
+need_in tools/run-arm64-guest-tests.sh "native_bash=disabled" \
+    "the arm64 cross build cannot link native bash under lld"
 
 # --- shared ---------------------------------------------------------------
 need_file kernel/ioctl_abi.h

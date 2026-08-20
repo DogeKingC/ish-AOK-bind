@@ -246,10 +246,29 @@ static int smallclue_real_main(int argc, char *const argv[], char *const envp[])
 int native_bash_main(int argc, char *const argv[], char *const envp[]);
 #endif
 
+// zsh (kernel/zsh_glue.c), on the same terms as bash: the define and the glue
+// file are both decided by meson's `have_zsh`, so the table and the archive
+// cannot disagree. Off by default -- see meson_options.txt.
+#ifdef ISH_NATIVE_ZSH
+int native_zsh_main(int argc, char *const argv[], char *const envp[]);
+// zsh's MULTIOS byte pump, also kernel/zsh_glue.c. A program of its own rather
+// than an applet of the one above because it is spawned as a separate guest
+// TASK: `echo hi > a > b` needs something holding the target descriptors that
+// is NOT the shell, and the shell is about to close its own copies. See the
+// long note in zsh_glue.c, and closemn() in deps/zsh/Src/exec.c which spawns
+// it. Nobody is expected to run it by hand -- it exists at /AOK/native only
+// because that is how exec reaches a native program.
+int native_zsh_multio_main(int argc, char *const argv[], char *const envp[]);
+#endif
+
 static const struct native_program native_programs[] = {
     { "smallclue", smallclue_real_main },
 #ifdef ISH_NATIVE_BASH
     { "bash", native_bash_main },
+#endif
+#ifdef ISH_NATIVE_ZSH
+    { "zsh", native_zsh_main },
+    { "zsh-multio", native_zsh_multio_main },
 #endif
 };
 

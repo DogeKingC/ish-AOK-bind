@@ -33,6 +33,10 @@ foreach channel : log_on + log_off
         add_project_arguments('-DDEBUG_' + channel + '=0', language: 'c')
     endif
 endforeach
+# glibc hides a good deal behind feature-test macros that Darwin exposes anyway
+# -- off64_t and the cookie_io typedefs, RUN_LVL in <utmpx.h>, and more. Darwin
+# ignores the macro, so it is set for everyone rather than gated.
+add_project_arguments('-D_GNU_SOURCE', language: 'c')
 add_project_arguments('-DLOG_HANDLER_' + get_option('log_handler').to_upper() + '=1', language: 'c')
 add_project_arguments('-DENGINE_' + get_option('engine').to_upper() + '=1', language: 'c')
 
@@ -51,25 +55,19 @@ add_project_arguments('-Wno-switch', language: 'c')
 # weak_import included, so a build without deps/bash failed to link on the table
 # entry itself.
 fs_early = import('fs')
-
-# Whether the native-program subsystem (SmallCLUE, nextvi, bash compiled in as
-# HOST code) can be built at all. kernel/native_libc.c is written against
-# BSD/macOS libc -- funopen, BSD struct statfs, sockaddr sa_len, dirent
-# d_namlen, an off_t-compatible fpos_t, and static assertions that posix_spawn's
-# opaque types are plain pointers -- so it does not compile on glibc.
-#
-# That matters because the Linux host is not optional: it is where the guest
-# regression suites run, including tools/run-arm64-guest-tests.sh, the only
-# automated cover the arm64 gadget set has. Rather than port an iOS feature to a
-# host that never exercises it -- and carry edits in a file upstream is actively
-# developing, conflicting on every sync -- a non-Darwin build swaps in
-# kernel/native_stubs.c, which reports "no native programs in this build". That
-# is a state the design already handles: exec falls through to the ordinary
-# path and /AOK/native is served empty, exactly as on an iOS build whose
-# submodules were never populated.
-have_native = host_machine.system() == 'darwin'
-
-have_bash = fs_early.exists('deps/bash/shell.c') and have_native
+bash_opt = get_option('native_bash')
+bash_present = fs_early.exists('deps/bash/shell.c')
+if bash_opt.disabled()
+    # Not merely unregistered: libbash never gets built, so link_whole below
+    # folds nothing in. See meson_options.txt for why that distinction matters.
+    have_bash = false
+elif bash_opt.enabled() and not bash_present
+    error('-Dnative_bash=enabled but deps/bash is not checked out. Either:\n' +
+          '    git submodule update --init deps/bash\n' +
+          '  or build without it: -Dnative_bash=disabled')
+else
+    have_bash = bash_present
+endif
 if have_bash
     # Populated but STALE is the case worth catching by name. A pull that moves
     # the submodule pointer does not move the submodule, so deps/bash can be a
@@ -83,6 +81,50 @@ if have_bash
     endif
     add_project_arguments('-DISH_NATIVE_BASH=1', language: 'c')
 endif
+
+# The same question for zsh, and the same reason it is answered here: the
+# registry in kernel/native.c needs it as a define before any target exists.
+#
+# deps/zsh is a CONFIGURED tree rather than a pristine checkout, and that is
+# what the test looks for. zsh generates a great deal of its own source --
+# config.h, Src/signames.c, every module's .mdh and .epro, Src/bltinmods.list
+# -- and this build compiles those generated files rather than reproducing
+# zsh's mkmakemod.sh in meson. So the marker is config.h, not a .c: a tree
+# someone unpacked but never configured would otherwise fail much later with a
+# missing "../config.h" from inside a generated header.
+zsh_opt = get_option('native_zsh')
+zsh_present = fs_early.exists('deps/zsh/config.h') and fs_early.exists('deps/zsh/Src/bltinmods.list')
+if zsh_opt.disabled()
+    have_zsh = false
+elif zsh_opt.enabled() and not zsh_present
+    error('-Dnative_zsh=enabled but deps/zsh is not a configured zsh tree.\n' +
+          '  It is a submodule now, and the generated sources are committed in\n' +
+          '  it, so there is nothing to configure -- just check it out:\n' +
+          '    git submodule update --init deps/zsh\n' +
+          '  To re-generate them instead (a new zsh, or different options):\n' +
+          '    cd deps/zsh && ../../tools/configure-zsh.sh && make prep\n' +
+          '  Or build without zsh: -Dnative_zsh=disabled')
+else
+    have_zsh = zsh_present
+endif
+if have_zsh
+    add_project_arguments('-DISH_NATIVE_ZSH=1', language: 'c')
+endif
+
+# Said out loud at configure time, because the consequence is a licensing one
+# and the alternative is finding out from an App Store takedown. Nothing else
+# in the binary is GPL: smallclue is MIT, OpenSSH and libarchive BSD, liblzma
+# public domain, and iSH-AOK's own GPL is what LICENSE.IOS covers.
+summary({'native bash': have_bash ? 'yes -- binary contains GPLv3 (bash, readline)'
+                                  : 'no -- no third-party GPL in the binary'},
+        section: 'Licensing')
+# zsh is in the OTHER column and says so, because "another shell compiled in"
+# reads like the same licensing question and is not: zsh's licence is
+# permissive, and the only GPL files in its tree are three completion SCRIPTS
+# that nothing here compiles or installs.
+summary({'native zsh': have_zsh ? 'yes -- permissive (zsh LICENCE), no GPL compiled'
+                                : 'no'},
+        section: 'Licensing')
 
 # Resolved here (rather than next to the gadget source lists below) because
 # it also drives a project-wide define, and add_project_arguments must run
@@ -151,6 +193,39 @@ libdl = cc.find_library('dl', required: false)
 libatomic = cc.find_library('atomic', required: false)
 sqlite3 = cc.find_library('sqlite3')
 dependencies = [librt, libm, libdl, libatomic, threads, sqlite3]
+
+# zsh needs tgetent/tgetstr/tgoto/tputs and, unlike bash, does not bundle a
+# termcap of its own. This USED to add -ltermcap (or -lcurses) here, and that
+# was the bug kernel/native_termcap.c exists to fix: the system library reads
+# the HOST's terminfo database, so on a device -- which has none -- ZLE got no
+# capabilities and could not move the cursor. The shim answers those six names
+# from the GUEST's database now, so the system library is not merely
+# unnecessary, it is the wrong answer. It also takes away the reason the app
+# build could not have zsh: the Xcode project links the meson archives by name
+# and would have had to grow a libcurses of its own, and there is nothing left
+# for it to link (the iOS SDK ships the .tbd stubs but no curses.h/term.h,
+# which is also why deps/zsh is configured termcap-only).
+if have_zsh
+    # iconv, which zsh uses for two things: converting a filename that is
+    # not valid in the current charset (Src/utils.c zreaddir) and turning a
+    # \u escape into the locale's encoding (ucs4tomb). Darwin and iOS both
+    # ship libiconv, so this is a link-line entry rather than a port. The
+    # alternative was configuring zsh without it, which silently changes what
+    # $'é' produces -- not a thing to decide by omission.
+    #
+    # Where it LIVES is not the same question as whether it is there. Darwin and
+    # iOS ship it as a separate libiconv, which is what this originally assumed;
+    # glibc and musl put iconv_open inside libc itself and have no -liconv to
+    # link at all. Asking only the first question broke every Linux CI build
+    # from e06c2aa5 until this commit -- `ld: cannot find -liconv' -- while the
+    # mac job went on passing, because on the mac the assumption was true.
+    iconv_lib = cc.find_library('iconv', required: false)
+    if iconv_lib.found()
+        dependencies += iconv_lib
+    elif not cc.has_function('iconv_open', prefix: '#include <iconv.h>')
+        error('zsh needs iconv: no libiconv, and no iconv_open in libc either')
+    endif
+endif
 
 subdir('vdso') # ish depends on the vdso
 
@@ -310,7 +385,13 @@ if get_option('kernel') == 'ish'
 
         'kernel/fork.c',
         'kernel/exec.c',
+        'kernel/native.c',
+        'kernel/native_io.c',
+        'kernel/native_libc.c',
+        'kernel/native_termcap.c',
         'kernel/native_syscall.c', native_syscall_nums,
+        'kernel/smallclue_glue.c',
+        'kernel/openssh_glue.c',
         'kernel/exit.c',
         'kernel/time.c',
         'kernel/mmap.c',
@@ -393,13 +474,6 @@ if get_option('kernel') == 'ish'
         'platform/' + host_machine.system() + '.c',
     ]
 
-    if have_native
-        src += files('kernel/native.c', 'kernel/native_io.c',
-                     'kernel/native_libc.c', 'kernel/smallclue_glue.c')
-    else
-        src += files('kernel/native_stubs.c')
-    endif
-
     # SmallCLUE, compiled in as HOST code so its applets run without being
     # translated (kernel/native.h). Two things make this unlike an ordinary
     # vendored dependency:
@@ -413,18 +487,104 @@ if get_option('kernel') == 'ish'
     #    that honest.
     #
     # Excluded feature groups, entry points stubbed in kernel/smallclue_glue.c:
-    # checksum_app needs OpenSSL (AOK links none), integration.c is the
-    # WITH_EXSH path into PSCAL's VM, and the openssh trio needs the vendored
-    # OpenSSH tree.
+    # integration.c is the WITH_EXSH path into PSCAL's VM.
     # gzip_app and tar_app are excluded for a build-system reason rather than a
     # code one: they are the only files needing zlib, and the Xcode app targets
     # link the meson archives by name with no zlib anywhere in the project (no
     # libz.tbd, no OTHER_LDFLAGS). Re-enabling either means adding zlib to
     # those targets first -- worth doing, since tar is a real loss, but it is a
     # change to the app project rather than to this build.
-    smallclue_excluded = ['main.c', 'integration.c', 'checksum_app.c',
-                          'openssh_app.c', 'openssh_shim.c', 'openssh_stubs.c',
-                          'gzip_app.c', 'tar_app.c']
+    smallclue_excluded = ['main.c', 'integration.c', 'gzip_app.c', 'tar_app.c']
+
+    # checksum_app.c (md5sum/sha1sum/sha256sum) was on that list too, for the
+    # same shape of reason and with a better answer: it wants OpenSSL's EVP,
+    # SmallCLUE has OpenSSL because libgit2 and OpenSSH pull it in, and AOK
+    # links neither -- so three working commands were stubbed over one
+    # #include. deps/smallclue-shim/openssl/evp.h supplies that #include from
+    # CommonCrypto, which is in libSystem on macOS and iOS, so unlike zlib this
+    # needs nothing added to the Xcode project.
+    #
+    # Apple-only on purpose: elsewhere there is no CommonCrypto, and the honest
+    # stub is better than a build that fails at the include.
+    have_checksums = host_machine.system() in ['darwin', 'ios']
+    if not have_checksums
+        smallclue_excluded += 'checksum_app.c'
+    endif
+
+    # --------------------------------------------------------------- openssh
+    #
+    # ssh/scp/sftp/ssh-keygen/ssh-copy-id, from the OpenSSH tree vendored at
+    # deps/smallclue/third-party/openssh. Like Nextvi it is a tree a plain
+    # checkout does not populate, so the build works either way and says so.
+    #
+    # Two things have to be true before it can be built, and they are checked
+    # separately because the fixes differ:
+    #
+    #  - the tree is there at all (ssh.c), and
+    #  - it has been CONFIGURED (config.h), with:
+    #
+    #        cd deps/smallclue/third-party/openssh
+    #        ./configure --without-openssl --without-zlib --sysconfdir=/etc/ssh
+    #
+    # --without-openssl is not a shortcut, it is the whole reason this links:
+    # AOK ships no libcrypto and no zlib, and the Xcode app targets link the
+    # meson archives by name with nothing else on the line. Configured that way
+    # OpenSSH falls back to its own bundled crypto and the link line is just
+    # "-lresolv" -- no new libraries and no change to the app project.
+    #
+    # The price, and it is a real one someone will hit: without libcrypto the
+    # client supports ED25519 KEYS AND chacha20-poly1305 ONLY. RSA and ECDSA
+    # keys -- including most keys people already have -- will not work, and
+    # `ssh-keygen -t rsa` will refuse. That is a deliberate trade, not a bug.
+    #
+    # The tree also has to be the PATCHED one: smallclue's
+    # fetch_dependencies.sh renames ssh.c/scp.c/sftp.c/ssh-keygen.c's main()
+    # to pscal_openssh_*_main() with sed, which is what
+    # deps/smallclue/src/openssh_app.c calls. An unpatched tree links four
+    # main()s against AOK's own.
+    openssh_dir = 'deps/smallclue/third-party/openssh'
+    have_openssh_tree = run_command(python, '-c',
+            'import os, sys; sys.exit(0 if os.path.exists(sys.argv[1]) else 1)',
+            meson.current_source_dir() / openssh_dir / 'ssh.c',
+            check: false).returncode() == 0
+    have_openssh = have_openssh_tree and run_command(python, '-c',
+            'import os, sys; sys.exit(0 if os.path.exists(sys.argv[1]) else 1)',
+            meson.current_source_dir() / openssh_dir / 'config.h',
+            check: false).returncode() == 0
+
+    if not have_openssh
+        # src/openssh_app.c is the launcher (setjmp around fatal()/exit(), pty
+        # handling, the re-entry split); openssh_shim.c and openssh_stubs.c only
+        # exist to feed it. None of them compile without the tree's headers, so
+        # they drop out together and kernel/smallclue_glue.c's honest "not built
+        # into this iSH-AOK" stubs stay.
+        smallclue_excluded += ['openssh_app.c', 'openssh_shim.c',
+                               'openssh_stubs.c']
+        if have_openssh_tree
+            warning('deps/smallclue/third-party/openssh is present but has no ' +
+                    'config.h -- ssh/scp/sftp/ssh-keygen will report "not ' +
+                    'built into this iSH-AOK". Configure it with: ./configure ' +
+                    '--without-openssl --without-zlib --sysconfdir=/etc/ssh')
+        else
+            warning('deps/smallclue/third-party/openssh is not checked out -- ' +
+                    'ssh/scp/sftp/ssh-keygen will report "not built into this ' +
+                    'iSH-AOK"')
+        endif
+    else
+        # src/openssh_stubs.c does two jobs, and only one of them survives
+        # contact with a real OpenSSH: it implements the exit-context helpers
+        # openssh_app.c calls, AND it defines four WEAK pscal_openssh_*_main()
+        # that print "OpenSSH integration unavailable in this build".
+        #
+        # Weak loses to strong within one link -- but NOT across static
+        # archives. The linker takes the first archive member that defines a
+        # symbol and stops looking, so the stub satisfied openssh_app.c and
+        # ssh.o was never pulled in at all: `ssh -V` printed "OpenSSH
+        # integration unavailable" out of a binary that contained every line of
+        # OpenSSH. So the file is compiled on its own below, with those four
+        # names renamed out of the way rather than left to lose a race.
+        smallclue_excluded += 'openssh_stubs.c'
+    endif
 
     # Nextvi -- the editor `vi` runs -- is a submodule OF a submodule and is not
     # populated by a plain checkout, so the build has to work either way. With
@@ -458,12 +618,7 @@ if get_option('kernel') == 'ish'
             check: false).returncode() == 0
 
     smallclue_src = []
-    # have_native gates the glue too: kernel/nextvi_glue.c is force-included
-    # with native_libc.h and calls into the nlibc_* surface. Kept separate from
-    # have_nextvi_src so the "not checked out" diagnostic below does not start
-    # lying on a host where native is simply not built.
     have_nextvi_src = have_nextvi
-    have_nextvi = have_nextvi_src and have_native
     if have_nextvi
         smallclue_excluded += 'nextvi_stubs.c'
         # Supplies nextvi_main_entry over the renamed real one; see the file.
@@ -495,6 +650,9 @@ if get_option('kernel') == 'ish'
 
     smallclue_includes = include_directories(
         'deps/smallclue-shim',
+        # Headers that exist on Darwin and not here. Gated so the shipping
+        # build never picks up a stand-in for a header it really has.
+        host_machine.system() in ['darwin', 'ios'] ? [] : 'deps/smallclue-shim/linux',
         'deps/smallclue',
         'deps/smallclue/src',
         'deps/smallclue/common',
@@ -504,19 +662,43 @@ if get_option('kernel') == 'ish'
     smallclue_c_args = [
         '-include', meson.current_source_dir() / 'kernel/native_libc.h',
         '-DSMALLCLUE_PLATFORM_SPAWN',
+        # SmallCLUE is written against BSD/Darwin header visibility, where
+        # ptsname_r, strptime and FNM_CASEFOLD are simply there. glibc puts all
+        # three behind feature-test macros, so on Linux they vanish and the
+        # compiler reports them as implicit declarations -- with strptime that
+        # then cascades into an int-to-pointer error, because an undeclared
+        # function is assumed to return int.
+        #
+        # Darwin ignores the macro, so this is unconditional rather than
+        # host-gated. It has to be a -D and not a #define in a header: the macro
+        # only counts if it precedes the first libc header, and the force-include
+        # above is itself a header.
+        #
+        # Not noticed until 21a2a4a8, because until then no Linux build got past
+        # the iconv probe at configure time to compile any of this.
+        '-D_GNU_SOURCE',
+        # dmesg's real body sits behind a __linux__ test, which is false for a
+        # native program (compiled for the HOST) even though the kernel it talks
+        # to IS Linux -- AOK's own. The shim routes klogctl to the guest's
+        # syslog(2), so say so rather than letting the #else claim dmesg is
+        # unsupported on a system whose /usr/bin/dmesg works.
+        '-DSMALLCLUE_HAVE_KLOGCTL',
         '-w',  # vendored code, not ours to police
     ]
 
-    # Not built on a host that has no native subsystem to link it into: every
-    # translation unit here is force-included with kernel/native_libc.h and
-    # calls the nlibc_* redirections, which only exist when native_libc.c is in
-    # the build. See have_native above.
-    libsmallclue = []
-    if have_native
-        libsmallclue = static_library('smallclue', smallclue_src,
-            include_directories: [includes, smallclue_includes],
-            c_args: smallclue_c_args)
+    # src/openssh_app.c and src/openssh_shim.c reach into the vendored tree
+    # (sshkey.h, pscal_runtime_hooks.h), so libsmallclue needs its headers too
+    # -- but only when it is there, since include_directories() on a missing
+    # directory is a configure error.
+    openssh_includes = []
+    if have_openssh
+        openssh_includes = [include_directories(
+            openssh_dir, openssh_dir / 'openbsd-compat')]
     endif
+
+    libsmallclue = static_library('smallclue', smallclue_src,
+        include_directories: [includes, smallclue_includes] + openssh_includes,
+        c_args: smallclue_c_args)
 
     # Nextvi gets an archive of its own for one reason: a -D that must apply to
     # its translation unit and to no other. It is a program written to run once
@@ -526,7 +708,7 @@ if get_option('kernel') == 'ish'
     # Renaming through the compiler is how SmallCLUE's own CMake build already
     # turns Nextvi's main() into nextvi_main_entry.
     libnextvi = []
-    if have_nextvi and have_native
+    if have_nextvi
         nextvi_c_args = smallclue_c_args + ['-Dnextvi_main_entry=nextvi_editor_run']
         if have_nextvi_spawn
             nextvi_c_args += '-DNEXTVI_PLATFORM_SPAWN'
@@ -534,6 +716,222 @@ if get_option('kernel') == 'ish'
         libnextvi = static_library('nextvi', files(nextvi_dir / 'vi.c'),
             include_directories: [includes, smallclue_includes],
             c_args: nextvi_c_args)
+    endif
+
+    # --------------------------------------------------------------- openssh
+    #
+    # OpenSSH is not built as a library upstream: it is five programs that
+    # share a pile of .c files, and the Makefile links a different subset into
+    # each. AOK links ONE binary, so the subset has to be chosen here -- and
+    # the choice is not obvious, because "client" and "server" are not
+    # separated by filename. What follows is ported from SmallCLUE's own
+    # CMakeLists.txt, where it was derived one link error at a time; the
+    # reasons are kept because re-deriving them costs a day.
+    #
+    # Start from every .c in the tree, then drop, in groups:
+    #
+    #  - Other programs. ssh-agent, ssh-add, ssh-keyscan, ssh-keysign,
+    #    ssh-sk-helper, ssh-pkcs11-helper, sftp-server(-main) and sshd* each
+    #    have their own main(); only ssh/scp/sftp/ssh-keygen got the
+    #    main() -> pscal_openssh_*_main() rename, so the rest collide with
+    #    AOK's main() at link time. contrib/ is GUI askpass helpers (also with
+    #    their own main()), regress/ is the test suite.
+    #
+    #  - The server. auth2-*, auth-passwd/rhosts/shadow, monitor*, servconf,
+    #    session, serverloop, sshlogin, loginrec/logintest, sandbox-*: sshd's
+    #    privsep monitor, its config parser, its select loop, its utmp/wtmp
+    #    accounting, its sandbox. auth.c/auth2.c/sshlogin.c/serverloop.c have
+    #    generic-sounding names and were missed by the patterns above -- they
+    #    are server-only all the same, and once their own callees are gone they
+    #    fail to link. No client source calls any of them.
+    #
+    #  - Duplicate symbols, which is where the surprises live:
+    #      * ssh-pkcs11.c is the dlopen-based provider meant to run INSIDE
+    #        ssh-pkcs11-helper; the client side is ssh-pkcs11-client.c, which
+    #        talks to it over IPC. Both define pkcs11_add_provider and friends.
+    #        Same story for ssh-sk-client.c against ssh-sk.c.
+    #      * cleanup.c's cleanup_exit() is the trivial default (_exit(i));
+    #        clientloop.c defines a client-specific one that restores the
+    #        terminal and kills the mux proxy, and no-ops those safely when ssh
+    #        never started them. One binary, one cleanup_exit: keep the fuller
+    #        one. scp.c has a THIRD (closing remin/remout) -- that one is
+    #        renamed rather than dropped, below.
+    #      * sftp-realpath.c's sftp_realpath(path, resolved) resolves a LOCAL
+    #        path for the sftp *server*; sftp-client.c's sftp_realpath(conn,
+    #        path) sends a REALPATH request to the remote. The client wants the
+    #        second.
+    #      * dns.c (VerifyHostKeyDNS via SSHFP records) collides with
+    #        src/openssh_shim.c's deliberate verify_host_key_dns() stub, and
+    #        wants getrrsetbyname() besides. SSHFP lookups stay off, so dns.c
+    #        and getrrsetbyname*.c both go rather than the stub.
+    #
+    # Three files the broad patterns catch by accident and the client needs:
+    # monitor_fdpass.c (fd passing, used by ssh's mux), sshsig.c (ssh-keygen
+    # -Y), platform-pledge.c (a no-op pledge() on everything but OpenBSD).
+    openssh_excluded = [
+        # own main()
+        'ssh-agent.c', 'ssh-add.c', 'ssh-keyscan.c', 'ssh-keysign.c',
+        'ssh-sk-helper.c', 'ssh-pkcs11-helper.c',
+        'sftp-server.c', 'sftp-server-main.c',
+        # server
+        'auth.c', 'auth2.c', 'auth-passwd.c', 'auth-rhosts.c', 'auth-shadow.c',
+        'servconf.c', 'session.c', 'serverloop.c', 'sshlogin.c',
+        'loginrec.c', 'logintest.c', 'gss-genr.c', 'platform-tracing.c',
+        # duplicate symbols
+        'ssh-pkcs11.c', 'ssh-sk-client.c', 'cleanup.c', 'sftp-realpath.c',
+        'dns.c',
+        # reaches the host, and cannot be redirected any other way.
+        #
+        # mktemp.c exists in this build only to define _ssh_mkstemp(), the
+        # umask-clamping wrapper that openbsd-compat.h's UNCONDITIONAL
+        # `#define mkstemp(x) _ssh_mkstemp(x)` points every caller at
+        # (everything else in the file is behind !HAVE_MKDTEMP, which Darwin
+        # has). That macro lands AFTER the force-included native_libc.h and
+        # overwrites its `#define mkstemp nlibc_mkstemp`, and then mktemp.c
+        # opens with `#ifdef mkstemp / #undef mkstemp / int mkstemp(char *);`
+        # -- deliberately undoing any redirection, including a -D on the
+        # command line. So the routed mkstemp was quietly bypassed and
+        # hostfile.c and ssh-keygen.c created their temp files on the DEVICE,
+        # with the host fd number then handed to the routed fchmod/write/close
+        # as if it were a guest descriptor.
+        #
+        # Dropping the file is what makes the redirection stick: nothing else
+        # defines _ssh_mkstemp, so native_libc.h's `#define _ssh_mkstemp
+        # nlibc_mkstemp` catches the rescan of openbsd-compat.h's macro and
+        # every call site lands on the guest's mkstemp -- which already applies
+        # the 0600 the wrapper's umask dance was for.
+        'mktemp.c',
+    ]
+    # Whole families, matched on the leading name: auth2-* and sandbox-* and
+    # sshd* are server; monitor* is the privsep monitor (minus monitor_fdpass);
+    # getrrsetbyname* is dns.c's dependency.
+    openssh_excluded_prefixes = ['auth2-', 'sandbox-', 'sshd', 'monitor',
+                                 'getrrsetbyname']
+    openssh_readded = ['monitor_fdpass.c', 'sshsig.c', 'platform-pledge.c']
+
+    # Two sources need a compiler flag that must not reach any other, so each
+    # is compiled into a one-file archive of its own. Same reason Nextvi has its
+    # own: meson can only vary flags per target.
+    #
+    #  - scp.c defines a THIRD cleanup_exit(), closing the four remote fds it
+    #    owns, unrelated to the clientloop.c one everything else resolves to.
+    #    Renaming it is scoped here so scp's own call sites -- the only callers
+    #    -- move with it.
+    #  - smult_curve25519_ref.c has a file-static helper called select(), which
+    #    native_libc.h's `#define select nlibc_select` turns into a second,
+    #    wrongly-typed declaration of nlibc_select. A -D cannot undo that (the
+    #    header is included after the command line), so a second force-included
+    #    header undefines it afterwards. See that header for the rule.
+    openssh_special = {
+        'scp.c': ['-Dcleanup_exit=pscal_openssh_scp_cleanup_exit'],
+        'smult_curve25519_ref.c': ['-include',
+            meson.current_source_dir() / 'deps/smallclue-shim/openssh_local_names.h'],
+    }
+
+    libopenssh = []
+    libopenssh_special = []
+    if have_openssh
+        openssh_src = []
+        openssh_special_src = {}
+        # Paths relative to the tree, so the directory tests below can see
+        # contrib/ and regress/. Space-separated for the same reason as the
+        # SmallCLUE glob above: meson eats \n in its own string literals.
+        foreach p : run_command(python, '-c',
+                'import glob, sys; print(" ".join(sorted(p[len(sys.argv[1]) + 1:] for p in glob.glob(sys.argv[1] + "/**/*.c", recursive=True))))',
+                meson.current_source_dir() / openssh_dir,
+                check: true).stdout().strip().split(' ')
+            if p == ''
+                continue
+            endif
+            base = p.split('/')[-1]
+            keep = true
+            if p.contains('contrib/') or p.contains('regress/')
+                keep = false
+            elif openssh_excluded.contains(base)
+                keep = false
+            else
+                foreach prefix : openssh_excluded_prefixes
+                    if base.startswith(prefix)
+                        keep = false
+                    endif
+                endforeach
+            endif
+            if openssh_readded.contains(base)
+                keep = true
+            endif
+            if keep
+                if openssh_special.has_key(base)
+                    openssh_special_src += {base: files(openssh_dir / p)}
+                else
+                    openssh_src += files(openssh_dir / p)
+                endif
+            endif
+        endforeach
+
+        # OpenSSH brings its own glob (openbsd-compat/glob.c) and has to: sftp
+        # globs REMOTE paths through GLOB_ALTDIRFUNC, handing glob() its own
+        # opendir/readdir/stat that speak the SFTP protocol. Routing glob() to
+        # nlibc_glob would both collide with that definition and, if it linked,
+        # glob the local filesystem for a remote pattern. The compat glob calls
+        # the ordinary directory functions underneath, and those are routed, so
+        # local globbing still sees the guest. Same escape hatch bash uses --
+        # see kernel/native_libc.h.
+        #
+        # Two names collide with the native bash in the same binary, out of the
+        # ~170 translation units on each side. Renaming OpenSSH's rather than
+        # bash's keeps each rename inside one archive: these two are declared in
+        # OpenSSH's own headers and used only by OpenSSH's own sources, and none
+        # of deps/smallclue/src reaches for either.
+        #  - xmalloc: both are "malloc or die", but bash's is the one its whole
+        #    tree and its readline are built around.
+        #  - tilde_expand: OpenSSH's takes a const char *, bash's does not, and
+        #    they expand different syntax.
+        openssh_c_args = smallclue_c_args + [
+            '-DNATIVE_LIBC_OWN_GLOB',
+            '-Dxmalloc=pscal_openssh_xmalloc',
+            '-Dtilde_expand=pscal_openssh_tilde_expand',
+        ]
+        # implicit_include_directories: false, and it matters. Meson otherwise
+        # puts the target's build dir and the PROJECT SOURCE ROOT ahead of
+        # every -I given here -- and AOK's root has a misc.h, as does OpenSSH.
+        # A quoted #include "misc.h" from a source under openbsd-compat/ does
+        # not find its own directory, so it walked the -I list and read AOK's,
+        # leaving SSH_TUNMODE_* undeclared in port-net.c with no hint that the
+        # wrong header had been used. Nothing here wants AOK's headers anyway:
+        # the one AOK file these sources see is kernel/native_libc.h, which is
+        # force-included by absolute path and includes only system headers.
+        libopenssh = static_library('openssh', openssh_src,
+            include_directories: openssh_includes + [includes, smallclue_includes],
+            implicit_include_directories: false,
+            c_args: openssh_c_args)
+
+        # See the note beside smallclue_excluded above: the four weak
+        # pscal_openssh_*_main() here would otherwise beat the real ssh.c,
+        # scp.c, sftp.c and ssh-keygen.c to the link.
+        libopenssh_special += static_library('openssh_stubs',
+            files('deps/smallclue/src/openssh_stubs.c'),
+            include_directories: [includes, smallclue_includes] + openssh_includes,
+            c_args: smallclue_c_args + [
+                '-Dpscal_openssh_ssh_main=pscal_openssh_ssh_main_unavailable',
+                '-Dpscal_openssh_scp_main=pscal_openssh_scp_main_unavailable',
+                '-Dpscal_openssh_sftp_main=pscal_openssh_sftp_main_unavailable',
+                '-Dpscal_openssh_ssh_keygen_main=pscal_openssh_ssh_keygen_main_unavailable',
+            ])
+
+        foreach base, extra_args : openssh_special
+            if not openssh_special_src.has_key(base)
+                # The file was excluded, or the tree moved under us. Silence
+                # here would mean scp linking without its cleanup_exit rename.
+                error('openssh_special names ' + base + ', which is not in the ' +
+                      'source list -- reconcile it with openssh_excluded')
+            endif
+            libopenssh_special += static_library(
+                'openssh_' + base.replace('.c', '').replace('-', '_'),
+                openssh_special_src[base],
+                include_directories: openssh_includes + [includes, smallclue_includes],
+                implicit_include_directories: false,
+                c_args: openssh_c_args + extra_args)
+        endforeach
     endif
 
     # ------------------------------------------------------------------ bash
@@ -548,10 +946,16 @@ if get_option('kernel') == 'ish'
     libbash = []
     if have_bash
         bash_includes = include_directories(
-            'deps/bash-shim',   # <builtins/builtext.h>; see the header there
+            # FIRST, and it holds two headers bash would otherwise find its own
+            # copy of: <builtins/builtext.h> and <termcap.h>. See them for why.
+            'deps/bash-shim',
             bash_dir, bash_dir / 'generated', bash_dir / 'generated/builtins',
             bash_dir / 'include', bash_dir / 'builtins', bash_dir / 'lib',
-            bash_dir / 'lib/readline', bash_dir / 'lib/termcap',
+            # NOT lib/termcap. Its termcap.h declares the bundled GNU termcap
+            # that is no longer built (see the source list below), and having
+            # both on the path would leave which one readline compiles against
+            # a matter of directory order.
+            bash_dir / 'lib/readline',
         )
 
         # What bash's own Makefile passes. -DHAVE_CONFIG_H above all: without it
@@ -583,6 +987,16 @@ if get_option('kernel') == 'ish'
             # bash brings its own globbing, and macOS's <glob.h> shares the
             # include guard _GLOB_H_ with bash's -- see kernel/native_libc.h.
             '-DNATIVE_LIBC_OWN_GLOB',
+            # NOT -DNATIVE_LIBC_OWN_TERMCAP, which bash carried while it still
+            # built its own bundled GNU termcap (lib/termcap). That copy reads
+            # /etc/termcap and nothing else, and no rootfs AOK supports ships
+            # one -- Debian, Devuan and Alpine all moved to terminfo -- so
+            # every capability readline asked for came back empty and its
+            # editor erased with a bare space, which ADVANCES the cursor.
+            # tgetent and friends route to kernel/native_termcap.c now, which
+            # reads the GUEST's terminfo. The bundled files are out of the
+            # source list below, so there are no DEFINITIONS left here for the
+            # shim to rename into a collision.
             # fork by re-launch (deps/bash/aok_fork.c). Guards the two hooks in
             # bash's own sources so the vendor tree still builds without it.
             '-DAOK_NATIVE_FORK=1',
@@ -592,6 +1006,10 @@ if get_option('kernel') == 'ish'
             '-Dmain=bash_main_entry',
             '-Dwait_for=bash_wait_for',
             '-include', meson.current_source_dir() / 'kernel/native_libc.h',
+            # Same reason smallclue_c_args carries it: bash reaches for wcswidth,
+            # which glibc puts behind a feature-test macro and Darwin exposes by
+            # default. Darwin ignores the macro, so it is unconditional.
+            '-D_GNU_SOURCE',
             # mkbuiltins writes bash_builtext.h here; deps/bash-shim forwards
             # <builtins/builtext.h> to it.
             '-I' + meson.current_build_dir(),
@@ -714,13 +1132,24 @@ if get_option('kernel') == 'ish'
             'lib/readline/text.c', 'lib/readline/tilde.c',
             'lib/readline/undo.c', 'lib/readline/util.c',
             'lib/readline/vi_mode.c', 'lib/readline/xfree.c',
-            'lib/readline/xmalloc.c',
-            # bash's OWN termcap, not the system one. readline needs tgetent
-            # and friends, and bash's configure links -ltermcap when it finds
-            # it -- which would put a system library on the Xcode link line,
-            # the very thing that keeps zlib (and tar, and gzip) out. The
-            # bundled implementation costs three files and no dependency.
-            'lib/termcap/termcap.c', 'lib/termcap/tparam.c']
+            'lib/readline/xmalloc.c']
+        # NOT lib/termcap/termcap.c and lib/termcap/tparam.c, which readline
+        # used to get tgetent and friends from. Two reasons to drop the files
+        # rather than keep compiling them with NATIVE_LIBC_OWN_TERMCAP:
+        #
+        #   * They resolve nothing. That termcap reads /etc/termcap only, and
+        #     the rootfs images ship terminfo instead. Leaving a second, dead
+        #     implementation in the binary under the standard names is a trap
+        #     for the next unrouted call site, not a fallback.
+        #   * Nothing outside them uses them. readline (terminal.c, display.c)
+        #     is the only caller of the six functions, tparam has no callers at
+        #     all, and bashline.c only DECLARED tputs.
+        #
+        # What went with them: PC, which lib/readline/terminal.c now defines
+        # itself -- it is the only code that writes it -- and ospeed, which
+        # nothing in bash references. deps/bash-shim/termcap.h holds the
+        # declarations, and lib/termcap is off the include path above so it is
+        # the only <termcap.h> bash can find.
 
         bash_src = []
         foreach f : bash_top
@@ -747,15 +1176,174 @@ if get_option('kernel') == 'ish'
             c_args: bash_defs)
     endif
 
+    # ------------------------------------------------------------------- zsh
+    #
+    # zsh as a third native program, EXPERIMENTAL and default-off (see
+    # meson_options.txt). Unlike bash this is not a submodule: deps/zsh is a
+    # zsh source tree that has been CONFIGURED AND BUILT in place by
+    # tools/configure-zsh.sh, and this target compiles the result. zsh
+    # generates a lot of its own source -- config.h, Src/signames.c,
+    # Src/bltinmods.list, and for every module a .mdh, an .epro and a .pro --
+    # through mkmakemod.sh, makepro.awk and mkbltnmlst.sh, and reproducing
+    # that machinery in meson would be a second build system to keep honest.
+    # Compiling zsh's own generated files is the smaller commitment; the price
+    # is that deps/zsh must be configured before this build runs, which is
+    # what the check at the top of this file enforces.
+    #
+    # The generated headers include each other by RELATIVE path -- a module's
+    # .mdh does `#include "../../Src/zsh.mdh"` and that does `#include
+    # "../config.h"` -- so the tree layout is load-bearing and the include
+    # list below is smaller than zsh's own Makefile passes.
+    libzsh = []
+    if have_zsh
+        zsh_dir = 'deps/zsh'
+        zsh_includes = include_directories(
+            # FIRST, so <termcap.h> resolves to deps/zsh-shim/termcap.h on both
+            # platforms. The iOS SDK ships libtermcap.tbd and libncurses.tbd but
+            # no termcap.h, and zsh brings no termcap of its own -- so the
+            # symbols link and only the declarations were missing. See that
+            # header for why macOS uses it too rather than the system one.
+            'deps/zsh-shim',
+            zsh_dir, zsh_dir / 'Src', zsh_dir / 'Src/Zle',
+            zsh_dir / 'Src/Modules', zsh_dir / 'Src/Builtins')
+
+        # The seven names zsh and libish both define, out of zsh's 1941
+        # externals against libish's 5216. Renaming ZSH's side keeps each
+        # rename inside one archive, which is the rule the OpenSSH block above
+        # follows for the same reason.
+        #
+        # Three come from bash (evalstring.c, evalfile.c, lib/sh/zgetline.c)
+        # and four from OpenSSH (scp.c's `pwd` and `source`, and
+        # openbsd-compat/bsd-setres_id.c). The setres* pair is the one worth a
+        # word: zsh vendors OpenSSH's file too (Src/openssh_bsd_setres_id.c),
+        # so both archives carry an implementation. They are NOT
+        # interchangeable -- each is compiled with kernel/native_libc.h inside
+        # its own archive, and the guest-vs-host question is settled by which
+        # copy the call site reaches. Renaming keeps zsh's calls in zsh's copy.
+        zsh_renames = [
+            '-Dparse_string=zsh_parse_string',    # bash builtins/evalstring.c
+            '-Dsourcelevel=zsh_sourcelevel',      # bash builtins/evalfile.c
+            '-Dzgetline=zsh_zgetline',            # bash lib/sh/zgetline.c
+            '-Dpwd=zsh_pwd',                      # OpenSSH scp.c
+            '-Dsource=zsh_source',                # OpenSSH scp.c
+            '-Dsetresuid=zsh_setresuid',          # OpenSSH bsd-setres_id.c
+            '-Dsetresgid=zsh_setresgid',          # OpenSSH bsd-setres_id.c
+        ]
+
+        zsh_defs = [
+            '-DHAVE_CONFIG_H',
+            # The capability-code tables exist (kernel/native_termcap.c
+            # exports them under ncurses's names, declared in the shim's
+            # termcap.h), so zsh/termcap enumerates $termcap from THOSE rather
+            # than from its own bundled ncurses-5-era fallback. Not cosmetic:
+            # with the fallback, ${(k)termcap} listed 37 capabilities where
+            # the guest's own zsh listed 50, for the same terminal.
+            #
+            # deps/zsh/config.h leaves these undefined because zsh's configure
+            # ran without a curses library to find them in. They belong on the
+            # command line rather than in that file: this is AOK supplying
+            # them, and deps/zsh is a vendored tree.
+            '-DHAVE_BOOLCODES', '-DHAVE_NUMCODES', '-DHAVE_STRCODES',
+            # zsh brings its own globbing (Src/glob.c defines zglob and
+            # friends) and never calls libc's. Same escape hatch bash uses --
+            # see kernel/native_libc.h -- and here it is also what keeps
+            # macOS's <glob.h> from being dragged in at all.
+            '-DNATIVE_LIBC_OWN_GLOB',
+            '-include', meson.current_source_dir() / 'kernel/native_libc.h',
+            # AFTER the shim, deliberately: it exists to take back the handful
+            # of rewrites zsh cannot live with. See the header for the rule.
+            '-include', meson.current_source_dir() / 'deps/zsh-shim/aok_zsh_shim.h',
+            # Same reason bash and smallclue carry it: zsh calls wcwidth, which
+            # glibc puts behind a feature-test macro and Darwin exposes anyway.
+            '-D_GNU_SOURCE',
+            '-w',  # vendored code, not ours to police
+        ] + zsh_renames
+
+        # From zsh's own build (Src/stamp-modobjs), not a glob: several .c in
+        # the tree belong to modules this build maps to link=no in
+        # config.modules, and Src/main.c is a three-line wrapper around
+        # zsh_main that would define a second main().
+        zsh_top = [
+            'builtin.c', 'compat.c', 'cond.c', 'context.c', 'exec.c', 'glob.c',
+            'hashtable.c', 'hashnameddir.c', 'hist.c', 'init.c', 'input.c',
+            'jobs.c', 'lex.c', 'linklist.c', 'loop.c', 'math.c', 'mem.c',
+            'module.c', 'options.c', 'params.c', 'parse.c', 'pattern.c',
+            'prompt.c', 'signals.c', 'signames.c', 'sort.c', 'string.c',
+            'subst.c', 'text.c', 'utils.c', 'openssh_bsd_setres_id.c',
+            # AOK's own, not upstream zsh's: fork by re-launch. It lives in the
+            # zsh tree beside the code it patches, exactly as deps/bash's
+            # aok_fork.c does, because only zsh can serialise zsh's state.
+            'aok_fork.c']
+        zsh_builtins = ['rlimits.c', 'sched.c']
+        zsh_modules = [
+            'attr.c', 'clone.c', 'datetime.c', 'files.c', 'hlgroup.c',
+            'ksh93.c', 'langinfo.c', 'mapfile.c', 'mathfunc.c', 'nearcolor.c',
+            'newuser.c', 'param_private.c', 'parameter.c', 'random.c',
+            'random_real.c', 'regex.c', 'socket.c', 'stat.c', 'system.c',
+            'errnames.c', 'tcp.c', 'termcap.c', 'watch.c', 'zftp.c', 'zprof.c',
+            'zpty.c', 'zselect.c', 'zutil.c']
+        zsh_zle = [
+            'compctl.c', 'complete.c', 'compcore.c', 'compmatch.c',
+            'compresult.c', 'complist.c', 'computil.c', 'deltochar.c',
+            'zle_bindings.c', 'zle_hist.c', 'zle_keymap.c', 'zle_main.c',
+            'zle_misc.c', 'zle_move.c', 'zle_params.c', 'zle_refresh.c',
+            'zle_thingy.c', 'zle_tricky.c', 'zle_utils.c', 'zle_vi.c',
+            'zle_word.c', 'termquery.c', 'textobjects.c', 'zleparameter.c']
+
+        zsh_src = []
+        foreach f : zsh_top
+            zsh_src += files(zsh_dir / 'Src' / f)
+        endforeach
+        foreach f : zsh_builtins
+            zsh_src += files(zsh_dir / 'Src/Builtins' / f)
+        endforeach
+        foreach f : zsh_modules
+            zsh_src += files(zsh_dir / 'Src/Modules' / f)
+        endforeach
+        foreach f : zsh_zle
+            zsh_src += files(zsh_dir / 'Src/Zle' / f)
+        endforeach
+
+        # kernel/native.c's registry entry is behind ISH_NATIVE_ZSH, so this
+        # file and the define are decided by the same `have_zsh`.
+        src += files('kernel/zsh_glue.c')
+
+        # implicit_include_directories: false for the reason spelled out in
+        # the OpenSSH block -- meson would otherwise put AOK's source root
+        # ahead of everything here, and AOK's root has files whose names zsh
+        # also uses.
+        libzsh = static_library('zsh', zsh_src,
+            include_directories: zsh_includes,
+            implicit_include_directories: false,
+            c_args: zsh_defs)
+    endif
+
     # link_whole, not link_with: this folds SmallCLUE's objects into libish.a
     # itself. The Xcode project links the meson archives by name (libish.a,
     # libish_emu.a, libfakefs.a), so a fourth archive would silently fail to
     # link on iOS -- which is exactly what happened -- and would need adding to
     # every app target by hand. Riding inside libish.a keeps the two build
     # systems from diverging again.
+    # -DAOK_HAVE_OPENSSH is read by kernel/openssh_glue.c alone, and is passed
+    # here rather than decided in that file so that the archive and the glue
+    # cannot disagree: one `have_openssh` decides both.
+    ish_c_args = []
+    if have_openssh
+        ish_c_args += '-DAOK_HAVE_OPENSSH'
+    endif
+    # Same contract for the checksums: one `have_checksums` decides both
+    # whether checksum_app.c is in the archive and whether smallclue_glue.c
+    # defines the refusals, so the two cannot disagree. They must not both be
+    # present -- the linker takes the first archive member defining a symbol
+    # and stops, which is how `ssh -V` once printed "unavailable" out of a
+    # binary containing all of OpenSSH.
+    if have_checksums
+        ish_c_args += '-DAOK_HAVE_CHECKSUMS'
+    endif
+
     libish = library('ish', src,
-        link_whole: [libsmallclue, libnextvi, libbash],
-        include_directories: includes)
+        link_whole: [libsmallclue, libnextvi, libbash, libzsh, libopenssh] + libopenssh_special,
+        include_directories: includes, c_args: ish_c_args)
     ish = declare_dependency(
         link_with: [libish, libish_emu, libfakefs],
         dependencies: dependencies,

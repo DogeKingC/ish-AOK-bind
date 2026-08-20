@@ -14,18 +14,18 @@ doesn't depend on iOS Scenes or Stage Manager multi-window support.
 
 ## What's in the dock
 
-- **Layout Manager / Desktops** — manage and switch between virtual
-  desktops; window arrangements are saved and restored per layout.
-- **Launcher / Quick Actions** — shortcuts to common actions.
-- **Sessions** — list and switch between running terminal sessions.
-- **Browser** — an in-app web browser applet.
-- **Music** — see below.
-- **MotePad** — see below.
-- **LLM Chat** — an OpenAI-compatible/on-device chat assistant; only shown
-  if enabled in Settings. See [llm-chat.md](llm-chat.md).
-- **Themes, Clock, Info, Monitor, Networks, Status, Storage, Filesystems,
-  Settings, Diagnostics** — status/utility applets and the Filesystems
-  screen described in [roots.md](roots.md).
+The dock itself has two tiles: **Terminal** and **Utils**. Long-press either for
+its menu — Terminal lists your sessions, Utils lists every applet, in five
+groups:
+
+- **Workspace** — Layout Manager, Desktops, Launcher, Quick Actions, Browser,
+  Music, MotePad, File Manager, Sessions, Themes, and LLM Chat when it is
+  enabled in Settings (see [llm-chat.md](llm-chat.md)).
+- **Media** — Markdown, Image Viewer, Video Player, and Wayland (see below).
+- **Status** — Clock, Monitor, Networks, Logs.
+- **Storage** — Storage, and Boot Images, which is the Filesystems screen
+  described in [roots.md](roots.md).
+- **Support** — Settings, Diagnostics.
 
 Window arrangements can be bookmarked and saved, so a favorite layout of
 terminals and applets can be recalled later.
@@ -53,11 +53,31 @@ An audio player applet with two kinds of sources:
 
 Playlists are saved as JSON under `/AOK/persist/playlists`.
 
-## A note on the Wayland/wlroots plan
+## The Wayland applet
 
-You may come across `wayland_workspace_plan.md` in the project's design
-docs, describing a future headless Wayland compositor (wlroots + wayvnc)
-surfaced through a VNC client in a "Display" applet. That is a forward
-design document for a **not-yet-shipped** feature, distinct from the
-native Workspace described here — don't confuse the two if you see it
-referenced elsewhere.
+The **Wayland** applet is the one window here whose contents are drawn by guest
+programs rather than by UIKit. A wlroots compositor, a terminal and a VNC server
+run as ordinary processes inside your root, and the applet is a native RFB
+client connected to them over localhost. It can also be the window the app opens
+on, rather than the terminal.
+
+It needs those programs installed in the guest first, and two scripts do that:
+
+```sh
+sudo sh /AOK/tools/setup-wayland.sh   # once: labwc, sway, wofi, foot, wayvnc
+sh /AOK/tools/start-wayland.sh        # the applet runs this for you
+```
+
+`labwc` is the default compositor and `foot` the first app; `sway` is installed
+as a `WAYLAND_COMPOSITOR_CMD=sway` alternative. `start-wayland.sh` also honours
+`WAYVNC_PORT` and `ISH_DISPLAY_READY_FILE`.
+
+Two caveats worth knowing before you start. Only **amd64/x86_64** guests have
+been bring-up-tested — the packages exist for the other architectures in Devuan
+and may well work, but nobody has run them. And Devuan (apt) and Arch (pacman)
+install the same stack under the same package names, while Alpine (apk) is a
+documented follow-up rather than a supported path.
+
+You may also come across `wayland_workspace_plan.md` in the project's design
+docs. That is the forward design document this applet came out of; where it and
+the shipped applet disagree, the applet is right.

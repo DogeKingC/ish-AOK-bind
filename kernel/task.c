@@ -697,17 +697,18 @@ void task_run_current(void) {
 static void *task_thread(void *task) {
     current = task;
 
-    // SIGUSR1 is blocked on entry (task_start created us that way). Instantiate
-    // the thread-local storage sigusr1_handler relies on -- on this normal call
-    // stack, where malloc is safe -- before unblocking SIGUSR1. The assignment
+    // The wake signals are blocked on entry (task_start created us that way).
+    // Instantiate the thread-local storage sigusr1_handler relies on -- on this
+    // normal call stack, where malloc is safe -- before unblocking them. The assignment
     // above instantiates `current`; this covers should_unwind / unwind_buf /
     // should_mark_wait_interrupted as well.
     signal_thread_locals_init();
 
-    sigset_t sigusr1;
-    sigemptyset(&sigusr1);
-    sigaddset(&sigusr1, SIGUSR1);
-    pthread_sigmask(SIG_UNBLOCK, &sigusr1, NULL);
+    sigset_t wake_sigs;
+    sigemptyset(&wake_sigs);
+    sigaddset(&wake_sigs, SIGUSR1);
+    sigaddset(&wake_sigs, SIGUSR2); // the backup poke, see util/sync.c
+    pthread_sigmask(SIG_UNBLOCK, &wake_sigs, NULL);
 
     update_thread_name();
     
@@ -716,10 +717,59 @@ static void *task_thread(void *task) {
     return NULL;
 }
 
+// A guest task's host stack has to be big enough for a NATIVE program, which
+// runs as an ordinary C function on this thread rather than inside the
+// emulator. Emulated code keeps its own recursion on the guest's stack and
+// barely touches this one, so the 512 KB Darwin gives a non-main thread was
+// never noticed -- until zsh and bash started running natively.
+//
+// Measured with native zsh: shell-function recursion costs ~3.5 KB of this
+// stack per level, so 512 KB ran out at about 150 nested calls. zsh's own
+// guard, FUNCNEST, defaults to 500 and is what makes `r() { r }; r` print
+// "maximum nested function level reached" on a real zsh; here the C stack was
+// exhausted first, and a native program is a function call on a thread of the
+// APP, so the resulting SIGBUS took the whole app down (host exit 138) rather
+// than one shell. `builtin() { builtin print x }; builtin` did the same thing
+// in one line.
+//
+// So the stack is sized to fit the guard rather than the guard shrunk to fit
+// the stack: 4 MB was measured to hold between 1250 and 1300 levels, i.e. two
+// and a half times FUNCNEST's default, which leaves zsh's own guard to stop
+// first and say so in zsh's own words. Shrinking FUNCNEST instead would have
+// been a divergence from what the same script does off-device, and it would
+// have fixed only zsh -- bash and every future native program share this
+// thread.
+//
+// Re-measured once both shells had the guard, since the depth that matters is
+// what is USABLE, not what the stack holds raw: native zsh refuses at 1186
+// levels and native bash at 1455 (binary search, this rootfs, 4 MB). zsh's own
+// FUNCNEST default of 500 therefore still fires first, which is the intent --
+// an ordinary script that recurses too far gets zsh's message from zsh's guard,
+// exactly as it does off-device.
+//
+// bash is the one that actually depends on this number, and it was not part of
+// the original reasoning: bash's FUNCNEST is UNSET by default, so there is no
+// first limit to fire and the stack guard is the only thing between a runaway
+// recursive function and the end of the stack. Halving this to 2 MB would put
+// zsh at roughly 550 usable levels -- close enough to FUNCNEST's 500 that the
+// two guards would start racing -- and 1 MB would put it below, so ours would
+// fire on scripts that are legal everywhere else. 4 MB is the smallest size
+// with real margin, not a round number.
+//
+// The cost is address space rather than memory: the pages are committed on
+// demand, so a thread that never recurses still touches only a few KB of it.
+// Measured with 60 concurrent guest tasks live: RSS stayed in the low
+// megabytes, i.e. the 8x reservation is not an 8x footprint.
+// That is what makes this affordable to give to every guest task rather than
+// only to the ones running native programs -- which is just as well, because
+// at creation time we do not yet know which those are.
+#define TASK_THREAD_STACK_SIZE (4 * 1024 * 1024)
+
 static pthread_attr_t task_thread_attr;
 __attribute__((constructor)) static void create_attr(void) {
     pthread_attr_init(&task_thread_attr);
     pthread_attr_setdetachstate(&task_thread_attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&task_thread_attr, TASK_THREAD_STACK_SIZE);
 #if defined(__APPLE__)
     // Run emulated guest threads one QoS band below the UI thread
     // (USER_INTERACTIVE). A multi-threaded guest workload spawns one OS thread
@@ -739,11 +789,12 @@ int task_start(struct task *task) {
     // (task_poke_shared_mem -> pthread_kill(.., SIGUSR1)) could be delivered
     // while the new thread is mid-malloc instantiating that storage, making the
     // handler re-enter malloc and abort on the malloc lock. The new thread
-    // inherits this mask and unblocks SIGUSR1 itself once it is safe.
-    sigset_t sigusr1, oldmask;
-    sigemptyset(&sigusr1);
-    sigaddset(&sigusr1, SIGUSR1);
-    pthread_sigmask(SIG_BLOCK, &sigusr1, &oldmask);
+    // inherits this mask and unblocks them itself once it is safe.
+    sigset_t wake_sigs, oldmask;
+    sigemptyset(&wake_sigs);
+    sigaddset(&wake_sigs, SIGUSR1);
+    sigaddset(&wake_sigs, SIGUSR2); // same reasoning, see util/sync.c
+    pthread_sigmask(SIG_BLOCK, &wake_sigs, &oldmask);
     // Test knob: ISH_TEST_FAIL_TASK_START_AFTER=N makes every create after
     // the Nth fail as if the host were at its thread limit, so the unwind
     // path below can be regression-tested without a 16k-thread storm.

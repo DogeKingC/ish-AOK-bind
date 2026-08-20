@@ -4,9 +4,13 @@
 #include "fs/tty.h"
 
 // Incredibly sloppy. Please do not reference as an example of good API design.
-// `name` is what / reports as its source in /proc/mounts (df's "Filesystem"
-// column); NULL reports the host path it was mounted from.
-int mount_root(const struct fs_ops *fs, const char *source, const char *name);
+// / reports /dev/<GUEST_DISK_NAME> as its source in /proc/mounts, matching
+// /proc/diskstats and /sys/block; see the comment on the definition.
+int mount_root(const struct fs_ops *fs, const char *source);
+// Declare the root in /etc/fstab if nothing there does. Call once per boot,
+// AFTER become_first_process() -- it goes through the guest VFS, which needs a
+// current task. See the definition for why a rootfs image never declares it.
+void ensure_root_fstab_entry(void);
 void set_console_device(int major, int minor);
 void get_console_device(int *major, int *minor);
 intptr_t become_first_process(void);

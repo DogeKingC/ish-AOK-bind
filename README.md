@@ -12,7 +12,9 @@ This fork is not just a rebrand. It carries fork-specific behavior, bundled root
   - product name `iSH-AOK`
   - bundle root `app.ish.iSH-AOK`
 - **Four guest architectures**, all JIT: `i386`, `amd64` (x86_64), `arm64` (aarch64), and `riscv64`.
-- Bundled root filesystems in the app build (Alpine 3.23.3 and Devuan 6, each for i386, x86_64 and aarch64), plus additional downloadable images including riscv64.
+- **Native programs**: bash, zsh and SmallCLUE's busybox-style toolbox — which carries OpenSSH (`ssh`, `scp`, `sftp`, `ssh-keygen`, `ssh-copy-id`) and the Nextvi editor — are compiled into the app as host code and dispatched from guest `execve` through `/AOK/native/<name>`. They are host functions on a guest task's thread, not guest binaries, so they run at full speed instead of being translated instruction by instruction.
+- `/AOK`, a read-only in-app filesystem (`/AOK/docs`, `/AOK/tools`, `/AOK/tests`, `/AOK/native`) embedded at build time from `opt/AOK/` via `fs/aok-*.manifest` and `tools/gen-aokfs.py`.
+- Bundled root filesystems in the app build (Alpine 3.23.3 and Devuan 6, `aarch64` only), plus downloadable images for `i386`, `x86_64` and `riscv64`.
 - Android Binder IPC: `/dev/binder`, `/dev/hwbinder`, `/dev/vndbinder` and
   binderfs, so `libbinder`-based Android userspace has a driver to talk to.
   See [docs/binder.md](docs/binder.md).
@@ -48,8 +50,11 @@ each gadget's body cheaper, not free.
 | `arm64` | supported, JIT |
 | `riscv64` | supported, JIT |
 
-The per-guest regression suites pass on all four. Note that the interpreters are
-legacy and are being retired: new work should target the JIT.
+The per-guest regression suites pass on all four on device. One known exception
+on the CLI build: `fakefs_type_race` crashes deterministically on an i386 guest
+(forward-edge block chaining; workaround `ISH_I386_NOCHAIN=1` — see
+[docs/TODO.md](docs/TODO.md)). Note that the interpreters are legacy and are
+being retired: new work should target the JIT.
 
 Relevant files:
 
@@ -85,16 +90,21 @@ All three are **off by default** and opt-in:
 
 | feature | CLI | what it does |
 |---|---|---|
-| HLE | `ISH_HLE=1` | replaces hot libc routines (`memcpy`, `strlen`, `memcmp`, ...) with native code |
+| HLE | `ISH_HLE=1` | replaces hot libc routines (`memcpy`, `strlen`, `memcmp`, ...) with native code — **arm64 and riscv64 guests only** |
 | Crypto | `ISH_CRYPTO_ACCEL=1` | AES-GCM and ChaCha20-Poly1305 offload |
 | Pixman | `ISH_PIX_ACCEL=1` | pixman composite offload |
 
-HLE matters most. On a loop dominated by the routines it replaces, it takes the
-guest from roughly 250x slower than native to roughly 1.4x, because the work
-happens inside one native call rather than one dispatch per guest instruction.
-It is a pure fast path: an unrecognized libc simply never matches and falls
-through to ordinary translation. `ISH_HLE_STATS=1` prints per-function call
-counts.
+HLE matters most, and only for the arm64 and riscv64 guests — `jit/jit.c` gates
+it on those two, so an i386 or amd64 guest never takes the path and `ISH_HLE=1`
+silently does nothing there. Measured against the same build with it off, on a
+memcpy/memset/memcmp/strlen loop: 1.23x at 256 B, 3.16x at 4 KB, 7.17x at 64 KB,
+6.68x at 1 MB
+([docs/performance-optimizations-2026-07.md](docs/performance-optimizations-2026-07.md)).
+The work happens inside one native call rather than one dispatch per guest
+instruction, so it helps data-movement-heavy code and is neutral where a
+program's own arithmetic dominates. It is a pure fast path: an unrecognized libc
+simply never matches and falls through to ordinary translation.
+`ISH_HLE_STATS=1` prints per-function call counts.
 
 ## Repository Layout
 
@@ -120,6 +130,10 @@ If you already cloned without submodules:
 ```bash
 git submodule update --init --recursive
 ```
+
+Note that `--recursive` includes `deps/bash`, which makes the default build a
+GPLv3 one. See [Native bash and licensing](#native-bash-and-licensing) if you
+intend to distribute the result.
 
 ## Build Requirements
 
@@ -194,6 +208,152 @@ Create a filesystem from a rootfs tarball:
 ./build/tools/fakefsify alpine-minirootfs-*.tar.gz alpine
 ```
 
+## Native Programs
+
+A native program is host code compiled into the app. `execve` of a path under
+`/AOK/native` dispatches to a function inside iSH-AOK rather than loading a
+guest image, and the caller cannot tell the difference. `/AOK/native` holds one
+entry per program in the registry (`kernel/native.c`) — `smallclue`, `bash`,
+`zsh`, `zsh-multio` — and everything else is a symlink to one of those, the link
+name selecting the applet exactly as busybox does:
+
+| program | what it is |
+|---|---|
+| `/AOK/native/smallclue` | busybox-style multicall toolbox, applet chosen by `argv[0]` |
+| `ssh`, `scp`, `sftp`, `ssh-keygen`, `ssh-copy-id` | OpenSSH, applets of SmallCLUE (built without OpenSSL) |
+| `vi` | the Nextvi editor, an applet of SmallCLUE |
+| `/AOK/native/bash` | see [Native bash and licensing](#native-bash-and-licensing) |
+| `/AOK/native/zsh` | see [Native zsh](#native-zsh) |
+
+`/AOK/tools/native-links.sh` builds the symlink farm that puts the applets on
+`PATH`, and `--shell bash|zsh|/path` switches the login shell; `--remove` undoes
+both. In-app documentation is at `/AOK/docs/native-programs.md` (what they are)
+and `/AOK/docs/native-setup.md` (how to set them up), sources under
+[opt/AOK/docs/](opt/AOK/docs).
+
+The hard part is not speed, it is that a native program must answer questions
+about the *guest* rather than about the iPhone it is running on: environment,
+identity, filesystem, `/etc/hosts` and `/etc/resolv.conf`, terminfo, locale and
+rc-file locations are all routed to the rootfs by a shim compiled in ahead of
+the system headers (`kernel/native_libc.c`). The governing question is not "is
+this function pure?" but "can this function's answer differ between the host and
+the guest?". `tools/check-native-libc.py` is the gate for it: run over the built
+objects, it reports every host-libc symbol a native program references that is
+not on an explicit allowlist. It is run deliberately rather than wired into the
+build.
+
+## Native bash and licensing
+
+bash is compiled into the app as a native program. The win is interpretation,
+not forking: an arithmetic loop runs roughly 16x faster than under the emulated
+shell, while subshells and command substitutions land near parity, because a
+native program cannot `fork` and re-launches itself instead. Numbers and method
+are in [docs/bash_native_plan.md](docs/bash_native_plan.md). It also puts GPLv3
+code in the binary: bash itself, its bundled readline, and GNU termcap.
+
+That matters for App Store distribution. iSH-AOK is GPLv3 too, but
+[LICENSE.IOS](LICENSE.IOS) is a promise from *this project's* copyright holders
+not to enforce against the conflict between the GPL and Apple's terms. It
+cannot bind the FSF, which holds bash's copyright and has had GPL software
+removed from the App Store twice — [GNU
+Go](https://www.theregister.com/2010/05/27/gnu_go_fsf_apple_itunes/) in 2010
+and [VLC](https://www.fsf.org/blogs/licensing/vlc-enforcement) in 2011, on the
+grounds that the store's Usage Rules impose "further restrictions" barred by
+[GPL section
+6](https://www.fsf.org/blogs/licensing/more-about-the-app-store-gpl-enforcement).
+The FSF states that analysis applies to all GPL versions, not only v3.
+
+So it is a build option:
+
+```bash
+meson setup build .                          # auto: on if deps/bash is present
+meson setup build . -Dnative_bash=disabled   # no third-party GPL in the binary
+meson setup build . -Dnative_bash=enabled    # fail if deps/bash is missing
+```
+
+Configure prints which one you got, under a `Licensing` heading. Check it
+rather than assuming:
+
+```
+Licensing
+  native bash: no -- no third-party GPL in the binary
+```
+
+`disabled` leaves bash, readline and termcap out of the archive entirely — 0
+objects, verified with `ar t`. Users still get bash: the emulated `/bin/bash`
+from the guest rootfs, which is the same mere-aggregation position as every
+other GPL tool in Devuan or Alpine.
+
+**Removing the applet-table entry in `kernel/native.c` is not sufficient.**
+`meson.build` folds these archives in with `link_whole`, so the objects ship
+whether or not anything references them — measured, 144 bash and 35 readline
+objects remain with the registry entry deleted. Only the build option removes
+them.
+
+Nothing else in the binary is third-party GPL: SmallCLUE is MIT, OpenSSH and
+libarchive are BSD, liblzma is public domain, and `deps/linux` is not compiled
+into this target.
+
+## Native zsh
+
+zsh is compiled in as a third native program, reachable as `/AOK/native/zsh`,
+and is **on by default** — `-Dnative_zsh=disabled` leaves it out. Unlike bash
+there is no licensing question: zsh's licence is permissive and none of its
+compiled C is GPL.
+
+It is a working shell. ZLE — the line editor — works: prompt, echo, editing,
+history keys, line wrapping, full terminal negotiation. So does `fork`, which
+was the thing that did not. A native program is a C function on a guest task's
+thread rather than a process, so `fork` cannot copy an address space; zsh
+instead serialises its own state into a script and re-launches itself, the
+design proven first on bash (`deps/zsh/Src/aok_fork.c`, `deps/bash/aok_fork.c`).
+Command substitution, pipelines, subshells and background jobs all go through
+that path:
+
+```
+% echo $(echo A); echo B | tr B C; (echo D); sleep 0.1 & wait; echo E
+A
+C
+D
+E
+```
+
+MULTIOS redirections use a companion native program, `zsh-multio`, because the
+descriptors have to be held by something that is not the shell.
+
+`/AOK/tools/native-links.sh --shell zsh` will make it the login shell.
+
+119 differential cases ship in the guest at
+`/AOK/tests/native_zsh_fork_state.sh`, with every expectation taken from what
+real zsh prints rather than from what looked reasonable; 116 of them pass. The
+two that fail are **process substitution** — `<(...)` and `>(...)` — and that is
+a property of the rootfs rather than of the shell: it needs `/dev/fd`, which the
+Alpine image does not provide, so it fails identically under the emulated
+`/bin/bash` there and works under both shells on Devuan, where `/dev/fd` is a
+symlink to `/proc/self/fd`. Two known gaps that *are* the shell's are recorded
+under *Known gaps* in
+[docs/release-notes-since-iSH-AOK_549.md](docs/release-notes-since-iSH-AOK_549.md):
+a pattern is compiled at first use and cached in the parse tree with nothing
+recording the options in force at the time, so a re-launched child can compile
+it under different options than its parent did; and `pipestatus` under a multio
+reports `1 0` where zsh reports `0 0`.
+
+The tree at `deps/zsh` is a submodule of
+[emkey1/zsh](https://github.com/emkey1/zsh) on branch `ish-aok`. It carries
+zsh's *generated* sources — `config.h`, `Src/signames.c`, the per-module
+`.mdh`/`.epro`/`.pro` — committed against upstream's `.gitignore`, because this
+build compiles zsh with meson and never runs zsh's own `make`. So a checkout
+builds with no configure step:
+
+```bash
+git submodule update --init deps/zsh
+```
+
+It is configured termcap-only with all modules linked statically. Both are
+forced: the iOS SDK ships the curses `.tbd` stubs without `curses.h`/`term.h`,
+and a native program cannot `dlopen` — where `--disable-dynamic` alone silently
+maps `zsh/regex` to `link=no` and `[[ =~ ]]` then fails at runtime.
+
 ## Regression Tests
 
 Host-side tests:
@@ -225,11 +385,19 @@ Adding a test means dropping the source in `tests/manual/` and listing it in
 so it is built and run. A test missing from the manifest is silently absent on
 device.
 
+Three suites are the exception: `native_zsh_fork_state.sh` (119 cases),
+`native_bash_fork_state.sh` (20) and `native_stdio_redirect.sh` are shell
+scripts rather than C, so `setup-regressions.sh` neither builds nor lists them.
+They ship via the manifest and are run directly from `/AOK/tests`, and each
+needs the matching native program to be present.
+
 ## Working with Root Filesystems
 
-Bundled in the app: Alpine 3.23.3 and Devuan 6 (excalibur), each for `i386`,
-`x86_64` and `aarch64`. Further images, including `riscv64` and Arch, are
-downloadable from within the app; the catalogue is
+Bundled in the app: Alpine 3.23.3 and Devuan 6 (excalibur), `aarch64` only. The
+Xcode "Download Root" phase installs those two archives and deletes the i386 and
+x86_64 ones from Resources, so they are the only roots present before any
+download. The same two distros for `i386`, `x86_64` and `riscv64`, plus Arch,
+are downloadable from within the app; the catalogue is
 [deps/rootfs-manifest](deps/rootfs-manifest).
 
 The root-selection UI and metadata handling live in:

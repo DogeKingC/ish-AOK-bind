@@ -119,6 +119,8 @@ fakefs_casefold.c
 fakefs_inode_alias.c
 fifo_open_creat_deadlock.c
 proc_stat_monotonic.c
+proc_field_layout.c
+sock_conn_error.c
 sock_getfd_errno.c
 inotify_close_race.c
 statx_mnt_id_timerfd.c
@@ -149,7 +151,7 @@ x86/amd64_regress.c
 x86/amd64_incdec.c
 x86/avx_regress.c
 x86/avx32_smoke.c
-x86/amd64_jit_bench.sh
+x86/amd64_jit_guest_bench.sh
 setup-regressions.sh
 arm64/atomics64.c
 arm64/arm64_regress.c
@@ -171,3 +173,6 @@ arm64/ret_retcache.c
 jit_fuse_ab.sh
 jit_bench.c
 aes_gcm_accel.c
+native_stdio_redirect.sh
+native_zsh_fork_state.sh
+native_bash_fork_state.sh

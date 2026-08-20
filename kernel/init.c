@@ -17,21 +17,99 @@
 #include "kernel/signal.h"
 #include "kernel/task.h"
 
-int mount_root(const struct fs_ops *fs, const char *source, const char *name) {
+int mount_root(const struct fs_ops *fs, const char *source) {
     char source_realpath[MAX_PATH + 1];
     if (realpath(source, source_realpath) == NULL)
         return errno_map();
     int err = do_mount(fs, source_realpath, "", "", 0);
     if (err < 0)
         return err;
-    // df's "Filesystem" column for / would otherwise be the host path this
-    // was mounted from, which is long, unusable from inside the guest, and on
-    // device carries the app group UUID. Report the root's name instead
-    // ("Devuan6-arm64"); the host path stays in mount->source for fakefs.
+    // What / reports as its source, in /proc/mounts, /proc/self/mountinfo and
+    // therefore df's "Filesystem" column.
+    //
+    // NOT the host path this was mounted from: that is long, unusable from
+    // inside the guest, and on device carries the app group UUID. It used to be
+    // the root's directory name ("Devuan6-arm64"), which read well in df but
+    // named something no other file in the guest had ever heard of. Nothing
+    // tied a mount to a device: /proc/diskstats advertised one device, btop
+    // matched mounts to diskstats entries by name, and no name in one file
+    // appeared in the other, so btop's disk and io panels listed nothing at all.
+    //
+    // So it is the block device the root is on, spelled the way Linux spells
+    // it. AOK aggregates every real read and write into one device (see
+    // fs/real.h) and has always printed major 8, minor 0 for it -- which IS
+    // "sda" in Linux's numbering, whatever the name beside it said. Now
+    // /proc/mounts, /proc/diskstats and /sys/block agree on it.
+    //
+    // The host path stays in mount->source for fakefs; only the label changes.
     // Ignore failure: the mount succeeded, only its label is at stake.
-    if (name != NULL)
-        mount_set_display_source("", name);
+    mount_set_display_source("", "/dev/" GUEST_DISK_NAME);
     return 0;
+}
+
+// Declare the root in /etc/fstab, if nothing there declares it already.
+//
+// A rootfs tarball has never heard of AOK's root: Alpine's ships an fstab whose
+// only entries are `noauto` lines for a CD-ROM and a USB stick, and Devuan's and
+// Arch's are no better. Every real Linux system's fstab names its root
+// filesystem, and things read it expecting that -- btop takes its ENTIRE disk
+// list from fstab by default (use_fstab), so its disk and io panels were empty
+// on every AOK guest, showing nothing at all rather than showing the root.
+// (Measured: with use_fstab off the same btop fills the panel in; with it on,
+// which is the default nobody changes, it stays blank.)
+//
+// The same reasoning as the /dev repair the CLI and the app each do at boot,
+// and the same conservatism: this only ever ADDS a line, and only when no entry
+// for "/" exists at all. A user who has written their own root entry keeps it,
+// and running twice changes nothing.
+void ensure_root_fstab_entry(void) {
+    static const char entry[] =
+        "# Added by iSH-AOK: the root, which the rootfs image did not describe.\n"
+        "/dev/" GUEST_DISK_NAME "\t/\tfake\trw\t0 0\n";
+
+    struct fd *fd = generic_open("/etc/fstab", O_RDWR_ | O_CREAT_, 0644);
+    if (IS_ERR(fd))
+        return;   // no /etc, read-only root, whatever -- not worth a boot failure
+
+    // Small file by nature; a root entry past 64 KiB is not a case to serve.
+    char buf[65536];
+    ssize_t n = fd->ops->read(fd, buf, sizeof(buf) - 1);
+    if (n < 0)
+        n = 0;
+    buf[n] = '\0';
+
+    bool have_root = false;
+    for (char *line = buf; line != NULL && *line != '\0'; ) {
+        char *end = strchr(line, '\n');
+        if (end != NULL)
+            *end = '\0';
+        // <device> <mountpoint> ...; the mountpoint is the second field.
+        const char *p = line;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (*p != '#' && *p != '\0') {
+            while (*p != '\0' && *p != ' ' && *p != '\t')
+                p++;                              // past the device
+            while (*p == ' ' || *p == '\t')
+                p++;
+            if (p[0] == '/' && (p[1] == '\0' || p[1] == ' ' || p[1] == '\t'))
+                have_root = true;
+        }
+        line = end != NULL ? end + 1 : NULL;
+    }
+
+    if (!have_root) {
+        // A file not ending in a newline would otherwise splice onto our line.
+        off_t_ at = n;
+        if (n > 0 && buf[n - 1] != '\n') {
+            fd->ops->lseek(fd, at, LSEEK_SET);
+            fd->ops->write(fd, "\n", 1);
+            at++;
+        }
+        fd->ops->lseek(fd, at, LSEEK_SET);
+        fd->ops->write(fd, entry, sizeof(entry) - 1);
+    }
+    fd_close(fd);
 }
 
 static void establish_signal_handlers(void) {
@@ -42,6 +120,18 @@ static void establish_signal_handlers(void) {
     sigemptyset(&sigact.sa_mask);
     sigaddset(&sigact.sa_mask, SIGUSR1);
     sigaction(SIGUSR1, &sigact, NULL);
+
+    // The backup wake poke (util/sync.c). Without a handler SIGUSR2's default
+    // action is to kill the whole emulator, so this must be installed before
+    // signal_wake_task can ever send one.
+    extern void sigusr2_handler(int sig);
+    struct sigaction usr2act;
+    usr2act.sa_handler = sigusr2_handler;
+    usr2act.sa_flags = 0;
+    sigemptyset(&usr2act.sa_mask);
+    sigaddset(&usr2act.sa_mask, SIGUSR2);
+    sigaction(SIGUSR2, &usr2act, NULL);
+
     signal(SIGPIPE, SIG_IGN);
 }
 
@@ -156,6 +246,22 @@ intptr_t become_first_process(void) {
     struct task *task = construct_task(NULL);
     if (IS_ERR(task))
         return PTR_ERR(task);
+
+    // The machine boots when init does, not when the app process starts.
+    //
+    // run_at_boot() sets boot_time once per APP PROCESS, and iOS keeps an app
+    // alive across suspensions for days -- so a guest whose init had just
+    // started reported an uptime measured from the app's launch, and
+    // /proc/stat's btime (derived from it) named a moment long past. Linux
+    // userland reads btime as "when this system came up" and checks it:
+    // wtmpdb-update-boot refused AOK's outright, with "Boot time too far in
+    // the past".
+    //
+    // This is where pid 1 is created, which is the only event in AOK that
+    // means what a boot means. run_at_boot still seeds boot_time so it is
+    // never zero for anything that reads the clock before init exists.
+    extern time_t boot_time;
+    boot_time = time(NULL);
     //task_ref_cnt_mod(task, 1);
     current = task;
     return 0;

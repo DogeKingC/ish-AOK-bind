@@ -9,24 +9,33 @@
 # Use a SYMlink, never a hard link: /AOK is its own filesystem, so `ln` across
 # it fails with EXDEV.
 #
-# Default target is /usr/local/native-bin, which is deliberately NOT on PATH.
+# Default target is /usr/local/native-bin, and this script puts that directory
+# FIRST on PATH, via /etc/profile.d, unless you pass --no-path.
 #
-# Linking into /usr/local/bin was the obvious design and it is wrong: that
-# directory precedes /usr/bin, so every link shadows the distro's command, and
-# SmallCLUE's applets are SMALLER implementations rather than drop-in
-# replacements. Excluding the applets that cannot work at all is not enough,
-# because the incompatibilities are per-flag: with the links installed,
-# PSCAL's harness died on `grep -q`, which SmallCLUE's grep does not support.
-# No audit of the sources finds that -- grep is present and works, just not
-# with that flag.
+# That default was reversed deliberately, and the reasoning it reversed is still
+# worth keeping in view: shadowing means every link takes precedence over the
+# distro's command, and SmallCLUE's applets are SMALLER implementations rather
+# than drop-in replacements. Excluding the applets that cannot work at all is not
+# enough on its own, because the incompatibilities are per-flag: PSCAL's harness
+# once died on `grep -q', which SmallCLUE's grep did not support at the time. No
+# audit of the SOURCES finds that class, since grep is plainly present and works,
+# just not with that one flag. (`grep -q' itself works now -- the shape of the
+# problem is what matters, not that example.)
 #
-# So the default is a directory you opt into:
+# What changed is the other half: the EXCLUDED list below is now derived from
+# tools/native-applet-audit.py rather than guessed, so an applet that cannot work
+# is not linked in the first place. If something still turns out to be shadowed
+# badly:
 #
-#   PATH=/usr/local/native-bin:$PATH        # this shell only
-#   /usr/local/native-bin/wc -l file        # one command
+#   sh /AOK/tools/native-links.sh --no-path   # link, but leave PATH alone
+#   sh /AOK/tools/native-links.sh --remove    # take the links back out
 #
-# Pass /usr/local/bin explicitly if you want the shadowing, and expect scripts
-# that rely on GNU extensions to break.
+# The links stay usable by full path either way:
+#
+#   /usr/local/native-bin/wc -l file          # one command, no PATH needed
+#
+# Pass /usr/local/bin explicitly if you want the links ahead of the distro's own
+# /usr/local/bin entries too.
 #
 # Usage:
 #   sh /AOK/tools/native-links.sh [options] [directory]
@@ -35,44 +44,154 @@
 #   --remove   remove links pointing at /AOK/native/smallclue
 #   --all      include applets that do not work in this build (see EXCLUDED)
 #   --force    replace files that are not our own symlinks
+#   --no-shell leave the UID 1000 login shell alone
+#   --shell S  which native shell to switch to: bash, zsh or an absolute path
 #   --help
+#
+# It also switches the UID 1000 user's login shell to a native shell, because
+# that is the other half of "make this install use the native code": the links
+# above only matter for commands the shell RUNS, and the shell itself is where
+# a session actually spends its time -- interpretation is 16.5x faster natively
+# (docs/bash_native_plan.md). --no-shell skips it, --remove puts it back.
 set -eu
 
 NATIVE=/AOK/native/smallclue
+NATIVE_BASH=/AOK/native/bash
+NATIVE_ZSH=/AOK/native/zsh
+# Which of them becomes the login shell. Empty means "decide below": prefer bash
+# when it is there, otherwise zsh. That ordering keeps this script doing exactly
+# what it always did on a build that HAS bash -- which is the default build, since
+# -Dnative_bash is `auto' and resolves to ON whenever deps/bash is checked out --
+# while making a build configured with -Dnative_bash=disabled, where
+# /AOK/native/bash does not exist at all because linking it would put GPLv3 in the
+# binary, switch to zsh instead of silently switching nothing.
+SHELL_WANT=
 TARGET_DIR=/usr/local/native-bin
 MODE=link
 INCLUDE_ALL=0
 FORCE=0
+DO_SHELL=1
+DO_PATH=1
+# Where the previous shell is remembered so --remove can restore it. In /etc
+# because that is where the thing it describes lives, and because /usr/local
+# may be a different filesystem.
+SHELL_STATE=/etc/aok-native-shell.prev
+# The PATH snippet. profile.d rather than a user dotfile: it is system state
+# this script owns, so --remove can delete the whole file and be sure it has
+# left nothing behind, which editing someone's .bashrc could never promise.
+PATH_FILE=/etc/profile.d/05-aok-native-bin.sh
 
-# Applets deliberately NOT linked by default. Linking a broken one is worse
-# than leaving it alone: the distro's working command gets shadowed by one that
-# errors, and the failure surfaces somewhere unrelated. This list is derived,
-# not guessed -- see tools/native-applet-audit.py, which walks SmallCLUE's
-# sources and flags every applet whose handler can reach a call the shim
-# answers with ENOSYS, following helper functions transitively.
+# Applets deliberately NOT linked. Linking a broken one is worse than leaving
+# it alone: the distro's working command gets shadowed by one that errors, and
+# the failure surfaces somewhere unrelated.
 #
-# It was written by hand first and that was not good enough: `env` was missed,
-# and since the PSCAL test harness runs `env ... bash ...`, installing these
-# links took its suite from 217 passing to zero. env has to exec.
+# THIS LIST WENT BADLY STALE ONCE. It was written when much of the native libc
+# shim was missing, and kept entries long after the shim grew spawn, signals,
+# wait and job control -- 52 entries where a measurement found a handful.
 #
-# Three groups:
-#   missing dependency  -- report "not built into this iSH-AOK": tar/gzip/zcat
-#                          (zlib), the checksum trio (OpenSSL), the ssh family
-#                          and rsync (vendored OpenSSH), git (libgit2)
-#   unimplemented call  -- reach exec/spawn/wait/ioctl/select/glob and fail
-#                          with "Function not implemented", or silently do
-#                          nothing, which is worse (xargs)
-#   not worth shadowing -- system state and non-commands
+# tools/native-applet-audit.py, which walks SmallCLUE's sources for calls the
+# shim answers with ENOSYS, is NOT the authority here and has drifted further
+# from one: it flags find, rm, time, timeout, watch, xargs, init and runit, and
+# every one of those was then measured working. The reason is structural -- it
+# follows helpers transitively and cannot see #if defined(PSCAL_TARGET_IOS), so
+# the one fork() left in the tree (inside an iOS-only watch helper) taints
+# everything that can reach the applet table. It also cleared `env`, whose
+# inability to exec once took PSCAL's harness from 217 passing to zero. Treat
+# it as a hint about where to LOOK, never as an answer.
 #
-# The audit is deliberately conservative: an applet is excluded if ANY path
-# through it reaches an unimplemented call, even a rare one. `find` works fine
-# until -exec; a command that fails only on some flags is a nastier trap than
-# one that is simply absent. Use --all to link everything anyway.
-EXCLUDED="awk chroot env find git gunzip gzip halt init kill less licenses md
-md5sum mdev micro mknod more mount nextvi nohup passwd poweroff reboot resize
-rm rsync runit scp script sftp sha1sum sha256sum smallclue smallclue-help ssh
-ssh-copy-id ssh-keygen stty su sudo tar telnet time timeout top touch umount
-version vi vproc-test watch xargs zcat"
+# So the entries below are what was MEASURED by running each applet, not what
+# the audit predicted. Re-measure rather than re-reason when this is revisited.
+#
+#   broken here      script needs the PSCAL app's terminal-capture hooks and
+#                    creates no pty of its own; mount, umount and passwd have
+#                    their real bodies inside #if defined(__linux__), and a
+#                    native program is compiled for the HOST; vproc-test says
+#                    it is iOS-only; version reports the embedding app's
+#                    marketing version, which AOK has none of
+#   loops or blocks  init, runit, watch all WORK -- init runs /etc/rc and reaps,
+#                    runit starts its services, watch repeats -- and that is
+#                    exactly why they are not linked: two are supervisors that
+#                    never return and the third repeats until interrupted
+#   misleading       halt, poweroff and reboot print "System halt requested"
+#                    and return 0, having halted nothing: their body is an
+#                    exit(0), and a native program's exit is a return into the
+#                    kernel, not the end of anything. Shadowing sysvinit's
+#                    halt with a no-op that reports success is the worst kind
+#                    of entry to link
+#   system state     mknod, mdev, chroot, su, sudo -- these work, and
+#                    shadowing them is still all risk: this sudo runs the
+#                    command with no authentication at all
+#   not commands     smallclue, smallclue-help, licenses
+#
+# Three entries left this list after being fixed rather than reclassified, which
+# is the outcome to aim for: ipaddr (the shim's getifaddrs is real now -- the
+# host's interfaces ARE the guest's, and /proc/net/dev was already built from
+# them), kill (which now takes -0, -s SIG and a signal by name or number), and
+# dmesg -- whose __linux__ test was answering the wrong question, since AOK's
+# guest IS Linux and now answers klogctl through the shim.
+#
+# Absent from this list on purpose, because they are handled by PROBED below
+# rather than hardcoded: everything whose availability depends on what this
+# particular build has compiled in.
+EXCLUDED="chroot halt init licenses mdev mknod mount passwd poweroff
+reboot runit script smallclue smallclue-help su sudo umount version
+vproc-test watch"
+
+# Availability-gated applets: present in every build, working only in some.
+# These are the ones that made the list stale, because whether they work is a
+# property of the BUILD rather than of the applet -- ssh needs the vendored
+# OpenSSH tree, tar and gzip need zlib, git needs libgit2, curl and wget need
+# libcurl, micro and vi need their embedded editors.
+#
+# So they are not guessed at: each is run once, and skipped only if it reports
+# that it is not in this build. A build that gains ssh starts linking ssh with
+# no edit here, which is the property this list was missing.
+#
+# md5sum/sha1sum/sha256sum are still probed although they now work everywhere
+# AOK builds: they are compiled only where CommonCrypto exists, which is the
+# same kind of build-time fact as the rest of this list.
+PROBED="ssh scp sftp ssh-keygen ssh-copy-id rsync git tar gzip gunzip zcat
+md5sum sha1sum sha256sum micro vi nextvi curl wget"
+
+# What to run to make an applet own up. --version for almost everything, but
+# not for curl and wget: they parse it as an option, print usage, and look
+# perfectly healthy right up until a transfer reports that libcurl is absent.
+# So they are probed with a real fetch from an address on this machine that
+# nothing listens on -- no network required, instant either way, and a build
+# WITH libcurl fails at connect rather than at "unavailable".
+probe_args() {
+    case "$1" in
+        curl) echo "-o /dev/null http://127.0.0.1:1/" ;;
+        wget) echo "-O /dev/null http://127.0.0.1:1/" ;;
+        # OpenSSH spells it -V, and answers --version with a getopt complaint on
+        # stderr. Harmless to the probe, which only looks for the stub's words,
+        # but it leaked "ssh: illegal option -- r" onto the terminal of anyone
+        # running this script.
+        # The ssh family shares no version flag: -V is a validity interval to
+        # ssh-keygen, nothing to sftp, and ssh-copy-id has none. Bare usage is
+        # what the probe wants -- but NOT for ssh-keygen, which with no
+        # arguments starts GENERATING A KEY and blocks on a prompt. A probe must
+        # not have side effects; give it a read-only failure instead.
+        ssh|scp|sftp|ssh-copy-id) echo "" ;;
+        ssh-keygen) echo "-l -f /nonexistent-probe" ;;
+        *) echo "--version" ;;
+    esac
+}
+
+# The stubs' own words, from kernel/smallclue_glue.c and the nextvi/micro
+# stubs. Matched loosely because they are diagnostics rather than an API --
+# three different spellings for one idea, which is why this is a case and not
+# a comparison. "not enabled in this build" is git's, and its absence here is
+# why git used to be linked into a build that had no libgit2.
+probe_missing() {
+    # shellcheck disable=SC2046
+    case "$("$NATIVE" "$1" $(probe_args "$1") 2>&1 | head -2)" in
+        *"not built into this iSH-AOK"*|\
+        *"unavailable in this build"*|\
+        *"not enabled in this build"*) return 0 ;;
+    esac
+    return 1
+}
 
 # Inlined rather than read out of the file header with sed: `sed` is itself an
 # applet this script links, so --help would break after installation. Same
@@ -81,13 +200,20 @@ usage() {
     echo "Link SmallCLUE's applets into a bin directory so they run natively."
     echo
     echo "Usage: sh /AOK/tools/native-links.sh [options] [directory]"
-    echo "       (defaults to /usr/local/native-bin, deliberately not on PATH)"
+    echo "       (defaults to /usr/local/native-bin, put first on PATH unless --no-path)"
     echo
     echo "  --list     show what would happen, change nothing"
     echo "  --remove   remove links pointing at /AOK/native/smallclue"
     echo "  --all      include applets that do not work in this build"
     echo "  --force    replace files that are not our own symlinks"
+    echo "  --no-shell leave the UID 1000 login shell alone"
+    echo "  --shell S  which native shell to switch to: bash, zsh, or a path"
+    echo "  --no-path  do not put the link directory on PATH"
     echo "  --help"
+    echo
+    echo "The UID 1000 user's login shell is switched unless --no-shell is"
+    echo "given; --remove restores whatever it was before. Without --shell the"
+    echo "choice is $NATIVE_BASH when present, otherwise $NATIVE_ZSH."
     echo
     echo "Applets with missing dependencies or no working implementation are"
     echo "skipped by default: linking one would shadow a working command with"
@@ -101,6 +227,11 @@ while [ $# -gt 0 ]; do
         --remove) MODE=remove ;;
         --all) INCLUDE_ALL=1 ;;
         --force) FORCE=1 ;;
+        --no-shell) DO_SHELL=0 ;;
+        --shell) [ $# -ge 2 ] || { echo "$0: --shell needs a value" >&2; exit 1; }
+                 SHELL_WANT=$2; shift ;;
+        --shell=*) SHELL_WANT=${1#--shell=} ;;
+        --no-path) DO_PATH=0 ;;
         -h|--help) usage 0 ;;
         -*) echo "$0: unknown option $1" >&2; usage 1 ;;
         *) TARGET_DIR="$1" ;;
@@ -113,10 +244,183 @@ if [ ! -x "$NATIVE" ]; then
     exit 1
 fi
 
+# ---------------------------------------------------------------- login shell
+#
+# /etc/passwd is read and rewritten with shell builtins, for the same reason
+# the applet list is parsed that way: `sed` and `awk` are applets this script
+# links, so after an install into a directory on PATH they are no longer the
+# implementations this script was written against. A script that installs
+# commands must not then depend on them.
+#
+# The rewrite is not atomic -- there is no builtin rename -- so the original is
+# written to /etc/passwd.aok-bak FIRST. Recovering a mangled passwd matters
+# more here than elsewhere: get it wrong and nobody can log in, which is
+# exactly how an earlier round of this work locked a test account out.
+
+uid1000_field() {
+    # $1 = field number. Prints the field for the first UID 1000 line.
+    while IFS=: read -r u p uid gid gecos home sh; do
+        [ "${uid:-}" = 1000 ] || continue
+        case "$1" in
+            1) printf '%s' "$u" ;;
+            7) printf '%s' "${sh:-}" ;;
+        esac
+        return 0
+    done < /etc/passwd
+    return 1
+}
+
+# Rewrite the UID 1000 line's shell field to $1. Every other line is passed
+# through byte for byte.
+set_uid1000_shell() {
+    want=$1
+    new=
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            *:*:1000:*)
+                # Re-split this one line only; the rest are untouched.
+                oldifs=$IFS; IFS=:
+                # shellcheck disable=SC2086
+                set -f; set -- $line; set +f
+                IFS=$oldifs
+                if [ "$#" -ge 7 ] && [ "$3" = 1000 ]; then
+                    line="$1:$2:$3:$4:$5:$6:$want"
+                fi
+                ;;
+        esac
+        new="$new$line
+"
+    done < /etc/passwd
+
+    [ -n "$new" ] || { echo "$0: refusing to write an empty /etc/passwd" >&2; return 1; }
+    printf '%s' "$new" > /etc/passwd.aok-new || return 1
+    # Same number of lines in and out, or something went wrong and we stop.
+    n_old=0; while IFS= read -r _l; do n_old=$((n_old + 1)); done < /etc/passwd
+    n_new=0; while IFS= read -r _l; do n_new=$((n_new + 1)); done < /etc/passwd.aok-new
+    if [ "$n_old" != "$n_new" ]; then
+        echo "$0: /etc/passwd rewrite changed the line count ($n_old -> $n_new); not applying" >&2
+        rm -f /etc/passwd.aok-new
+        return 1
+    fi
+    cp /etc/passwd /etc/passwd.aok-bak 2>/dev/null || :
+    printf '%s' "$new" > /etc/passwd || return 1
+    rm -f /etc/passwd.aok-new
+    return 0
+}
+
+# PUTTING THE LINKS FIRST REVERSES THIS SCRIPT'S ORIGINAL DEFAULT, and the
+# reason for that default is worth keeping in view rather than deleting: these
+# applets are SMALLER implementations, not drop-in replacements, and the
+# incompatibilities are per-flag. PSCAL's harness once died on `grep -q`, which
+# SmallCLUE's grep did not support -- a failure that no audit of the sources
+# finds, because grep is present and works, just not with that flag.
+#
+# What makes it the right default now is the other half: the EXCLUDED list is
+# derived from tools/native-applet-audit.py rather than guessed, so an applet
+# that cannot work is not linked in the first place. If something does turn out
+# to be shadowed badly, --no-path leaves PATH alone and --remove takes it back
+# out; the links themselves stay useful by full path either way.
+apply_path() {
+    if [ "$MODE" = remove ]; then
+        if [ -f "$PATH_FILE" ]; then
+            rm -f "$PATH_FILE"
+            echo "  removed $PATH_FILE (PATH reverts at next login)"
+        fi
+        return 0
+    fi
+    if [ "$MODE" = list ]; then
+        [ -f "$PATH_FILE" ] && echo "  $PATH_FILE already present" \
+                            || echo "  would put $TARGET_DIR first on PATH via $PATH_FILE"
+        return 0
+    fi
+    [ -d /etc/profile.d ] || { echo "  no /etc/profile.d; leaving PATH alone"; return 0; }
+    # Guarded so re-logging in, or sourcing profile twice, cannot stack the
+    # directory onto PATH over and over.
+    cat > "$PATH_FILE" <<PATHEOF
+# Added by native-links.sh. Puts iSH-AOK's native applet links ahead of the
+# distro's commands, so they run as host code instead of being translated.
+# Remove with: sh /AOK/tools/native-links.sh --remove
+case ":\$PATH:" in
+    *":$TARGET_DIR:"*) ;;
+    *) PATH="$TARGET_DIR:\$PATH" ; export PATH ;;
+esac
+PATHEOF
+    echo "  put $TARGET_DIR first on PATH via $PATH_FILE (takes effect at next login)"
+}
+
+# Resolve SHELL_WANT to a path. A bare name picks the matching native shell; a
+# path is taken as given, so an install can point at something this script has
+# never heard of.
+resolve_native_shell() {
+    case "$SHELL_WANT" in
+        bash) NATIVE_SHELL=$NATIVE_BASH ;;
+        zsh)  NATIVE_SHELL=$NATIVE_ZSH ;;
+        /*)   NATIVE_SHELL=$SHELL_WANT ;;
+        "")   if [ -x "$NATIVE_BASH" ]; then NATIVE_SHELL=$NATIVE_BASH
+              else NATIVE_SHELL=$NATIVE_ZSH; fi ;;
+        *)    echo "$0: --shell wants bash, zsh or an absolute path" >&2; exit 1 ;;
+    esac
+}
+
+apply_shell() {
+    resolve_native_shell
+    user=$(uid1000_field 1) || { echo "  no UID 1000 user; leaving shells alone"; return 0; }
+    cur=$(uid1000_field 7)
+
+    if [ "$MODE" = remove ]; then
+        if [ ! -f "$SHELL_STATE" ]; then
+            echo "  no saved shell for $user; leaving $cur alone"
+            return 0
+        fi
+        prev=
+        while IFS= read -r l; do prev=$l; done < "$SHELL_STATE"
+        [ -n "$prev" ] || { echo "  saved shell for $user is empty; leaving $cur alone"; return 0; }
+        if [ "$cur" = "$prev" ]; then
+            echo "  $user already uses $prev"
+        elif set_uid1000_shell "$prev"; then
+            echo "  restored $user's shell: $cur -> $prev"
+        fi
+        rm -f "$SHELL_STATE"
+        return 0
+    fi
+
+    if [ "$cur" = "$NATIVE_SHELL" ]; then
+        echo "  $user already uses $NATIVE_SHELL"
+        return 0
+    fi
+    # Never point a login shell at something that will not run. This is the one
+    # failure here that locks the user out rather than merely annoying them.
+    if [ ! -x "$NATIVE_SHELL" ]; then
+        echo "  $NATIVE_SHELL not present; leaving $user's shell as $cur" >&2
+        return 0
+    fi
+    if [ "$MODE" = list ]; then
+        echo "  would set $user's shell: $cur -> $NATIVE_SHELL"
+        return 0
+    fi
+    if set_uid1000_shell "$NATIVE_SHELL"; then
+        printf '%s\n' "$cur" > "$SHELL_STATE"
+        echo "  set $user's shell: $cur -> $NATIVE_SHELL (--remove restores it)"
+        # Some tools refuse a shell that is not listed here (chsh, and a few
+        # ftp/mail daemons). Appending is harmless when it is already present.
+        if [ -f /etc/shells ]; then
+            found=0
+            while IFS= read -r l; do [ "$l" = "$NATIVE_SHELL" ] && found=1; done < /etc/shells
+            [ "$found" = 0 ] && printf '%s\n' "$NATIVE_SHELL" >> /etc/shells
+        fi
+    fi
+}
+
 is_excluded() {
     [ "$INCLUDE_ALL" -eq 1 ] && return 1
     for e in $EXCLUDED; do
         [ "$1" = "$e" ] && return 0
+    done
+    for e in $PROBED; do
+        if [ "$1" = "$e" ]; then
+            probe_missing "$1" && return 0
+            return 1
+        fi
     done
     return 1
 }
@@ -134,6 +438,8 @@ if [ "$MODE" = remove ]; then
         removed=$((removed + 1))
     done
     echo "removed $removed link(s) from $TARGET_DIR"
+    [ "$DO_PATH" -eq 1 ] && apply_path
+    [ "$DO_SHELL" -eq 1 ] && apply_shell
     exit 0
 fi
 
@@ -163,9 +469,31 @@ fi
 [ "$MODE" = list ] || mkdir -p "$TARGET_DIR"
 
 linked=0; skipped=0; excluded=0; blocked=0
+pruned=0
 for applet in $APPLETS; do
     if is_excluded "$applet"; then
         excluded=$((excluded + 1))
+        # PRUNE a link this script made before the applet was excluded. Without
+        # this, exclusions only ever applied to installs that had never run the
+        # script: an older version linked dmesg, dmesg was later found not to
+        # work here and added to EXCLUDED, and every subsequent run skipped it
+        # and left the broken link in place -- shadowing the distro's dmesg,
+        # which works. Reported on an install whose dmesg link was made on
+        # 2026-08-16.
+        #
+        # Same ownership test --remove uses: only ever unlink a symlink that
+        # resolves to the native binary, so a real file of the same name, or
+        # somebody else's link, is never touched.
+        stale="$TARGET_DIR/$applet"
+        if [ -L "$stale" ] && [ "$stale" -ef "$NATIVE" ]; then
+            if [ "$MODE" = list ]; then
+                echo "  would unlink $stale (now excluded)"
+            else
+                rm -f "$stale"
+                echo "  unlinked $stale (now excluded)"
+            fi
+            pruned=$((pruned + 1))
+        fi
         continue
     fi
     dest="$TARGET_DIR/$applet"
@@ -191,9 +519,15 @@ for applet in $APPLETS; do
 done
 
 if [ "$MODE" = list ]; then
-    echo "would link $linked, leave $blocked in place, skip $excluded excluded, $skipped already linked"
+    echo "would link $linked, leave $blocked in place, skip $excluded excluded, $skipped already linked, unlink $pruned now-excluded"
 else
-    echo "linked $linked into $TARGET_DIR ($skipped already, $blocked left in place, $excluded excluded)"
+    echo "linked $linked into $TARGET_DIR ($skipped already, $blocked left in place, $excluded excluded, $pruned stale removed)"
     [ "$blocked" -gt 0 ] && echo "  $blocked existing command(s) left alone; --force to replace, --list to see them"
 fi
+
+# PATH and the login shell last, so a failure in either cannot leave the links
+# half-done -- and so their messages are the ones still on screen, since they
+# are the changes that affect the next login rather than the next command.
+[ "$DO_PATH" -eq 1 ] && apply_path
+[ "$DO_SHELL" -eq 1 ] && apply_shell
 exit 0

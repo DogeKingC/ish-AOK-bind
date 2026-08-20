@@ -48,6 +48,21 @@ Long-running programs read `openssl.cnf` when they start, so restart anything
 already running. For ssh that means restarting `sshd` if you want existing
 listeners to accelerate new connections.
 
+**This applies to your distro's ssh, not to the native one.** iSH-AOK's native
+`ssh`, `scp`, `sftp` and `ssh-keygen` -- reached as `/AOK/native/smallclue ssh`,
+or as plain `ssh` once `/AOK/tools/native-links.sh` has run -- are host code
+compiled into the app, and they are built **without OpenSSL**:
+
+```sh
+$ /AOK/native/smallclue ssh -V
+OpenSSH_10.2p1, without OpenSSL
+```
+
+They use their own bundled crypto, so an OpenSSL provider installed in the guest
+cannot reach them and nothing here accelerates them. Everything below describes
+guest programs that link the guest's OpenSSL. See
+[native-programs.md](native-programs.md) for what runs natively and how to tell.
+
 ## Verify
 
 ```sh
@@ -121,9 +136,11 @@ using OpenSSL's own implementation and works normally.
 
 ## Which guests
 
-Only **arm64** and **riscv64**. On i386 and amd64 guests the syscall raises
-SIGSYS by design and the installer refuses to run: those guests already execute
-these ciphers at reasonable speed, so there is nothing to win.
+Only **arm64** and **riscv64** — as a matter of policy, not capability. The
+accelerator syscall is wired for every guest ABI, so a provider probing for it
+on i386 or amd64 now gets a clean refusal rather than `SIGSYS`; the installer
+still declines to run there, because those guests already execute these ciphers
+at reasonable speed and there is nothing to win.
 
 ## It is safe to leave installed
 
