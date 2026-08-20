@@ -196,6 +196,13 @@ need_in kernel/calls.c "dump_fault_pt_state(cpu->segfault_addr)" \
 # than one hypothesis per device round -- six were killed serially that way.
 need_in kernel/calls.c dump_arm64_fault_panel \
     "the arm64 re-fault loop prints the full page/config panel per retry"
+# The store trace, reachable from a phone. Its lo16/val filters key on things
+# that do not survive a re-run under ASLR, so "all" (record every store, dump
+# the last N on a fault) is the mode that answers "did THIS store happen".
+need_in emu/tlb.c arm64_watch_configure \
+    "the store watchpoint is settable at runtime, not only from the environment"
+need_in fs/proc/ish.c arm64_watch \
+    "and is exposed at /proc/ish/arm64_watch"
 
 # --- permissive SELinux stub ----------------------------------------------
 need_file fs/selinuxfs.c

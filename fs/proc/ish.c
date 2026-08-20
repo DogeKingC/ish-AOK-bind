@@ -2,6 +2,7 @@
 #include "fs/proc/ish.h"
 #include "fs/proc/net.h"
 #include "jit/jit.h"
+#include "emu/tlb.h"
 #include "kernel/calls.h"
 #include "kernel/errno.h"
 #include "kernel/fs.h"
@@ -410,6 +411,41 @@ static int proc_ish_update_arm64_faultdump(struct proc_entry *UNUSED(entry), str
     return 0;
 }
 
+// /proc/ish/arm64_watch -- the store trace. See arm64_watch_configure.
+static int proc_ish_show_arm64_watch(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    char spec[64];
+    arm64_watch_show(spec, sizeof(spec));
+    proc_printf(buf, "%s\n", spec);
+    return 0;
+}
+
+static int proc_ish_update_arm64_watch(struct proc_entry *UNUSED(entry), struct proc_data *data) {
+    size_t start = 0, end = data->size;
+    while (start < end && (data->data[start] == ' ' || data->data[start] == '\t' ||
+            data->data[start] == '\r' || data->data[start] == '\n'))
+        start++;
+    while (end > start && (data->data[end - 1] == ' ' || data->data[end - 1] == '\t' ||
+            data->data[end - 1] == '\r' || data->data[end - 1] == '\n'))
+        end--;
+    size_t len = end - start;
+    if (len >= 64)
+        return _EINVAL;
+    char spec[64];
+    memcpy(spec, &data->data[start], len);
+    spec[len] = '\0';
+    if (strcmp(spec, "off") == 0 || spec[0] == '\0') {
+        arm64_watch_configure(NULL);
+        return 0;
+    }
+    // Reject anything unrecognised rather than silently configuring nothing:
+    // this gets set once before a reproduction that may be expensive to stage.
+    if (strncmp(spec, "all", 3) != 0 && strncmp(spec, "lo16=", 5) != 0 &&
+            strncmp(spec, "val=", 4) != 0)
+        return _EINVAL;
+    arm64_watch_configure(spec);
+    return 0;
+}
+
 static void proc_ish_defaults_getname(struct proc_entry *entry, char *buf) {
     strcpy(buf, entry->name);
 }
@@ -717,6 +753,7 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"amd64_jit", S_IFREG | 0644, .show = proc_ish_show_amd64_jit, .update = proc_ish_update_amd64_jit},
     {"amd_jit", S_IFREG | 0644, .show = proc_ish_show_amd64_jit, .update = proc_ish_update_amd64_jit},
     {"amd64_jit_fuse", S_IFREG | 0644, .show = proc_ish_show_amd64_jit_fuse, .update = proc_ish_update_amd64_jit_fuse},
+    {"arm64_watch", S_IFREG | 0644, .show = proc_ish_show_arm64_watch, .update = proc_ish_update_arm64_watch},
     {"arm64_faultdump", S_IFREG | 0644, .show = proc_ish_show_arm64_faultdump, .update = proc_ish_update_arm64_faultdump},
     {"arm64_jit_fuse", S_IFREG | 0644, .show = proc_ish_show_arm64_jit_fuse, .update = proc_ish_update_arm64_jit_fuse},
     {"i386_jit_fuse", S_IFREG | 0644, .show = proc_ish_show_i386_jit_fuse, .update = proc_ish_update_i386_jit_fuse},

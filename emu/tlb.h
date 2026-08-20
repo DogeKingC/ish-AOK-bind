@@ -85,6 +85,9 @@ void *tlb_write_ptr_slow(struct tlb *tlb, guest_addr_t addr);
 // revalidate funnel; arm64_watch_enabled() turns it on in mem_init.
 bool arm64_watch_enabled(void);
 void arm64_watch_dump(void);
+// /proc/ish/arm64_watch: "off", "all[:N]", "lo16=XXXX", "val=XXXX".
+void arm64_watch_configure(const char *spec);
+void arm64_watch_show(char *out, size_t size);
 uint64_t arm64_trace_ip_target(void);
 
 // arm64-guest host-atomic CAS pair helper (emu/tlb.c), shared by the JIT

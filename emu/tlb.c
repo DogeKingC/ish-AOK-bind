@@ -734,6 +734,18 @@ static bool arm64_watch_lo16_on;
 static uint64_t arm64_watch_val;
 static bool arm64_watch_val_on;
 static int arm64_watch_state; // 0 = unchecked, 1 = off, 2 = on
+// "record every store" mode. The lo16 and val filters above both key on
+// something that does not survive a re-run -- an address low half, or a value
+// -- and the question this was reached for ("did THIS instruction store, and to
+// where") has no stable key at all under ASLR. So the usable filter is no
+// filter: keep the last N stores per thread in the ring and let the fault dump
+// print the history leading up to the crash. Slow by construction (every store
+// takes the write slow path) and meant to be switched on for one reproduction.
+static bool arm64_watch_all;
+// How many of the most recent records to print per dump. The ring holds 2^20;
+// printing them all through printk on a phone is not a diagnostic, it is a
+// hang, so the dump is bounded and the bound is settable with the mode.
+static uint32_t arm64_watch_dump_limit = 64;
 
 bool arm64_watch_enabled(void) {
     if (arm64_watch_state == 0) {
@@ -747,7 +759,7 @@ bool arm64_watch_enabled(void) {
             arm64_watch_val = strtoull(vspec, NULL, 16);
             arm64_watch_val_on = true;
         }
-        if (arm64_watch_lo16_on || arm64_watch_val_on) {
+        if (arm64_watch_lo16_on || arm64_watch_val_on || arm64_watch_all) {
             arm64_watch_ring = calloc(ARM64_WATCH_RING, sizeof(*arm64_watch_ring));
             arm64_watch_state = arm64_watch_ring != NULL ? 2 : 1;
         } else {
@@ -789,6 +801,11 @@ static __no_instrument void arm64_watch_record(struct tlb *tlb, guest_addr_t add
         tlb->prev_write_ip = tlb->watch_ip;
         tlb->prev_write_changes = tlb->mem_changes;
     }
+    if (arm64_watch_all) {
+        uint64_t oldval = 0;
+        memcpy(&oldval, ptr, sizeof(oldval));
+        arm64_watch_push(tlb->watch_ip, addr, oldval);
+    }
     if (arm64_watch_lo16_on) {
         // window: any store starting up to 15 bytes before the watched
         // 8-byte slot through its end can touch it (largest guest store
@@ -815,12 +832,63 @@ static __no_instrument void arm64_watch_scan_value(guest_addr_t addr, const void
     }
 }
 
+// /proc/ish/arm64_watch. Accepts:
+//   off                  disable
+//   all[:N]              record EVERY store; dump the last N (default 64)
+//   lo16=XXXX            the existing address-low-half filter
+//   val=XXXXXXXX         the existing stored-value filter
+// Configuring here rather than only from ISH_ARM64_WATCH_LO16 is the whole
+// point: getenv on iOS reads the APP's environment, so the watchpoint was a
+// development-machine feature and unusable on the one machine where the faults
+// being chased actually happen -- exactly as /proc/ish/arm64_faultdump was.
+//
+// Set it BEFORE launching the process to be measured: arm64_watch_enabled()
+// decides requires_write_revalidate at mem_init, so a process already running
+// will not start funnelling its stores through here.
+void arm64_watch_configure(const char *spec) {
+    arm64_watch_lo16_on = false;
+    arm64_watch_val_on = false;
+    arm64_watch_all = false;
+    arm64_watch_dump_limit = 64;
+    if (spec != NULL && strncmp(spec, "all", 3) == 0) {
+        arm64_watch_all = true;
+        if (spec[3] == ':')
+            arm64_watch_dump_limit = (uint32_t) strtoul(spec + 4, NULL, 10);
+        if (arm64_watch_dump_limit == 0 || arm64_watch_dump_limit > 4096)
+            arm64_watch_dump_limit = 64;
+    } else if (spec != NULL && strncmp(spec, "lo16=", 5) == 0) {
+        arm64_watch_lo16 = (uint32_t) strtoul(spec + 5, NULL, 16) & 0xffff;
+        arm64_watch_lo16_on = true;
+    } else if (spec != NULL && strncmp(spec, "val=", 4) == 0) {
+        arm64_watch_val = strtoull(spec + 4, NULL, 16);
+        arm64_watch_val_on = true;
+    }
+    if (arm64_watch_lo16_on || arm64_watch_val_on || arm64_watch_all) {
+        if (arm64_watch_ring == NULL)
+            arm64_watch_ring = calloc(ARM64_WATCH_RING, sizeof(*arm64_watch_ring));
+        arm64_watch_state = arm64_watch_ring != NULL ? 2 : 1;
+    } else {
+        arm64_watch_state = 1;
+    }
+}
+
+void arm64_watch_show(char *out, size_t size) {
+    if (arm64_watch_state != 2)
+        snprintf(out, size, "off");
+    else if (arm64_watch_all)
+        snprintf(out, size, "all:%u", arm64_watch_dump_limit);
+    else if (arm64_watch_lo16_on)
+        snprintf(out, size, "lo16=%04x", arm64_watch_lo16);
+    else
+        snprintf(out, size, "val=%llx", (unsigned long long) arm64_watch_val);
+}
+
 void arm64_watch_dump(void) {
     if (arm64_watch_state != 2)
         return;
     uint32_t end = atomic_load_explicit(&arm64_watch_idx, memory_order_relaxed);
     uint32_t count = end < ARM64_WATCH_RING ? end : ARM64_WATCH_RING;
-    uint32_t shown = count < 65536 ? count : 65536;
+    uint32_t shown = count < arm64_watch_dump_limit ? count : arm64_watch_dump_limit;
     printk("arm64 watch ring: %u total records, dumping last %u\n", end, shown);
     for (uint32_t n = shown; n > 0; n--) {
         struct arm64_watch_rec *rec = &arm64_watch_ring[(end - n) & (ARM64_WATCH_RING - 1)];
