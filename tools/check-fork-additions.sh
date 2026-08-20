@@ -203,6 +203,12 @@ need_in emu/tlb.c arm64_watch_configure \
     "the store watchpoint is settable at runtime, not only from the environment"
 need_in fs/proc/ish.c arm64_watch \
     "and is exposed at /proc/ish/arm64_watch"
+# The ring is shared by every guest thread in every process, so a global window
+# of N is not N stores of the crashing task's history -- a second process
+# storing in the background empties it. The whole point of the trace is reading
+# meaning into an ABSENT record, so the dump is scoped to the faulting task.
+need_in emu/tlb.c arm64_watch_dump_global \
+    "the store trace's fault dump is scoped to the faulting task by default"
 
 # --- permissive SELinux stub ----------------------------------------------
 need_file fs/selinuxfs.c

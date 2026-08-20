@@ -722,8 +722,9 @@ configurable only from `ISH_ARM64_WATCH_LO16`, which on iOS reads the *app's*
 environment and so was unreachable from a phone. Both are fixed:
 
 ```sh
-echo all:200 > /proc/ish/arm64_watch    # record every store, dump last 200 on a fault
-echo off     > /proc/ish/arm64_watch
+echo all:1000 > /proc/ish/arm64_watch   # record every store, dump the faulting
+                                        # task's last 1000 on a fault
+echo off      > /proc/ish/arm64_watch
 ```
 
 "Record everything" is the only filter that survives a re-run. Set it BEFORE
@@ -732,10 +733,10 @@ launching the process -- `arm64_watch_enabled()` decides
 start funnelling its stores through it. Then:
 
 ```sh
-echo all:200 > /proc/ish/arm64_watch
+echo all:1000 > /proc/ish/arm64_watch
 ( chroot /root/android-sys /system/bin/servicemanager & ) ; sleep 4
 chroot /root/android-sys /system/bin/idmap2d
-dmesg | grep -A 200 "arm64 watch ring"
+dmesg | grep -A 1010 "arm64 watch ring"
 ```
 
 The ring entries around the crash say whether a store to `object+8` ever
@@ -743,6 +744,44 @@ happened and what address it used. If it is absent, the store never executed
 and the question becomes control flow. If it is present with a wrong address,
 `x19` did not survive the `bl _Znwm@plt` -- which the register probe says it
 should, so that would be a real find.
+
+**Read the dump's own header and footer before reading either of those into the
+entries.** The window is what makes the absence mean anything, and three things
+that have nothing to do with the bug can empty it:
+
+- *The window is scoped to the faulting task, and says so.* The ring is ONE ring
+  for every guest thread in every process -- one host process emulates all of
+  them -- and this reproduction requires `servicemanager` running alongside.
+  A window of the last N records globally is not N records of the crashing
+  task's history; a background process storing away shrinks it to nothing in
+  particular. The dump filters on the faulting task's tid (the number on the
+  `ERROR:` line) and prints how far back it had to scan to fill the window.
+  `all:1000,global` restores the unscoped window, which is only worth having if
+  the question is about interleaving BETWEEN tasks.
+- *The footer says whether the window ran out of history or ran out of limit.*
+  "window reaches the oldest record held" licenses "this store never executed".
+  "window ended at the dump limit" does not -- older stores by the same task are
+  still in the ring, and the answer is to raise N (max 4096) and re-run. This is
+  the same trap as the seven-arm matrix that ran without `servicemanager`: a
+  measurement that cannot show it covered the target has not measured anything.
+- *Three store forms execute without passing through this funnel*, and so leave
+  no record even in a window that reaches back far enough: a store that straddles
+  a page boundary (it goes through `arm64_crosspage_store`), an AdvSIMD `ld1`/
+  `st1` transfer, and the C-side atomics. `str x0, [x19, #8]` at an 8-byte
+  aligned offset is none of them, so for THIS store an absence is real -- but
+  check the form before concluding it for the next one.
+
+Each record prints `ip=` as a guest pc. To turn it into a `libutils.so+0x...`
+the disassembly can be read against, take the library base from the fault line,
+which prints both `pc` and its `pc-backing -> /system/lib64/libutils.so+0x...`:
+subtract that printed offset from `pc` to get the base, then subtract the base
+from each record's `ip`. The store being looked for is `libutils.so+0x1d9ec`.
+
+And expect it to be slow. Every store in every process started after the trace
+is armed takes the write slow path, so the whole system runs several times
+slower than usual: give `servicemanager` more than the usual four seconds to
+settle, and do not read `idmap2d` taking a long while to reach the crash as a
+change in behaviour.
 
 **`idmap2d` is NOT this bug**, which was predicted and then checked rather than
 assumed: it still faults at `libutils.so+0x1aa80` with `lr` at `+0x11030`, a

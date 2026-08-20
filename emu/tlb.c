@@ -725,10 +725,20 @@ struct arm64_watch_rec {
     uint64_t addr;
     uint64_t oldval;
     uint32_t thread;
+    // The guest tid, so a record can be matched against the task named on the
+    // fault line ("ERROR: 2981(binder:2981_2) ..." prints the tid) and so the
+    // dump can be scoped to the faulting task. pthread_self above identifies a
+    // host thread and nothing a person reading dmesg can cross-check.
+    uint32_t tid;
 };
 #define ARM64_WATCH_RING (1 << 20)
 static struct arm64_watch_rec *arm64_watch_ring;
-static _Atomic uint32_t arm64_watch_idx;
+// 64-bit, because in "all" mode this counts EVERY store in every process that
+// started after the trace was armed. A 32-bit counter wraps within a long
+// reproduction, and a wrapped counter makes the dump's "how many records are
+// really here" arithmetic silently wrong -- which is the arithmetic that
+// decides whether an absent record means the store never happened.
+static _Atomic uint64_t arm64_watch_idx;
 static uint32_t arm64_watch_lo16;
 static bool arm64_watch_lo16_on;
 static uint64_t arm64_watch_val;
@@ -738,14 +748,22 @@ static int arm64_watch_state; // 0 = unchecked, 1 = off, 2 = on
 // something that does not survive a re-run -- an address low half, or a value
 // -- and the question this was reached for ("did THIS instruction store, and to
 // where") has no stable key at all under ASLR. So the usable filter is no
-// filter: keep the last N stores per thread in the ring and let the fault dump
-// print the history leading up to the crash. Slow by construction (every store
-// takes the write slow path) and meant to be switched on for one reproduction.
+// filter: record every store into the ring and let the fault dump print the
+// history leading up to the crash. Slow by construction (every store takes the
+// write slow path) and meant to be switched on for one reproduction.
 static bool arm64_watch_all;
 // How many of the most recent records to print per dump. The ring holds 2^20;
 // printing them all through printk on a phone is not a diagnostic, it is a
 // hang, so the dump is bounded and the bound is settable with the mode.
 static uint32_t arm64_watch_dump_limit = 64;
+// Dump the last N records of the FAULTING task only (default), or the last N
+// records globally (",global"). The ring is shared by every guest thread in
+// every process -- one host process emulates all of them -- so a global window
+// of N is not N stores of history for the task that crashed: a second process
+// storing in the background pushes the interesting records out. Answering "did
+// THIS instruction store" off a window that another process can shrink is how
+// an absent record gets read as "the store never executed".
+static bool arm64_watch_dump_global;
 
 bool arm64_watch_enabled(void) {
     if (arm64_watch_state == 0) {
@@ -770,13 +788,30 @@ bool arm64_watch_enabled(void) {
 }
 
 static __no_instrument void arm64_watch_push(uint64_t ip, uint64_t addr, uint64_t val) {
-    uint32_t i = atomic_fetch_add_explicit(&arm64_watch_idx, 1, memory_order_relaxed)
+    uint64_t i = atomic_fetch_add_explicit(&arm64_watch_idx, 1, memory_order_relaxed)
         & (ARM64_WATCH_RING - 1);
     struct arm64_watch_rec *rec = &arm64_watch_ring[i];
     rec->ip = ip;
     rec->addr = addr;
     rec->oldval = val;
     rec->thread = (uint32_t) (uintptr_t) pthread_self();
+    rec->tid = current != NULL ? (uint32_t) current->pid : 0;
+}
+
+// The 8 bytes about to be overwritten, read without leaving the guest page.
+// Guest pages are backed one host page at a time and the next one can be
+// absent, so an unguarded 8-byte read of a store landing in the last bytes of
+// a mapping's final page faults the EMULATOR -- taking the app down in the
+// middle of the one reproduction the trace was armed for. The val filter has
+// carried this guard since it was written (PGOFFSET <= PAGE_SIZE - 16); the
+// "all" and lo16 paths did the same read without it.
+static __no_instrument uint64_t arm64_watch_oldval(guest_addr_t addr, const void *ptr) {
+    size_t avail = PAGE_SIZE - PGOFFSET(addr);
+    if (avail > sizeof(uint64_t))
+        avail = sizeof(uint64_t);
+    uint64_t oldval = 0;
+    memcpy(&oldval, ptr, avail);
+    return oldval;
 }
 
 static __no_instrument void arm64_watch_record(struct tlb *tlb, guest_addr_t addr, void *ptr) {
@@ -801,21 +836,15 @@ static __no_instrument void arm64_watch_record(struct tlb *tlb, guest_addr_t add
         tlb->prev_write_ip = tlb->watch_ip;
         tlb->prev_write_changes = tlb->mem_changes;
     }
-    if (arm64_watch_all) {
-        uint64_t oldval = 0;
-        memcpy(&oldval, ptr, sizeof(oldval));
-        arm64_watch_push(tlb->watch_ip, addr, oldval);
-    }
+    if (arm64_watch_all)
+        arm64_watch_push(tlb->watch_ip, addr, arm64_watch_oldval(addr, ptr));
     if (arm64_watch_lo16_on) {
         // window: any store starting up to 15 bytes before the watched
         // 8-byte slot through its end can touch it (largest guest store
         // is 16 bytes)
         uint32_t lo = addr & 0xffff;
-        if (lo + 16 > arm64_watch_lo16 && lo < arm64_watch_lo16 + 8) {
-            uint64_t oldval;
-            memcpy(&oldval, ptr, sizeof(oldval));
-            arm64_watch_push(tlb->watch_ip, addr, oldval);
-        }
+        if (lo + 16 > arm64_watch_lo16 && lo < arm64_watch_lo16 + 8)
+            arm64_watch_push(tlb->watch_ip, addr, arm64_watch_oldval(addr, ptr));
     }
 }
 
@@ -834,7 +863,11 @@ static __no_instrument void arm64_watch_scan_value(guest_addr_t addr, const void
 
 // /proc/ish/arm64_watch. Accepts:
 //   off                  disable
-//   all[:N]              record EVERY store; dump the last N (default 64)
+//   all[:N]              record EVERY store; dump the last N (default 64) of
+//                        the FAULTING task
+//   all[:N],global       ... of every task, sharing one window (the old
+//                        behaviour; useful only when the question is about
+//                        interleaving between tasks)
 //   lo16=XXXX            the existing address-low-half filter
 //   val=XXXXXXXX         the existing stored-value filter
 // Configuring here rather than only from ISH_ARM64_WATCH_LO16 is the whole
@@ -850,6 +883,7 @@ void arm64_watch_configure(const char *spec) {
     arm64_watch_val_on = false;
     arm64_watch_all = false;
     arm64_watch_dump_limit = 64;
+    arm64_watch_dump_global = spec != NULL && strstr(spec, ",global") != NULL;
     if (spec != NULL && strncmp(spec, "all", 3) == 0) {
         arm64_watch_all = true;
         if (spec[3] == ':')
@@ -876,26 +910,87 @@ void arm64_watch_show(char *out, size_t size) {
     if (arm64_watch_state != 2)
         snprintf(out, size, "off");
     else if (arm64_watch_all)
-        snprintf(out, size, "all:%u", arm64_watch_dump_limit);
+        snprintf(out, size, "all:%u%s", arm64_watch_dump_limit,
+                 arm64_watch_dump_global ? ",global" : "");
     else if (arm64_watch_lo16_on)
         snprintf(out, size, "lo16=%04x", arm64_watch_lo16);
     else
         snprintf(out, size, "val=%llx", (unsigned long long) arm64_watch_val);
 }
 
+// Called from the fatal-fault path, on the faulting thread, so current->pid
+// here is the task named on the ERROR: line.
+//
+// Scoped to that task by default. The question this trace exists to answer is
+// "did instruction X store, and to what address", and the answer is read off
+// the ABSENCE of a record as much as its presence -- so the window has to be N
+// stores of THIS task's history, not N stores of whatever the machine happened
+// to be doing. It is one ring for every guest thread in every process, and the
+// reproduction it was built for needs a second process (servicemanager) running
+// alongside the one that crashes.
+//
+// The trailing line is the other half of that: a window that ended because the
+// limit was reached does not license "the store never executed", because older
+// stores by the same task are still in the ring. Only a window that ran out of
+// history does.
 void arm64_watch_dump(void) {
     if (arm64_watch_state != 2)
         return;
-    uint32_t end = atomic_load_explicit(&arm64_watch_idx, memory_order_relaxed);
-    uint32_t count = end < ARM64_WATCH_RING ? end : ARM64_WATCH_RING;
-    uint32_t shown = count < arm64_watch_dump_limit ? count : arm64_watch_dump_limit;
-    printk("arm64 watch ring: %u total records, dumping last %u\n", end, shown);
-    for (uint32_t n = shown; n > 0; n--) {
-        struct arm64_watch_rec *rec = &arm64_watch_ring[(end - n) & (ARM64_WATCH_RING - 1)];
-        printk("  watch[-%u] ip=%#llx addr=%#llx old=%#llx thread=%#x\n",
-               n, (unsigned long long) rec->ip, (unsigned long long) rec->addr,
-               (unsigned long long) rec->oldval, rec->thread);
+    uint64_t end = atomic_load_explicit(&arm64_watch_idx, memory_order_relaxed);
+    uint64_t held = end < ARM64_WATCH_RING ? end : ARM64_WATCH_RING;
+    uint32_t tid = current != NULL ? (uint32_t) current->pid : 0;
+    bool scoped = !arm64_watch_dump_global && tid != 0;
+
+    // Walk back until the limit is filled or this task's history runs out,
+    // then print forward from there. Two passes rather than one so the records
+    // come out oldest-first without buffering up to 4096 indices.
+    uint64_t scanned = 0, matched = 0;
+    while (scanned < held && matched < arm64_watch_dump_limit) {
+        struct arm64_watch_rec *rec =
+            &arm64_watch_ring[(end - scanned - 1) & (ARM64_WATCH_RING - 1)];
+        scanned++;
+        if (!scoped || rec->tid == tid)
+            matched++;
     }
+    bool ran_out = scanned == held;
+
+    if (scoped)
+        printk("arm64 watch ring: %llu records total, %llu held; showing the last "
+               "%llu of tid %u (scanned back %llu)\n",
+               (unsigned long long) end, (unsigned long long) held,
+               (unsigned long long) matched, tid, (unsigned long long) scanned);
+    else
+        printk("arm64 watch ring: %llu records total, %llu held; showing the last "
+               "%llu (all tasks)\n",
+               (unsigned long long) end, (unsigned long long) held,
+               (unsigned long long) matched);
+
+    uint64_t n = matched;
+    for (uint64_t back = scanned; back > 0; back--) {
+        struct arm64_watch_rec *rec =
+            &arm64_watch_ring[(end - back) & (ARM64_WATCH_RING - 1)];
+        if (scoped && rec->tid != tid)
+            continue;
+        printk("  watch[-%llu] ip=%#llx addr=%#llx old=%#llx tid=%u thread=%#x\n",
+               (unsigned long long) n, (unsigned long long) rec->ip,
+               (unsigned long long) rec->addr, (unsigned long long) rec->oldval,
+               rec->tid, rec->thread);
+        n--;
+    }
+
+    if (ran_out)
+        printk("arm64 watch ring: window reaches the oldest record held, so a store "
+               "missing above is missing from the whole trace\n");
+    else
+        printk("arm64 watch ring: window ended at the dump limit (%u), NOT at the "
+               "start of history -- older stores are in the ring; a store missing "
+               "above may simply be further back. Raise N in all:N.\n",
+               arm64_watch_dump_limit);
+    // Three ways a store that DID execute leaves no record, all of them
+    // outside this funnel: a store that straddles a page boundary (it goes
+    // through arm64_crosspage_store), an AdvSIMD ld1/st1 transfer, and the
+    // C-side atomics. Rule those out by the instruction's form before reading
+    // an absence as "it never ran".
 }
 
 // ISH_ARM64_TRACE_IP=<hex guest pc> + ISH_ARM64_TRACE_LDR="rn,rm": before
