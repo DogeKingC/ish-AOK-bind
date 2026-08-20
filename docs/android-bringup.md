@@ -505,6 +505,14 @@ So of the three candidates:
 - **What is left is that the store of `mRefs` did not land** -- and it is
   deterministic, byte for byte, across four reproductions.
 
+**That conclusion is WRONG, and the store trace disproved it on the device --
+see "ANSWERED: the store landed" below.** The store lands. Both observations
+above are `RefBase::~RefBase()`'s own two stores: it zeroes `mRefs`, and it
+puts RefBase's vtable back. The object is a corpse, not an unfinished one. The
+elimination was sound and the third candidate was simply not on the list:
+"constructed, then destroyed" looks identical from the corpse to "never
+finished", and only a trace with history separates them.
+
 Worth carrying forward: `x27` is `0xb0` below `x20` in every reproduction, and
 `x8` is `0xb0`. That is the virtual-base offset -- `x27` is the `PoolThread`
 and `x20` its `RefBase` subobject at `+0xb0`. Because `Thread` inherits
@@ -782,6 +790,85 @@ is armed takes the write slow path, so the whole system runs several times
 slower than usual: give `servicemanager` more than the usual four seconds to
 settle, and do not read `idmap2d` taking a long while to reach the crash as a
 change in behaviour.
+
+### ANSWERED: the store landed. The object was DESTROYED, then used.
+
+The measurement above was run on the device and it settles the question -- but
+not on either of the two branches it was written for. The store executed, with
+the right base, to the right address, and the value stayed there. What happens
+next is that `RefBase::~RefBase()` runs on that object, and `incStrong` is
+called on it 2397 stores later.
+
+Run: `all:4000`, `servicemanager` started first, `idmap2d` exits 139 as always.
+The window held 4000 records of the faulting task, which needed scanning back
+5976 records globally -- one ring is shared by every guest thread in every
+process, and this reproduction needs two processes. A 200-record global window
+would have reached about 134 stores of the faulting task, and every record
+below is further back than that.
+
+`x20 = 0x7ffe906f0408` at the fault. Three `RefBase` constructions are in the
+window (`str x8, [x0]` at `libutils.so+0x1d9cc`), and **x20 is the first of
+them**. Its constructor's stores are all there and all coherent:
+
+```
+watch[-3976] ip=libutils+0x1d9cc addr=0x7ffe906f0408   str x8,[x0]       *this = vptr
+watch[-3945] ip=libutils+0x1d9ec addr=0x7ffe906f0410   str x0,[x19,#8]   this->mRefs = impl
+```
+
+`this` is `0x7ffe906f0408` at `+0x1d9cc` and `x19` is the same value at
+`+0x1d9ec`, on the far side of the `bl _Znwm@plt`. **So x19 survived the
+cross-library call and `str x0, [x19, #8]` landed at `this+8`.** Both branches
+the measurement was written for are dead: the store is not absent, and its
+address is not wrong.
+
+The record that matters is 1548 stores later:
+
+```
+watch[-2397] ip=libutils+0x14368 addr=0x7ffe906f0410 old=0x7ffdc06ed370
+```
+
+Same address -- `this->mRefs` -- and the value it overwrote is a **live
+`weakref_impl` pointer**, so `mRefs` was still holding what the constructor put
+there. `libutils.so+0x14368` disassembles on the device to:
+
+```
+0000000000014320 <_ZN7android7RefBaseD1Ev>:
+   14348:  f9000009   str  x9, [x0]        ; x9 = 0x245d8, RefBase's vtable
+   ...
+   14368:  f900041f   str  xzr, [x0, #8]   ; <- this record. mRefs = NULL
+```
+
+That is `RefBase::~RefBase()`, and `str xzr, [x0, #8]` is its last line -- the
+`const_cast<weakref_impl*&>(mRefs) = NULL` it does "for debugging purposes".
+
+**So this is a use-after-destruction, and the emulator is not losing a store.**
+The object is constructed, used, destroyed, and then `incStrong`'d.
+
+**Both pieces of evidence the old diagnosis rested on are the destructor's
+fingerprints, which is why it read as a lost store.** `mRefs` is zero because
+the destructor zeroed it. And "a valid libutils vtable at `this+0`, so a
+constructor ran here" is `str x9, [x0]` at `+0x14348`, four instructions
+earlier in the same destructor, putting RefBase's own vtable back as the
+derived layers are torn down. The ring shows that round trip directly: the vptr
+slot takes RefBase's vtable at `+0x1d9cc`, is overwritten by the derived
+constructor at `watch[-3941]` (`old=0x7fffb8db35d8`, RefBase's vtable), and the
+fault-time memdump shows `0x7fffb8db35d8` back in it. A corpse with a
+base-class vptr and a null `mRefs` is what a destroyed `RefBase` looks like,
+not an unfinished one.
+
+**What the next round has to answer, and the instrument gap it hits.** The
+question is now why the object died while a reference to it was still live --
+`ProcessState::spawnPooledThread` holds it in an `sp<>`, and `Thread::run()`
+takes another (`mHoldSelf`). That is a refcount question, and **this trace
+cannot see refcounts**: `incStrong`/`decStrong` work through outline-atomics
+LDADD, which is one of the three store forms that never reach the write funnel
+(see above), so `mStrong`/`mWeak` never appear in the ring. Answering it needs
+either a watch on the `weakref_impl` itself -- its address is in the destructor
+record's `old=` field, which is how to get it without ASLR guesswork -- or
+recording the C-side atomics the way plain stores are recorded now.
+
+Do not carry the old framing forward. "The constructor's store was lost" is
+answered and wrong; the open question is who dropped the last reference.
 
 **`idmap2d` is NOT this bug**, which was predicted and then checked rather than
 assumed: it still faults at `libutils.so+0x1aa80` with `lr` at `+0x11030`, a
@@ -1164,20 +1251,24 @@ that tree's `dev/__properties__`.
    `lr-backing`, the library and file offset of both the faulting instruction
    and its caller -- rather than waiting on a tombstone that will not come.
 
-   For `idmap2d` the function is known (`RefBase::incStrong` with a null
-   `mRefs`) and so is the object's state: a valid vptr with `mRefs` unwritten,
-   deterministically. See that section for what it rules out. The next step is
-   the store itself. The constructor is disassembled (see the idmap2d section):
-   the missing store addresses the object through `x19`, held across
-   `bl _Znwm@plt`. Either the store was dropped or `x19` did not survive the
-   call. HLE is ruled out (three ways, above), a minimal C++
-   virtual-inheritance repro passes under the harness, and the register probe
-   passes both under the harness with HLE on and on the device against Alpine
-   musl. So the remaining candidates are narrower: the store's own translation
-   in that block, a stale mapping between the write and the later read, or
-   something in the caller that reuses x19. Take them one at a time, and check
-   each claim the way the HLE one was checked -- by confirming the mechanism
-   actually ran.
+   `idmap2d` is no longer a lost-store problem, and the whole "did the
+   constructor's store land" line of inquiry is CLOSED -- see "ANSWERED: the
+   store landed" in the idmap2d section. The store trace, run on the device,
+   shows the constructor writing `mRefs` correctly and `RefBase::~RefBase()`
+   zeroing it 1548 stores later; the fault is `incStrong` on an object that has
+   already been destroyed. The null `mRefs` and the "valid vptr" that made it
+   look like an unfinished construction are both the destructor's own stores.
+
+   So the open question is a refcount one: why the last reference to the
+   `PoolThread` goes away while `spawnPooledThread`'s `sp<>` and
+   `Thread::run()`'s `mHoldSelf` should both still hold it. The trace cannot
+   answer that as it stands -- `incStrong`/`decStrong` are outline-atomics
+   LDADD, which never reach the store funnel, so no refcount operation appears
+   in the ring. Either watch the `weakref_impl` (its address is the `old=`
+   value on the destructor's record) or record the C-side atomics the way plain
+   stores are recorded. Whichever, confirm the mechanism actually ran before
+   believing the result -- the HLE lesson, and this bug has now punished the
+   alternative twice.
 
    Apply the same treatment to `installd` rather than assuming it is the same
    bug: its fault address is `0x0`, not `0x4`, so it is at best the same
