@@ -197,6 +197,16 @@ else
     note "no system/bin/toybox, skipping the inside-the-chroot checks"
 fi
 
+# installd creates per-user directories under these and exits 1 with "Could not
+# create directories" if the parents are missing; on a device init and vold
+# build this tree. Cheap, and idempotent on a tree that already has them.
+mkdir -p mnt/asec data/misc/installd data/misc/user/0 data/system \
+         data/system_de/0 data/system_ce/0 \
+         data/user/0 data/user_de/0 data/user_ce/0 \
+         data/misc_de/0 data/misc_ce/0 data/data data/app data/media/0 \
+         data/local/tmp 2>/dev/null
+note "ensured the /data tree installd needs"
+
 for node in dev/binder dev/null dev/kmsg; do
     [ -c "$node" ] || { echo "  FAILED: $node is not a character device"; fail=1; }
 done
@@ -212,6 +222,14 @@ fi
 
 if [ "$fail" -eq 0 ]; then
     echo "ready: chroot . /system/bin/servicemanager"
+    # A chroot does not read root-profile.sh, so the environment Android's init
+    # would have provided has to come from the invoking shell. ASEC_MOUNTPOINT
+    # is the one that bites: installd calls strlen(getenv("ASEC_MOUNTPOINT"))
+    # with no null check and dies at address 0 without it, which reads as an
+    # emulator null-dereference and is not one.
+    echo "  for installd, prefix with the env init would have set:"
+    echo "    ANDROID_ROOT=/system ANDROID_DATA=/data ASEC_MOUNTPOINT=/mnt/asec \\"
+    echo "      chroot . /system/bin/installd"
 else
     echo "setup incomplete, see above" >&2
 fi

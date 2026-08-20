@@ -385,7 +385,7 @@ With the sink up, running each HAL-free daemon and reading its own words:
 | `servicemanager` | starts, registers, serves `checkService` |
 | `incidentd` | starts, registers `incident` |
 | `apexd` | **exits 0** -- runs to completion |
-| `installd` | `Could not find ANDROID_DATA` -> with `ANDROID_DATA=/data` set it reaches `installd firing up`, then `SIGSEGV` at `0x0` |
+| `installd` | needs `ANDROID_DATA`, `ASEC_MOUNTPOINT` and a `/data` tree; with those it starts, spawns binder threads, and hits the **same** `0x4` crash as `idmap2d` |
 | `idmap2d` | logs `Starting`, registers `idmap`, then `SIGSEGV` at `0x4` in a **binder thread** |
 | `hwservicemanager` | absent from the image |
 
@@ -394,8 +394,46 @@ one log line, one variable, and it gets from "exit 1, silently" to running its
 own startup. It is set by init in a real Android, which is why nothing here
 supplies it.
 
-Both remaining crashes are null dereferences. `idmap2d`'s is now identified
-exactly; `installd`'s is not.
+There are not two crashes here. `installd`'s `0x0` fault was a missing
+environment variable in guest code, and once it is set `installd` reaches
+`idmap2d`'s crash exactly -- see below.
+
+### installd's `0x0` was never an emulator bug: `strlen(getenv(NULL))`
+
+Read rather than assumed, and it took one fault block. `installd` faults on a
+**read** of address 0 with `x0=0`, `pc` in `libc.so` and
+`lr -> installd+0x5985c`. Disassembling the caller on the device:
+
+```
+59850:  bl   getenv@plt      ; getenv("ASEC_MOUNTPOINT")
+59854:  mov  x19, x0         ; x19 = result   (x19 = 0 at the fault)
+59858:  bl   strlen@plt      ; strlen(NULL)   <- the read of 0
+5985c:  cmn  x0, #0x9        ; == lr
+```
+
+The string at the `adrp`/`add` two instructions earlier is `ASEC_MOUNTPOINT`.
+So `installd` passes an unchecked `getenv` result to `strlen`, and the register
+block agrees exactly: `x19 = 0` is the saved result, `x0 = 0` is `strlen`'s
+argument, `lr` is the instruction after the call, and `pc` is `strlen`'s entry
+(a `bti c` followed by the page-crossing check an optimised `strlen` opens
+with). ASEC is long dead -- Android 4.x app-on-SD -- and init still sets the
+variable, which is why nothing in a chroot did.
+
+With `ASEC_MOUNTPOINT=/mnt/asec` there is **no fault at all**. `installd` then
+exits 1 asking for `/data/misc/user/0`, and with the `/data` tree created it
+gets all the way to spawning binder threads -- where it dies at `0x4`, with
+`pc-backing -> libutils.so+0x1aa80` and `lr-backing -> libutils.so+0x11030`,
+byte for byte `idmap2d`'s fault, in a task called `binder:<pid>_2`.
+
+**So the two "null dereferences" were one setup bug and one emulator bug, and
+the emulator bug now has two independent reproducers.** That matters more than
+removing an item from the list: `idmap2d` and `installd` share nothing but
+libbinder's thread pool, so the use-after-destruction is in that path rather
+than in anything specific to `idmap2d`.
+
+`root-profile.sh` and `chroot-setup.sh` now set the variable and build the
+`/data` tree, because this cost a crash that looked exactly like the one that
+is real.
 
 ### idmap2d: `RefBase::incStrong` on an object whose `mRefs` is null
 
@@ -1294,9 +1332,11 @@ that tree's `dev/__properties__`.
 
 ## Anticipated order of remaining work
 
-1. **The two null dereferences.** `installd` faults at `0x0` just after
-   `installd firing up`; `idmap2d` faults at `0x4` in a binder thread just
-   after registering `idmap`. Start from iSH's own `page fault ... opcode
+1. **One null dereference, with two reproducers.** `idmap2d` and `installd`
+   both fault at `0x4` in a binder thread, at the same instruction.
+   (`installd`'s separate `0x0` fault was a missing `ASEC_MOUNTPOINT` in guest
+   code and is fixed in the setup scripts -- not an emulator bug.) Start from
+   iSH's own `page fault ... opcode
    window` line in `dmesg` -- it names the guest PC and, via `pc-backing` and
    `lr-backing`, the library and file offset of both the faulting instruction
    and its caller -- rather than waiting on a tombstone that will not come.
@@ -1320,9 +1360,11 @@ that tree's `dev/__properties__`.
    believing the result -- the HLE lesson, and this bug has now punished the
    alternative twice.
 
-   Apply the same treatment to `installd` rather than assuming it is the same
-   bug: its fault address is `0x0`, not `0x4`, so it is at best the same
-   *class*.
+   `installd` was given the same treatment rather than assumed to be the same
+   bug, and the answer was worth having both ways: its `0x0` fault was
+   something else entirely (guest code, missing environment), and underneath it
+   was this exact bug. Use it as the second reproducer -- two daemons sharing
+   only libbinder's thread pool put the fault in that path.
 2. **A `tombstoned` sink**, if those two do not yield to the above. It would
    give Android's own stack traces for every native crash. Same shape as
    `kernel/logd_sink.c` but with fd passing, so a bigger job; worth it only if
