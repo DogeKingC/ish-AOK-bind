@@ -192,7 +192,40 @@ libdl = cc.find_library('dl', required: false)
 # this is a no-op there.
 libatomic = cc.find_library('atomic', required: false)
 sqlite3 = cc.find_library('sqlite3')
+# zlib, for SmallCLUE's tar and gzip. Public on macOS AND iOS -- both SDKs ship
+# zlib.h and libz.tbd -- so unlike a vendored library this costs nothing but the
+# link. required: false so a host without it still builds, with tar and gzip
+# excluded exactly as they were before.
+zlib = cc.find_library('z', required: false, has_headers: ['zlib.h'])
+if zlib.found()
+    # kernel/smallclue_glue.c defines tar/gzip/gunzip/zcat stubs when this is
+    # absent. add_project_arguments has to run before any target is declared,
+    # which is why it is here rather than beside the applet list below.
+    add_project_arguments('-DISH_HAVE_ZLIB=1', language: 'c')
+endif
+
+# curl, wget and `md <url>` need libcurl, which the iOS SDK does not have in
+# any form -- no header, no tbd. deps/smallclue-shim/curl/curl.h supplies the
+# slice of the easy API SmallCLUE uses on top of NSURLSession, which needs an
+# Objective-C compiler. add_languages must run before any target is declared.
+#
+# required: false so that a toolchain without one still builds, with curl and
+# wget refusing honestly as they do today. Apple-only for the obvious reason:
+# elsewhere there is no Foundation to implement it with.
+have_curl_shim = false
+if host_machine.system() in ['darwin', 'ios']
+    have_curl_shim = add_languages('objc', required: false, native: false)
+endif
+if not have_curl_shim and host_machine.system() in ['darwin', 'ios']
+    warning('no Objective-C compiler -- curl and wget will be stubs')
+endif
 dependencies = [librt, libm, libdl, libatomic, threads, sqlite3]
+if zlib.found()
+    dependencies += zlib
+endif
+if have_curl_shim
+    dependencies += dependency('foundation')
+endif
 
 # zsh needs tgetent/tgetstr/tgoto/tputs and, unlike bash, does not bundle a
 # termcap of its own. This USED to add -ltermcap (or -lcurses) here, and that
@@ -488,13 +521,25 @@ if get_option('kernel') == 'ish'
     #
     # Excluded feature groups, entry points stubbed in kernel/smallclue_glue.c:
     # integration.c is the WITH_EXSH path into PSCAL's VM.
-    # gzip_app and tar_app are excluded for a build-system reason rather than a
-    # code one: they are the only files needing zlib, and the Xcode app targets
-    # link the meson archives by name with no zlib anywhere in the project (no
-    # libz.tbd, no OTHER_LDFLAGS). Re-enabling either means adding zlib to
-    # those targets first -- worth doing, since tar is a real loss, but it is a
-    # change to the app project rather than to this build.
-    smallclue_excluded = ['main.c', 'integration.c', 'gzip_app.c', 'tar_app.c']
+    smallclue_excluded = ['main.c', 'integration.c']
+    # AOK's own sources compiled into libsmallclue, so that they are built with
+    # smallclue_c_args and therefore with kernel/native_libc.h force-included.
+    smallclue_extra_src = []
+
+    # gzip_app and tar_app were excluded for a real reason, and it was never the
+    # link line. zlib is a system dylib built against the HOST libc, so the gz*
+    # file API does host I/O on whatever path or descriptor it is handed --
+    # invisibly correct wherever a path exists on both sides, and quietly
+    # operating on iOS's filesystem the whole time. See
+    # deps/smallclue-shim/zlib.h, which reimplements those six calls over the
+    # redirected open/read/write and leaves the compression itself to zlib,
+    # whose deflate/inflate touch nothing but the caller's buffers.
+    if zlib.found()
+        smallclue_extra_src += files('deps/smallclue-shim/zlib_guest.c')
+    else
+        smallclue_excluded += ['gzip_app.c', 'tar_app.c']
+        warning('zlib not found -- tar and gzip will be stubs')
+    endif
 
     # checksum_app.c (md5sum/sha1sum/sha256sum) was on that list too, for the
     # same shape of reason and with a better answer: it wants OpenSSL's EVP,
@@ -683,8 +728,21 @@ if get_option('kernel') == 'ish'
         # syslog(2), so say so rather than letting the #else claim dmesg is
         # unsupported on a system whose /usr/bin/dmesg works.
         '-DSMALLCLUE_HAVE_KLOGCTL',
+        # `md` with no arguments lists the documents in this directory, and
+        # `md native-programs` resolves a bare name against it. The default is
+        # $HOME/Docs, which an AOK guest has no reason to have -- so md looked
+        # broken rather than empty. /AOK/docs is compiled into the app
+        # (fs/aok-docs.manifest) and is always there.
+        '-DSMALLCLUE_MARKDOWN_DOCS_DIR="/AOK/docs"',
         '-w',  # vendored code, not ours to police
     ]
+
+    # core.c reaches for <curl/curl.h> under this, and gets
+    # deps/smallclue-shim/curl/curl.h -- which is on the include path above,
+    # ahead of the SDK's own on the one platform that has one.
+    if have_curl_shim
+        smallclue_c_args += '-DPSCAL_HAS_LIBCURL'
+    endif
 
     # src/openssh_app.c and src/openssh_shim.c reach into the vendored tree
     # (sshkey.h, pscal_runtime_hooks.h), so libsmallclue needs its headers too
@@ -696,9 +754,23 @@ if get_option('kernel') == 'ish'
             openssh_dir, openssh_dir / 'openbsd-compat')]
     endif
 
-    libsmallclue = static_library('smallclue', smallclue_src,
+    libsmallclue = static_library('smallclue', smallclue_src + smallclue_extra_src,
         include_directories: [includes, smallclue_includes] + openssh_includes,
         c_args: smallclue_c_args)
+
+    # NOT compiled with the native_libc.h force-include the rest of SmallCLUE
+    # gets. This file's whole job is to talk to Foundation, so redirecting its
+    # libc onto the guest would be redirecting the wrong half -- the bytes go
+    # back to the caller's write callback, which IS redirected, and that is
+    # where the guest belongs in this picture. deps/smallclue-shim/curl/curl.h
+    # says the rest.
+    libcurlshim = []
+    if have_curl_shim
+        libcurlshim = [static_library('curlshim',
+            files('deps/smallclue-shim/curl_nsurlsession.m'),
+            include_directories: [includes, smallclue_includes],
+            objc_args: ['-fobjc-arc'])]
+    endif
 
     # Nextvi gets an archive of its own for one reason: a -D that must apply to
     # its translation unit and to no other. It is a program written to run once
@@ -1342,7 +1414,7 @@ if get_option('kernel') == 'ish'
     endif
 
     libish = library('ish', src,
-        link_whole: [libsmallclue, libnextvi, libbash, libzsh, libopenssh] + libopenssh_special,
+        link_whole: [libsmallclue, libnextvi, libbash, libzsh, libopenssh] + libopenssh_special + libcurlshim,
         include_directories: includes, c_args: ish_c_args)
     ish = declare_dependency(
         link_with: [libish, libish_emu, libfakefs],
