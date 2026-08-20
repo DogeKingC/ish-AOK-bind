@@ -100,6 +100,17 @@ struct addr_set {
     struct {
         uint32_t addr;             // network byte order
         char ifname[IF_NAMESIZE];
+        // IFF_POINTOPOINT. A connect() to the host's OWN address on a
+        // point-to-point link is not something the platform promises to
+        // deliver locally: the packet goes to the peer -- the carrier's
+        // gateway on a cellular PDP link, the far end on a VPN utun -- and
+        // nothing brings it back. Measured on an iPhone with both up:
+        // lo0 and en0 (WiFi) are reachable, pdp_ip0 and utun4 time out, and
+        // they time out identically whether the listener bound the wildcard
+        // or bound that exact address. So it is not wildcard coverage that
+        // fails there, and failing the test on it reports a routing property
+        // of the phone as an iSH bug. Probed and reported, never counted.
+        int pointopoint;
     } v[MAX_ADDRS];
     unsigned n;
 };
@@ -157,6 +168,7 @@ static void addr_set_collect(struct addr_set *out) {
         if (dup || out->n >= MAX_ADDRS)
             continue;
         out->v[out->n].addr = a;
+        out->v[out->n].pointopoint = (c->ifa_flags & IFF_POINTOPOINT) != 0;
         snprintf(out->v[out->n].ifname, IF_NAMESIZE, "%s",
                  c->ifa_name != NULL ? c->ifa_name : "?");
         out->n++;
@@ -272,6 +284,12 @@ static unsigned probe_all(const struct addr_set *set, const struct addr_set *bas
         if (probe_addr(set->v[i].addr, probe_port, expect_banner, why, sizeof(why)) == 0) {
             test_logf("  ok   %s (%s)%s\n", abuf, set->v[i].ifname,
                       is_new ? "  [appeared after bind]" : "");
+        } else if (set->v[i].pointopoint) {
+            // Reported, not counted -- see the pointopoint field. Still worth
+            // printing: on a host where these DO loop back, a change here is
+            // the first sign of it.
+            test_logf("  skip %s (%s) -- point-to-point, not self-connectable "
+                      "on this platform: %s\n", abuf, set->v[i].ifname, why);
         } else {
             printf("FAIL %s: %s:%d (%s)%s -- %s\n", phase, abuf, probe_port,
                    set->v[i].ifname,

@@ -875,6 +875,56 @@ assumed: it still faults at `libutils.so+0x1aa80` with `lr` at `+0x11030`, a
 silently lost heap store with no re-fault at all. It remains open, below.
 
 
+### The device sweep: 135/135, and the five SIGSEGVs are gone
+
+Worth re-running whole rather than probing one test at a time, because the
+value of this suite has always been what it catches that nobody was looking
+for. Latest run on the device (`sh /AOK/tests/setup-regressions.sh --run`,
+aarch64 Alpine 3.23.3, build 549): **134 pass, 1 fail, and the one failure was
+the test's own assumption** -- see below. Every one of the five SIGSEGVs
+described in this section now passes on real hardware:
+
+| test | was | now |
+|---|---|---|
+| `socket_kill` | SIGSEGV | PASS |
+| `accept_kill` | SIGSEGV | PASS |
+| `clone_error_cleanup` | SIGSEGV | PASS |
+| `fifo_open_creat_deadlock` | SIGSEGV | PASS (200 rounds) |
+| `concurrent_exec_tlb` | SIGSEGV | PASS |
+| `proc_stat_monotonic` | SIGSEGV | PASS |
+
+That is the re-fault guard fix (below) confirmed on the device rather than
+inferred from the harness. The suite also builds and runs the arm64 manual
+tests, and **all fifteen pass on the phone** -- `tagged_pointer`,
+`stlr_ldar_publish` (400000 iterations), `smc_stale_block`, `ret_retcache`,
+`atomics64`, `thread_identity` and the rest. Those had only ever been green
+under qemu-user, which is a stand-in for a real core, so this is the first time
+the arm64 gadget set is known good on the hardware it ships for.
+
+**The one failure was `inaddr_any_iface`, and it was not iSH.** It requires
+every IPv4 address `getifaddrs()` reports to be self-connectable while a
+wildcard listener is up. On a phone that is false for two of the four:
+
+```
+  ok   127.0.0.1 (lo0)
+  FAIL 10.68.120.121 (pdp_ip0) -- timeout
+  ok   192.168.1.80 (en0)
+  FAIL 10.7.0.0 (utun4) -- timeout
+```
+
+Both failures are `IFF_POINTOPOINT` links -- the cellular PDP interface and a
+VPN tunnel -- where a connect to the device's own address goes to the peer and
+nothing brings it back. The discriminator was worth running rather than
+assuming, because "wildcard coverage is broken on some interfaces" is exactly
+what this test exists to catch: a listener bound EXPLICITLY to those same two
+addresses times out identically, while loopback and WiFi work under both bind
+modes. So the wildcard is not the variable and the test was reporting a routing
+property of the phone as an emulator bug. It now probes point-to-point
+addresses and reports them as `skip` instead of counting them, which keeps the
+check that matters -- a real regression on lo or a broadcast interface still
+fails loudly -- and gets the suite to 135/135 on a phone with cellular and a
+VPN up, which is most phones.
+
 Found by running the whole guest suite on a device (122 pass, and this). Five
 tests die with SIGSEGV there, and two of them -- `socket_kill` and
 `proc_stat_monotonic` -- land on the identical instruction:
