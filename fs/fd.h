@@ -271,6 +271,25 @@ struct fd {
             size_t buffer_len;
         } clipboard;
 
+        struct {
+            // Open /dev/kmsg fds, linked into the global kernel-log watch
+            // list (fs/mem.c) so a newly logged line can poll_wakeup them --
+            // `dmesg --follow` and systemd-journald both epoll this rather
+            // than sitting in a blocking read.
+            //
+            // THIS UNION, not the fs-data one below, and the distinction is
+            // load-bearing rather than tidiness. A device node has BOTH a
+            // device and a filesystem behind it: /dev/kmsg is a node on a
+            // tmpfs mount, so tmpfs_open stores its dirent in the fs union and
+            // fd_close (fs/fd.c) calls BOTH fd->ops->close and
+            // mount->fs->close. With this list sharing storage with
+            // tmpfs.dirent, kmsg_open's list_add overwrote the dirent,
+            // kmsg_close's list_remove NULLed it, and tmpfs_close then
+            // dereferenced NULL -- the emulator segfaulted closing an fd, and
+            // the tmpfs dirent reference taken at open leaked besides.
+            struct list link;
+        } kmsg;
+
         // can fit anything in here
         void *data;
     };
@@ -287,13 +306,6 @@ struct fd {
             // a new edge per mount change). Null links for other proc fds.
             struct list mountinfo_link;
         } proc;
-        struct {
-            // Open /dev/kmsg fds, linked into the global kernel-log watch
-            // list (fs/mem.c) so a newly logged line can poll_wakeup them --
-            // `dmesg --follow` and systemd-journald both epoll this rather
-            // than sitting in a blocking read.
-            struct list link;
-        } kmsg;
         struct {
             int num;
         } devpts;
