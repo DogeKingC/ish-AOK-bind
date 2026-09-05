@@ -34,6 +34,17 @@ struct proc_dir_entry {
     
     // file with a custom write function
     int (*update)(struct proc_entry *entry, struct proc_data *data);
+
+    // Let this entry see a ZERO-LENGTH write, which fs/proc.c otherwise
+    // answers with 0 without calling update at all. That short-circuit is
+    // right for sysctl -- Linux's proc_sys_call_handler does the same, and
+    // passing it through made every sysctl return EINVAL for
+    // write(fd, buf, 0) -- but it is wrong for a file where an empty write IS
+    // the operation. /proc/<pid>/attr/* is the case: writing nothing clears
+    // the slot, and clearing a non-clearable one has to report EINVAL, so
+    // both behaviours live in the handler's len == 0 branch and are
+    // unreachable if the write never arrives.
+    bool wants_empty_write;
     
     // file with custom pread functionality. flags are the opening fd's, so a
     // streaming entry can honour O_NONBLOCK -- /proc/kmsg blocks until there

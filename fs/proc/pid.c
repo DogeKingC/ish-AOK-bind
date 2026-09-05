@@ -1928,6 +1928,11 @@ struct proc_dir_entry proc_pid = {NULL, S_IFDIR,
 // root by the time it relabels itself.
 static struct proc_dir_entry proc_pid_attr_entry = {NULL, S_IFREG | 0666,
     .getname = proc_pid_attr_getname, .show = proc_pid_attr_show,
+    // An empty write to an attr file is the CLEAR operation, and clearing a
+    // non-clearable slot must report EINVAL -- both live in the handler's
+    // len == 0 branch, so it has to actually be reached. Without this,
+    // fs/proc.c answers 0 and never calls update.
+    .wants_empty_write = true,
     .update = proc_pid_attr_update};
 
 static struct proc_dir_entry proc_pid_fd = {NULL, S_IFLNK,

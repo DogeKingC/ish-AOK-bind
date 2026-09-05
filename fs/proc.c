@@ -244,7 +244,10 @@ static ssize_t proc_pwrite(struct fd *fd, const void *buf, size_t bufsize, off_t
     // nothing and returns 0, and Linux's proc_sys_call_handler short-circuits
     // before the handler is ever asked. Passing it through made every sysctl
     // answer EINVAL for `write(fd, buf, 0)`, which is not an error anywhere.
-    if (bufsize == 0)
+    //
+    // Unless the entry asked for it. For /proc/<pid>/attr/* an empty write is
+    // not a no-op, it is the clear operation -- see wants_empty_write.
+    if (bufsize == 0 && !fd->proc.entry.meta->wants_empty_write)
         return 0;
 
     struct proc_data data = {(char *)buf, bufsize, bufsize};
