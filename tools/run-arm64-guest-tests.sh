@@ -103,6 +103,26 @@ need ninja
 mkdir -p "$WORK"
 
 # --- the emulator -----------------------------------------------------------
+# A build directory is only reusable if meson configured it against THIS source
+# tree. It caches an absolute source path, so a $BUILD left behind by a run in
+# another checkout -- a git worktree, a second clone -- is silently reused and
+# every result then describes the wrong tree. That is the failure this whole
+# harness exists to avoid: a green run that measured something else. Cheap to
+# rule out, so rule it out.
+if [ -d "$BUILD" ] && [ -f "$BUILD/meson-info/meson-info.json" ]; then
+    # meson-info.json records it as directories.source. Parsed with python
+    # rather than sed because the file is one long line and a regex for the
+    # right "source" among several is exactly the kind of thing that silently
+    # matches the wrong one -- which would put this check back where it started.
+    configured_src=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["directories"]["source"])' \
+        "$BUILD/meson-info/meson-info.json" 2>/dev/null)
+    if [ -n "$configured_src" ] && [ "$configured_src" != "$SRC" ]; then
+        echo "note: $BUILD was configured against $configured_src, not $SRC" >&2
+        echo "      reconfiguring from scratch so this run measures THIS tree" >&2
+        rm -rf "$BUILD"
+    fi
+fi
+
 if [ ! -d "$BUILD" ]; then
     # -Dnative_bash=disabled is required here, not a preference. Native bash
     # brings deps/bash/lib/sh/getenv.c, which is force-included with
