@@ -102,9 +102,14 @@ static int kmsg_setup_device(void) {
 // through ish_log_write_record, the same path android::base's KernelLogger
 // uses, so this is where a delivered record lands.
 static int kmsg_contains(const char *needle) {
-    // Plain O_RDONLY, as tests/manual/kmsg.c does: a fresh open starts at
-    // offset 0 and reads the whole ring, and O_NONBLOCK is refused here.
-    int fd = open(kmsg_path, O_RDONLY);
+    // O_NONBLOCK, as tests/manual/kmsg.c does. A fresh open still starts at
+    // offset 0 and reads the whole ring; what changed is the far end. This
+    // used to say "O_NONBLOCK is refused here", which was true when /dev/kmsg
+    // had no reader worth the name. It has one now -- a real stream, with
+    // poll -- and a blocking read on a caught-up stream waits for the next
+    // message instead of reporting end-of-file, which is what `dmesg --follow`
+    // is. The loop below stops on `n <= 0`, so a blocking fd hangs it forever.
+    int fd = open(kmsg_path, O_RDONLY | O_NONBLOCK);
     if (fd < 0)
         return -1;
     static char buf[262144];

@@ -116,8 +116,18 @@ static int kmsg_put(const char *record, size_t len) {
 
 // Reads the whole log back. Returns a malloc'd NUL-terminated buffer, or NULL.
 // A fresh open starts at offset 0, so this sees everything still in the ring.
+//
+// O_NONBLOCK is required, not tidiness. /dev/kmsg is a STREAM: once a reader
+// has caught up, a blocking read waits for the next message rather than
+// reporting end-of-file, exactly as on Linux -- `dmesg --follow` is that wait.
+// The drain loop below stops on `n <= 0`, which a blocking fd never returns,
+// so without this the test hangs forever on its last read instead of
+// finishing. (It did: the emulator sat in ish_log_wait_past() until the
+// harness's timeout killed it, with the guest's own alarm(60) never getting a
+// chance to fire.) Non-blocking turns "caught up" into EAGAIN, which is what
+// this loop is written to see.
 static char *kmsg_slurp(void) {
-    int fd = open(kmsg_path, O_RDONLY);
+    int fd = open(kmsg_path, O_RDONLY | O_NONBLOCK);
     if (fd < 0)
         return NULL;
     size_t cap = 1 << 16, used = 0;

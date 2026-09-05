@@ -288,24 +288,23 @@ static int kmsg_poll(struct fd *fd) {
 static ssize_t kmsg_write(struct fd *UNUSED(fd), const void *buf, size_t bufsize) {
     if (bufsize == 0)
         return 0;
-    const char *msg = buf;
-    size_t len = bufsize > KMSG_WRITE_MAX ? KMSG_WRITE_MAX : bufsize;
-    size_t skip = 0;
-    if (len > 2 && msg[0] == '<') {
-        size_t i = 1;
-        while (i < len && msg[i] >= '0' && msg[i] <= '9')
-            i++;
-        if (i > 1 && i < len && msg[i] == '>')
-            skip = i + 1;
-    }
-    size_t n = len - skip;
-    // printk stores one line per call; a trailing newline of our own would
-    // leave a blank line between every injected message.
-    while (n > 0 && msg[skip + n - 1] == '\n')
-        n--;
-    if (n > 0)
-        // Never as the format string itself: the text is the guest's.
-        ish_printk("%.*s\n", (int) n, msg + skip);
+    // Through ish_log_write_record (kernel/log.c), not a local parse into
+    // ish_printk. The two are not equivalent and tests/manual/kmsg.c pins the
+    // difference, because both halves of it are load-bearing for Android:
+    //
+    //   - The <N> priority prefix is at most THREE digits. An unbounded digit
+    //     run swallows "<1234>" as a prefix, but Linux keeps four digits as
+    //     message text, and so must this -- a logger that writes a number in
+    //     angle brackets must not have it silently eaten.
+    //   - One write is ONE record. Control characters, an embedded newline
+    //     above all, become spaces rather than splitting the line. Every
+    //     reader of this buffer assumes one record per line; printk's
+    //     line-per-call framing does not survive a newline inside the text.
+    //
+    // android::base's KernelLogger writes here, and it is where a process that
+    // dies before logd is up says why -- servicemanager's fatal CHECKs land
+    // here and nowhere else, so a mangled record is a lost diagnosis.
+    ish_log_write_record(buf, bufsize);
     // Linux reports the whole write consumed even where it truncated.
     return (ssize_t) bufsize;
 }

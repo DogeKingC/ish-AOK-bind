@@ -275,6 +275,15 @@ need_in kernel/log.c ish_log_write_record "the logd sink's path into the log"
 need_in kernel/log.h ish_log_write_record
 need_in kernel/logd_sink.c ish_log_write_record \
     "the sink still writes records rather than being cut adrift"
+# RESTORED, and the reason is worth keeping. This assertion was retired one
+# sync ago on the grounds that upstream had written its own kmsg_write, so the
+# fork's was redundant. It was not: upstream's parses the <N> prefix with an
+# unbounded digit run (so "<1234>" is eaten rather than kept as text) and
+# emits through printk, whose line-per-call framing splits a record containing
+# a newline in two. tests/manual/kmsg.c caught both within one run of taking
+# upstream's file whole. The write path goes through ish_log_write_record.
+need_in fs/mem.c ish_log_write_record \
+    "kmsg_write must keep the 3-digit prefix bound and one-write-one-record"
 
 # --- boot_id generated once ------------------------------------------------
 # Upstream generates it lazily with no lock. libbinder refuses to start on a
