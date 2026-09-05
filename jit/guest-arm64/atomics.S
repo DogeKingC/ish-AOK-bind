@@ -92,6 +92,13 @@
 .gadget \name
     ldr x8, [_ip]
     ldr x19, [_ip, #8]       // orig_ip (fault restart), callee-saved
+    // Store trace: stash the guest pc the way arm64_resolve_write_ptr does
+    // (memory.S). These gadgets hand the address straight to C, so they never
+    // pass through write_prep -- but the C helper resolves it with
+    // tlb_write_ptr_slow, which RECORDS. Without this the record carries
+    // whatever ip the last ordinary store left behind, so every atomic in the
+    // ring is unattributable: right address, wrong instruction.
+    str x19, [_tlb, #(-TLB_entries+TLB_watch_ip)]
     add _ip, _ip, #16
     and x20, x8, #0x1f       // rt (value to store)
     ubfx x22, x8, #8, #5     // rn (31 = SP)
@@ -175,6 +182,13 @@ stxr_gadget stxr64, 3
 .gadget \name
     ldr x8, [_ip]
     ldr x19, [_ip, #8]       // orig_ip
+    // Store trace: stash the guest pc the way arm64_resolve_write_ptr does
+    // (memory.S). These gadgets hand the address straight to C, so they never
+    // pass through write_prep -- but the C helper resolves it with
+    // tlb_write_ptr_slow, which RECORDS. Without this the record carries
+    // whatever ip the last ordinary store left behind, so every atomic in the
+    // ring is unattributable: right address, wrong instruction.
+    str x19, [_tlb, #(-TLB_entries+TLB_watch_ip)]
     add _ip, _ip, #16
     and x20, x8, #0x1f       // rt (new/desired)
     ubfx x22, x8, #8, #5     // rn (31 = SP)
@@ -259,6 +273,13 @@ cas_gadget cas64, 3
 .gadget lse_rmw
     ldr x8, [_ip]
     ldr x19, [_ip, #8]        // orig_ip (fault restart), callee-saved
+    // Store trace: stash the guest pc the way arm64_resolve_write_ptr does
+    // (memory.S). These gadgets hand the address straight to C, so they never
+    // pass through write_prep -- but the C helper resolves it with
+    // tlb_write_ptr_slow, which RECORDS. Without this the record carries
+    // whatever ip the last ordinary store left behind, so every atomic in the
+    // ring is unattributable: right address, wrong instruction.
+    str x19, [_tlb, #(-TLB_entries+TLB_watch_ip)]
     add _ip, _ip, #16
     and x20, x8, #0x1f        // rt (old out)
     ubfx x21, x8, #8, #5      // rn
@@ -326,6 +347,13 @@ lse_rmw_fault:
 .gadget \name
     ldr x8, [_ip]
     ldr x19, [_ip, #8]       // orig_ip (fault restart), callee-saved
+    // Store trace: stash the guest pc the way arm64_resolve_write_ptr does
+    // (memory.S). These gadgets hand the address straight to C, so they never
+    // pass through write_prep -- but the C helper resolves it with
+    // tlb_write_ptr_slow, which RECORDS. Without this the record carries
+    // whatever ip the last ordinary store left behind, so every atomic in the
+    // ring is unattributable: right address, wrong instruction.
+    str x19, [_tlb, #(-TLB_entries+TLB_watch_ip)]
     add _ip, _ip, #16
     and x20, x8, #0x1f       // rt (desired lo; rt+1 = desired hi)
     ubfx x22, x8, #8, #5     // rn (31 = SP)

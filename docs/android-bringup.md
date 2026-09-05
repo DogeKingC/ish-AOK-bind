@@ -894,16 +894,31 @@ fault-time memdump shows `0x7fffb8db35d8` back in it. A corpse with a
 base-class vptr and a null `mRefs` is what a destroyed `RefBase` looks like,
 not an unfinished one.
 
-**What the next round has to answer, and the instrument gap it hits.** The
-question is now why the object died while a reference to it was still live --
-`ProcessState::spawnPooledThread` holds it in an `sp<>`, and `Thread::run()`
-takes another (`mHoldSelf`). That is a refcount question, and **this trace
-cannot see refcounts**: `incStrong`/`decStrong` work through outline-atomics
-LDADD, which is one of the three store forms that never reach the write funnel
-(see above), so `mStrong`/`mWeak` never appear in the ring. Answering it needs
-either a watch on the `weakref_impl` itself -- its address is in the destructor
-record's `old=` field, which is how to get it without ASLR guesswork -- or
-recording the C-side atomics the way plain stores are recorded now.
+**What the next round has to answer.** The question is now why the object died
+while a reference to it was still live -- `ProcessState::spawnPooledThread`
+holds it in an `sp<>`, and `Thread::run()` takes another (`mHoldSelf`).
+
+**CORRECTION, and it is worth reading before designing the next measurement:
+the trace CAN see refcounts, and this document previously said it could not.**
+That claim was reasoned from the wrong end -- from which paths call
+`arm64_watch_scan_value` -- instead of from what `arm64_lse_rmw` actually does,
+which is resolve its address with `tlb_write_ptr_slow`, the one function that
+records. So the LSE read-modify-writes, CAS and CASP have been landing in the
+ring all along, with the right address and the pre-store value.
+`incStrong`/`decStrong` are outline-atomics LDADD; they are in there.
+
+What was genuinely missing is only the `ip`. Those gadgets hand the address
+straight to C and never pass `write_prep`, so nothing set `tlb->watch_ip` and
+every atomic record carried whatever ip the last ordinary store left behind --
+right address, wrong instruction, and unattributable. The four gadgets that
+resolve through the recording wrapper (the two CAS forms, `lse_rmw`, `casp`)
+now stash `orig_ip` exactly as `arm64_resolve_write_ptr` does.
+
+So the next measurement does not need a new instrument. Arm the trace, take the
+`weakref_impl` address from the destructor record's `old=` field (which is how
+to name it without guessing past ASLR), and read every record against it: the
+`mStrong` and `mWeak` traffic is the refcount history, and with the ip fixed
+each entry names the instruction that made it.
 
 Do not carry the old framing forward. "The constructor's store was lost" is
 answered and wrong; the open question is who dropped the last reference.
@@ -1351,14 +1366,14 @@ that tree's `dev/__properties__`.
 
    So the open question is a refcount one: why the last reference to the
    `PoolThread` goes away while `spawnPooledThread`'s `sp<>` and
-   `Thread::run()`'s `mHoldSelf` should both still hold it. The trace cannot
-   answer that as it stands -- `incStrong`/`decStrong` are outline-atomics
-   LDADD, which never reach the store funnel, so no refcount operation appears
-   in the ring. Either watch the `weakref_impl` (its address is the `old=`
-   value on the destructor's record) or record the C-side atomics the way plain
-   stores are recorded. Whichever, confirm the mechanism actually ran before
-   believing the result -- the HLE lesson, and this bug has now punished the
-   alternative twice.
+   `Thread::run()`'s `mHoldSelf` should both still hold it. The trace can
+   answer it as it stands -- `incStrong`/`decStrong` are LSE LDADD, which
+   resolve through `tlb_write_ptr_slow` and so are recorded; an earlier version
+   of this list said the opposite and was wrong. Watch the `weakref_impl`,
+   whose address is the `old=` value on the destructor's record, and read the
+   `mStrong`/`mWeak` traffic against it. Confirm the mechanism actually ran
+   before believing the result -- the HLE lesson, and this bug has now punished
+   the alternative twice.
 
    `installd` was given the same treatment rather than assumed to be the same
    bug, and the answer was worth having both ways: its `0x0` fault was

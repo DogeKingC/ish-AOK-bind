@@ -1212,11 +1212,22 @@ void arm64_watch_dump(void) {
                "start of history -- older stores are in the ring; a store missing "
                "above may simply be further back. Raise N in all:N.\n",
                arm64_watch_dump_limit);
-    // Three ways a store that DID execute leaves no record, all of them
-    // outside this funnel: a store that straddles a page boundary (it goes
-    // through arm64_crosspage_store), an AdvSIMD ld1/st1 transfer, and the
-    // C-side atomics. Rule those out by the instruction's form before reading
-    // an absence as "it never ran".
+    // What is and is not in here, because an absence is read as evidence and
+    // an earlier version of this comment got it wrong in the direction that
+    // costs a round: it claimed the C-side atomics were invisible.
+    //
+    // RECORDED: ordinary stores (the JIT's write path, which "all" forces
+    // through the revalidate funnel), and the arm64 atomics that resolve via
+    // tlb_write_ptr_slow -- the LSE read-modify-writes (LDADD/LDCLR/LDEOR/
+    // LDSET/LDSMAX/LDSMIN/LDUMAX/LDUMIN and SWP), CAS and CASP. Refcounts ARE
+    // visible: incStrong/decStrong are outline-atomics LDADD, and they land
+    // here with the right address and the pre-store value.
+    //
+    // NOT recorded, all of which reach memory without passing this wrapper:
+    // a store that straddles a page boundary (__tlb_write_cross_page), an
+    // AdvSIMD ld1/st1 transfer (tlb_write), and the LDXP/STXP exclusive pair.
+    // Rule those out by the instruction's form before reading an absence as
+    // "it never ran".
 }
 
 // ISH_ARM64_TRACE_IP=<hex guest pc> + ISH_ARM64_TRACE_LDR="rn,rm": before
