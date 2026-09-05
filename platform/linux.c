@@ -359,4 +359,27 @@ bool host_mem_headroom_low(void) {
     return budget.available < host_mem_headroom_floor();
 }
 
+// The host memory-pressure source is a Darwin DISPATCH_SOURCE_TYPE_MEMORYPRESSURE
+// and has no Linux counterpart. platform.h already specifies what to do about
+// that -- "0 on platforms with no such source, which makes every caller a
+// no-op there" -- so these are that contract, written out. Upstream declared
+// them and implemented them only in platform/darwin.c, which links on iOS and
+// fails here with three undefined symbols.
+//
+// host_mem_should_reclaim is deliberately NOT wired to host_mem_headroom_low()
+// above: that one is the hard refuse-growth guard reserved for CRITICAL, and
+// its own comment says the reclaim throttle must sit at a lower bar. With no
+// pressure source there is no lower bar to read, so the honest answer is false
+// -- the Linux build is a test harness, and the OOM killer owns this here.
+unsigned host_mem_pressure_level(void) {
+    return HOST_MEM_PRESSURE_NORMAL;
+}
+
+bool host_mem_should_reclaim(void) {
+    return false;
+}
+
+void host_mem_pressure_start(void) {
+}
+
 #endif

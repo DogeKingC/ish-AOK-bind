@@ -2,6 +2,24 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+// MADV_FREE_REUSABLE and MADV_FREE_REUSE are Darwin's, and upstream's swap
+// eviction path is written directly against them -- which stops the Linux
+// build dead, and the Linux build is where BOTH guest test harnesses run
+// (tools/run-guest-tests.sh and tools/run-arm64-guest-tests.sh, the latter
+// being the only automated cover the arm64 gadget set has anywhere).
+//
+// Mapped onto the nearest Linux behaviour rather than porting the design: the
+// shipping target is iOS, where the real flags are used and nothing here
+// applies. Eviction has already written the frame to its swap slot and follows
+// this with mprotect(PROT_NONE), so DONTNEED -- drop the pages -- is what
+// REUSABLE means here. REUSE has no Linux counterpart because Linux has no
+// "reusable" state to leave; NORMAL is the correct no-op.
+#ifndef MADV_FREE_REUSABLE
+#define MADV_FREE_REUSABLE MADV_DONTNEED
+#endif
+#ifndef MADV_FREE_REUSE
+#define MADV_FREE_REUSE MADV_NORMAL
+#endif
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
