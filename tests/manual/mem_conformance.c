@@ -1,6 +1,6 @@
 // mem_conformance.c — self-checking regression lock for the memory-management
 // conformance fixes found by differential testing against real Linux (mint).
-// Each check asserts the documented Linux behavior that iSH now matches:
+// Each check asserts the documented Linux behavior that AOK now matches:
 //
 //   - PROT_NONE is enforced on READS, not just writes: a page mprotect'd from
 //     RW down to PROT_NONE faults on read (it used to keep its host backing and
@@ -11,14 +11,16 @@
 //   - mmap with neither MAP_PRIVATE nor MAP_SHARED -> EINVAL.
 //   - mmap with an unaligned (non-FIXED) addr hint -> success (rounded down).
 //   - madvise: invalid advice -> EINVAL; unaligned addr -> EINVAL; DONTNEED over
-//     an unmapped range -> ENOMEM; DONTNEED zeroes private anon pages.
+//     an unmapped range -> ENOMEM; DONTNEED zeroes private anon pages; FREE is
+//     accepted on private anon, refused with EINVAL on anything else, and does
+//     not eat a write made after it.
 //   - msync: unknown flag / MS_SYNC|MS_ASYNC -> EINVAL; unmapped range -> ENOMEM.
 //   - mincore: mapped -> OK; zero length -> OK; unmapped -> ENOMEM; unaligned ->
 //     EINVAL (and it is wired on amd64, not a "missing syscall").
 //   - fork copy-on-write: a child's write to a MAP_PRIVATE page leaves the
 //     parent's copy unchanged; a MAP_SHARED write is visible in the parent.
 //
-// The same source is a Tier-0 functional gate (run under iSH, no oracle) and a
+// The same source is a Tier-0 functional gate (run under AOK, no oracle) and a
 // portable check that also passes on a real Linux kernel.
 #define _GNU_SOURCE
 #include <errno.h>
@@ -164,7 +166,25 @@ static void check_madvise(void) {
     eq_errno("madvise invalid advice -> EINVAL", madvise(p, PS, 0x7ffe), EINVAL);
     eq_errno("madvise unaligned -> EINVAL", madvise((char *) p + 1, PS, MADV_WILLNEED), EINVAL);
     is_ok("madvise MADV_FREE accepted", madvise(p, PS, MADV_FREE));
+
+    // MADV_FREE leaves the caller no promise about the CONTENTS -- Linux may
+    // return the old bytes or zeroes, depending on whether it got round to
+    // reclaiming -- so neither answer can be asserted portably. What is
+    // promised is that a write after the advice sticks: it cancels the pending
+    // free rather than being dropped along with it.
+    memset(p, 0x5A, PS);
+    is_true("write after MADV_FREE is kept", all_val(p, PS, 0x5A));
     munmap(p, 2 * PS);
+
+    // MADV_FREE is for private anonymous memory and nothing else. Linux
+    // refuses the rest outright (madvise_free_single_vma) rather than treating
+    // it as a hint it can ignore.
+    void *sh = mmap(NULL, PS, RW, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (sh != MAP_FAILED) {
+        eq_errno("madvise MADV_FREE on shared anon -> EINVAL",
+                 madvise(sh, PS, MADV_FREE), EINVAL);
+        munmap(sh, PS);
+    }
 
     // DONTNEED over an unmapped range -> ENOMEM
     void *q = mmap(NULL, PS, RW, ANON_PRIV, -1, 0);

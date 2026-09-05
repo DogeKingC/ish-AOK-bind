@@ -11,6 +11,7 @@ int mount_root(const struct fs_ops *fs, const char *source);
 // AFTER become_first_process() -- it goes through the guest VFS, which needs a
 // current task. See the definition for why a rootfs image never declares it.
 void ensure_root_fstab_entry(void);
+void ensure_dev_fd_links(void);
 void set_console_device(int major, int minor);
 void get_console_device(int *major, int *minor);
 intptr_t become_first_process(void);
@@ -42,5 +43,27 @@ struct guest_command_result {
 int run_guest_command_capture(const char *command, const char *env,
                               int timeout_ms, size_t max_output,
                               struct guest_command_result *result);
+
+// Same, but `shell -c command` with a caller-chosen shell (absolute guest
+// path, e.g. /AOK/native/zsh). NULL or "" means /bin/sh.
+int run_guest_command_capture_shell(const char *shell, const char *command,
+                                    const char *env, int timeout_ms,
+                                    size_t max_output,
+                                    struct guest_command_result *result);
+
+// Same, but as `user` instead of root, via `/bin/su - user -c command` -- the
+// child of init is root, so no password is involved, and su gives the command
+// the account's real identity (uid/gid/groups), HOME, and login-shell
+// environment. The command is one argv element, so no shell quoting of it
+// happens here. That argv ordering works on both BusyBox su (options parsed
+// anywhere) and util-linux/shadow su (post-username words are passed to the
+// login shell as its arguments) -- the same form DisplayViewController uses
+// for the Wayland session. NULL or "" user means run as root, exactly
+// run_guest_command_capture(). Backs "Open Everything as Default User" for
+// the headless command surfaces (LLM chat's run_shell tool, Shortcuts).
+int run_guest_command_capture_user(const char *user, const char *command,
+                                   const char *env, int timeout_ms,
+                                   size_t max_output,
+                                   struct guest_command_result *result);
 
 #endif

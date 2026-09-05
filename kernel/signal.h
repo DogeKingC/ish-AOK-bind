@@ -2,6 +2,7 @@
 #define SIGNAL_H
 
 #include "misc.h"
+#include "kernel/errno.h"   // _EINTR/_ERESTART for signal_restart_or_eintr
 #include "util/list.h"
 #include "util/sync.h"
 #include <stdatomic.h>
@@ -13,6 +14,8 @@ typedef qword_t sigset_t_;
 #define SIG_DFL_ 0
 #define SIG_IGN_ 1
 
+#define SA_NOCLDSTOP_ 1
+#define SA_NOCLDWAIT_ 2
 #define SA_SIGINFO_ 4
 #define SA_ONSTACK_ 0x08000000
 #define SA_RESTART_ 0x10000000
@@ -26,7 +29,12 @@ struct sigaction_ {
     sigset_t_ mask;
 };
 
-#define NUM_SIGS 64
+// One past the highest signal number, so a valid signal is 1 <= sig < NUM_SIGS
+// -- which is how every bound in the tree spells it. Linux's highest is
+// SIGRTMAX == 64, so this is 65: at 64, signal 64 itself did not exist and
+// sigaction/kill/tgkill all returned EINVAL for it. sig_mask(64) is 1 << 63,
+// which still fits sigset_t_ (uint64_t).
+#define NUM_SIGS 65
 
 #define	SIGHUP_    1
 #define	SIGINT_    2
@@ -175,6 +183,10 @@ static const struct siginfo_ SIGINFO_NIL = {
     .code = SI_KERNEL_,
 };
 
+// See kernel/signal.c. Counts a repeat POSIX-timer expiration onto the
+// already-queued signal instead of queueing another; -1 if none is queued.
+int signal_timer_count_overrun(struct task *task, int sig, int timer_id);
+
 struct sigqueue {
     struct list queue;
     struct siginfo_ info;
@@ -194,14 +206,48 @@ void send_signal(struct task *task, int sig, struct siginfo_ info);
 void deliver_signal(struct task *task, int sig, struct siginfo_ info);
 // true when the next unblocked pending signal would run a handler with SA_RESTART
 bool signal_should_restart_syscall(void);
+bool signal_should_restart_syscall_nohand(void);
+
+// Turn a wait's _EINTR into _ERESTART when the handler that interrupted it was
+// installed with SA_RESTART, so the dispatcher re-executes the syscall and the
+// guest never sees the interruption. Call this from the syscall entry points
+// Linux restarts -- read/write family, ioctl, open, the blocking socket calls,
+// flock and F_SETLKW, wait.
+//
+// Do NOT call it from anything in signal(7)'s never-restarted list: poll,
+// select, epoll_wait, nanosleep, the sigwait family, System V IPC (msgrcv,
+// msgsnd, semop -- these use ERESTARTNOHAND, which a running handler cancels),
+// io_getevents, or a socket call with SO_RCVTIMEO/SO_SNDTIMEO set. Those must
+// keep returning _EINTR; restarting them hangs a guest that relies on the
+// interruption to make progress.
+static inline int_t signal_restart_or_eintr(int_t res) {
+    if (res == _EINTR && signal_should_restart_syscall())
+        return _ERESTART;
+    return res;
+}
+
+// The ERESTARTNOHAND form, for signal(7)'s never-restarted interfaces: a
+// running handler still gives the guest its EINTR, but a job-control stop
+// resumes the syscall transparently, exactly as Linux does.
+static inline int_t signal_restart_or_eintr_nohand(int_t res) {
+    if (res == _EINTR && signal_should_restart_syscall_nohand())
+        return _ERESTART_NOHAND;
+    return res;
+}
 // send a signal to current if it's not blocked or ignored, return whether that worked
 // exists specifically for sending SIGTTIN/SIGTTOU
-bool try_self_signal(int sig);
+bool signal_is_ignored_or_blocked(int sig);
 // send a signal to all processes in a group, could return ESRCH
 int send_group_signal(dword_t pgid, int sig, struct siginfo_ info);
 // check for and deliver pending signals on current
 // must be called without pids_lock, current->group->lock, or current->sighand->lock
 void receive_signals(void);
+// Block for the duration of a job-control group-stop, reporting it to a tracer
+// if the task is traced. Shared by the two execution models -- handle_interrupt
+// for translated code, native_checkpoint for a native program -- because they
+// used to hold separate copies and the native one silently lacked every bit of
+// the ptrace handling. Call with no lock held, from the task's own context.
+void group_stop_wait(void);
 // The blocked set as far as WAKING a task is concerned, which is not the same
 // as the blocked set as far as delivering to it is concerned: a native program's
 // handler is held by the shim with the signal blocked (kernel/native_libc.c),

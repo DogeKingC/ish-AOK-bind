@@ -12,6 +12,7 @@
 #include "kernel/logd_sink.h"
 #include "fs/real.h"
 #include "fs/sock.h"
+#include "kernel/swap.h"
 #ifdef __APPLE__
 #include <sys/resource.h>
 #define IOPOL_TYPE_VFS_HFS_CASE_SENSITIVITY 1
@@ -86,6 +87,12 @@ static inline int xX_main_Xx(int argc, char *const argv[], const char *envp) {
 
     become_first_process();
     current->thread = pthread_self();
+    // Simulated swap, if and only if the user asked for it. Off by default, so
+    // on every ordinary launch this reads one environment variable, finds
+    // nothing, and returns -- no file, no allocation, no thread. Here rather
+    // than in main.c so the app gets it too; the app's Settings reach it
+    // through swap_set_preference() instead of the environment.
+    swap_startup();
     netlink_link_watch_start();
     // Create /dev/binder & friends if the root can hold device nodes. On a
     // realfs root without CAP_MKNOD this quietly does nothing; binderfs

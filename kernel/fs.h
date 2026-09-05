@@ -56,6 +56,9 @@ struct attr {
 
 struct fd *generic_open(const char *path, int flags, int mode);
 struct fd *generic_openat(struct fd *at, const char *path, int flags, int mode);
+// generic_openat with extra path_normalize flags (fs/path.h's N_*). openat2's
+// RESOLVE_* constraints ride in here.
+struct fd *generic_openat_norm(struct fd *at, const char *path, int flags, int mode, int extra_norm);
 // For stored, already-normalized paths (chroot prefix included): anchors at
 // the real root instead of the caller's chroot. See fs/generic.c.
 struct fd *generic_open_realroot(const char *path, int flags, int mode);
@@ -69,6 +72,10 @@ int generic_renameat(struct fd *src_at, const char *src, struct fd *dst_at, cons
 int generic_symlinkat(const char *target, struct fd *at, const char *link);
 int generic_mknodat(struct fd *at, const char *path, mode_t_ mode, dev_t_ dev);
 int generic_seek(struct fd *fd, off_t_ off, int whence, size_t size);
+// The sticky bit. Shared: fs/generic.c enforces it, kernel/fs.c must not
+// mask it off in mkdir.
+#define S_ISVTX_ 01000
+
 #define AC_R 4
 #define AC_W 2
 #define AC_X 1
@@ -136,6 +143,19 @@ struct mount {
     // snapshot taken here would go stale.
     const char *display_source;
     const char *info;
+    // A mount created by fsmount() but not yet placed by move_mount(). Linux
+    // has no mountpoint for one of these at all -- it exists only as the fd --
+    // so it appears in no mount listing until it is moved. AOK has no mount
+    // namespaces and models it as a real mount at a hidden staging path
+    // (/.ish-fsmount/<n>, fs/mount.c), which made it visible in /proc/mounts
+    // and mountinfo. df then tried to statfs a 0700 staging directory it could
+    // not enter and printed "Permission denied" for a mount Linux never would
+    // have shown. Listed again the moment move_mount gives it a real point.
+    bool detached;
+    // umount2(MNT_DETACH): taken out of the mount table immediately so no new
+    // lookup can reach it, but not torn down until the last reference on it
+    // goes. See mount_remove_lazy in fs/mount.c.
+    bool lazy_umount;
     int flags;
     const struct fs_ops *fs;
     unsigned refcount;
@@ -165,6 +185,8 @@ struct mount {
     const char *bind_prefix;
 };
 extern lock_t mounts_lock;
+// mount_id with mounts_lock already held by the caller.
+int mount_id_locked(struct mount *target);
 
 // returns a reference, which must be released
 struct mount *mount_find(char *path);
@@ -232,6 +254,10 @@ bool mount_param_flag(const char *info, const char *flag);
 
 // open flags
 #define O_ACCMODE_ 3
+// Internal only, never from the guest: the caller has already made the access
+// decision that applies (see open_dir), so generic_open must not add its own.
+// Chosen above every real O_* bit so it cannot collide with a guest flag word.
+#define O_NOACCESS_CHECK_ (1 << 30)
 #define O_RDONLY_ 0
 #define O_WRONLY_ (1 << 0)
 #define O_RDWR_ (1 << 1)
@@ -253,6 +279,11 @@ bool mount_param_flag(const char *info, const char *flag);
 // links" for /etc/os-release and, fatally, the /etc/localtime timezone
 // watch during Arch aarch64 boot).
 #define O_PATH_ (1 << 21)
+// O_TMPFILE is this bit PLUS O_DIRECTORY, on every ABI: the directory bit is
+// what makes an old kernel reject it rather than create a file called
+// whatever the path said. The arm64 translation relocates O_DIRECTORY and
+// leaves this one alone, so the internal value is the same for both guests.
+#define O_TMPFILE_ (1 << 22)
 
 // generic ioctls
 // On sockets 0x5411 is SIOCOUTQ (bytes queued in the send buffer); it shares
@@ -267,6 +298,14 @@ bool mount_param_flag(const char *info, const char *flag);
 struct fs_ops {
     const char *name;
     int magic;
+
+    // True for a filesystem whose operations can block indefinitely on
+    // something outside the kernel (fusefs: a userspace daemon). generic.c and
+    // stat.c drop inodes_lock across calls into such a filesystem -- holding a
+    // global lock while waiting on a daemon whose own filesystem work needs
+    // that lock is a deadlock, and even without the cycle it would wedge every
+    // other file operation in the emulator behind one slow daemon.
+    bool may_block;
 
     int (*mount)(struct mount *mount);
     int (*umount)(struct mount *mount);
@@ -311,6 +350,9 @@ struct fs_ops {
 };
 
 struct mount *find_mount_and_trim_path(char *path);
+// Same, but also reports the mount flags governing the path. For a bind these
+// are NOT the returned mount's own -- see fs/generic.c. Pass NULL to ignore.
+struct mount *find_mount_and_trim_path_flags(char *path, int *mount_flags);
 
 // adhoc fs
 struct fd *adhoc_fd_create(const struct fd_ops *ops);
@@ -337,6 +379,8 @@ extern const struct fs_ops cgroup2fs;
 // Android userspace, which refuses to start without a security server to
 // talk to, can find one.
 extern const struct fs_ops selinuxfs;
+
+extern const struct fs_ops fusefs;
 void fs_register(const struct fs_ops *fs);
 const struct fs_ops *fs_lookup(const char *name); // by registered name, NULL if unknown
 char* get_filesystems(void); // For /proc/filesystems

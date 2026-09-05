@@ -30,10 +30,12 @@
 #import "CurrentRoot.h"
 #import "Diagnostics.h"
 #import "DiagnosticsBridge.h"
+#import "GuestFileBridge.h"
 #import "iOSFS.h"
 #import "SceneDelegate.h"
 #import "AudioDevice.h"
 #import "PasteboardDevice.h"
+#import "URLDevice.h"
 #import "LocationDevice.h"
 #import "NSObject+SaneKVO.h"
 #import "Roots.h"
@@ -59,8 +61,10 @@
 #include "util/sync.h"
 #include "app/LocationDevice.h"
 #include "fs/fake-db.h"
+#include "kernel/swap.h"
 #import <os/log.h>
 #import <os/lock.h>
+#include "platform/platform.h"
 
 // Visible in Console.app with subsystem app.ish.iSH-AOK, category suspend.
 static os_log_t ISHSuspendLog(void) {
@@ -104,9 +108,6 @@ static void ISHDispatchBootWork(NSString *name, void (^work)(void)) {
     });
 }
 
-#if ISH_LINUX
-#import "LinuxInterop.h"
-#endif
 
 @class ISHMetricKitSubscriber;
 
@@ -131,7 +132,6 @@ static void ISHDispatchBootWork(NSString *name, void (^work)(void)) {
 
 @end
 
-#if !ISH_LINUX
 #pragma pack(push, 4)
 typedef struct {
     struct in_addr address;
@@ -438,9 +438,7 @@ static NSData *ISHBuildBonjourDnsResponse(const uint8_t *queryBytes, size_t quer
     }
     return response;
 }
-#endif
 
-#if !ISH_LINUX
 static void ios_handle_exit(struct task *task, int code) {
     // we are interested in init and in children of init
     // this is called with pids_lock as an implementation side effect, please do not cite as an example of good API design
@@ -512,14 +510,6 @@ static void ios_handle_die(const char *msg) {
     pthread_setname_np(newName.UTF8String);
     ISHDiagnosticsRecordGuestFatalSync("die", msg, NULL);
 }
-#elif ISH_LINUX
-void ReportPanic(const char *message) {
-    NSDictionary *userInfo = message != NULL ? @{@"message": @(message)} : nil;
-    [NSNotificationCenter.defaultCenter postNotificationName:KernelPanicNotification
-                                                      object:nil
-                                                    userInfo:userInfo];
-}
-#endif
 
 static intptr_t bootError;
 static NSString *bootFailureTitle;
@@ -857,7 +847,7 @@ static NSData *BootEnvironmentForCommand(NSString *commandPath) {
         @"USER=root",
         @"LOGNAME=root",
         [NSString stringWithFormat:@"SHELL=%@", shell],
-        @"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        @"PATH=/AOK/persist/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         @"PS1=# ",
         @"COLUMNS=80",
         @"LINES=24",
@@ -1339,7 +1329,11 @@ static int EnsureCharacterDevice(const char *path, mode_t_ mode, dev_t_ device) 
         return err;
 
     mode_t_ permissions = mode & 07777;
-    bool wrongType = !S_ISCHR(stat.mode);
+    // Compare against the type the CALLER asked for, not S_IFCHR. Every caller
+    // but one passes S_IFCHR, but /dev/aokswap0 is a block device, and an
+    // unconditional S_ISCHR test would decide the block node was the wrong type
+    // and recreate it on every single boot.
+    bool wrongType = (stat.mode & S_IFMT) != (mode & S_IFMT);
     bool wrongDevice = stat.rdev != device;
     if (wrongType || wrongDevice) {
         err = EnsurePathRemoved(path, &stat);
@@ -1516,6 +1510,70 @@ static int FixSharedDirectoryPermissionsCallback(const char *fpath, const struct
 // cheap for the modest trees /AOK/persist actually holds, and idempotent.
 static void FixSharedDirectoryPermissions(const char *path) {
     nftw(path, FixSharedDirectoryPermissionsCallback, 16, FTW_PHYS);
+}
+
+// One tiny launcher per Workspace applet, written into /AOK/persist/bin so a
+// shell can open a GUI window: `ws-filemanager /etc`, `ws-markdown README.md`.
+// They talk to /proc/ish/workspace (see fs/proc/ish.c).
+//
+// Shell scripts rather than compiled binaries, even though /AOK/persist/bin is
+// documented as the place for aarch64 binaries. Three reasons: they are four
+// lines; a script runs under an i386 or riscv64 root without caring which ELF
+// we shipped; and a user can read one to see exactly what it does to their
+// system, which for something that talks to the app is worth more than speed.
+//
+// The `ws-` prefix is not decoration. /AOK/persist/bin is FIRST on PATH, and
+// several tool identifiers collide with real commands -- `info` is GNU info,
+// `status`, `clock` and `browser` are plausible names for anything. Shipping a
+// bare `info` that opened a GUI panel would be exactly the class of shadowing
+// that got SmallCLUE's `less` excluded. The prefix also makes the whole set
+// discoverable: `ws-` then TAB.
+static void ISHWriteWorkspaceLaunchers(NSURL *binURL) {
+    if (binURL == nil)
+        return;
+    // Rewritten on every launch so they track the app, but ONLY over files
+    // carrying this marker: /AOK/persist survives reinstalls and belongs to
+    // the user, so anything of theirs that happens to share a name is left
+    // alone rather than silently replaced.
+    static NSString *const marker = @"# iSH-AOK Workspace launcher -- generated, edits are overwritten";
+    NSArray<NSString *> *tools = @[@"motepad", @"filemanager", @"markdown", @"imageviewer",
+                                   @"videoplayer", @"audio", @"browser", @"llm",
+                                   @"filesystems", @"storage", @"monitor", @"networks",
+                                   @"status", @"settings", @"themes", @"launcher",
+                                   @"clock", @"info", @"diagnostics", @"sessions"];
+    for (NSString *tool in tools) {
+        NSURL *url = [binURL URLByAppendingPathComponent:
+            [NSString stringWithFormat:@"ws-%@", tool]];
+        NSString *existing = [NSString stringWithContentsOfURL:url
+                                                      encoding:NSUTF8StringEncoding error:NULL];
+        if (existing != nil && ![existing containsString:marker])
+            continue;   // somebody else's file of the same name; do not touch it
+        NSString *script = [NSString stringWithFormat:
+            @"#!/bin/sh\n"
+            @"%@\n"
+            @"# Opens the %@ applet in Workspace. Without a Workspace-hosted\n"
+            @"# session there is nothing to open into, so this says so and stops\n"
+            @"# rather than writing a request nobody will answer.\n"
+            @"case \"$(head -1 /proc/ish/workspace 2>/dev/null)\" in\n"
+            @"    hosted=1) ;;\n"
+            @"    *) echo \"${0##*/}: no Workspace is running\" >&2; exit 1 ;;\n"
+            @"esac\n"
+            @"if [ $# -gt 0 ]; then\n"
+            @"    # The bridge takes absolute paths only: by the time the request\n"
+            @"    # reaches the app, this shell's cwd means nothing to it.\n"
+            @"    case \"$1\" in /*) p=$1 ;; *) p=\"$PWD/$1\" ;; esac\n"
+            @"    printf 'open %@ %%s\\n' \"$p\" > /proc/ish/workspace\n"
+            @"else\n"
+            @"    printf 'open %@\\n' > /proc/ish/workspace\n"
+            @"fi\n", marker, tool, tool, tool];
+        NSError *writeError = nil;
+        if (![script writeToURL:url atomically:YES
+                       encoding:NSUTF8StringEncoding error:&writeError]) {
+            NSLog(@"Could not write Workspace launcher ws-%@: %@", tool, writeError);
+            continue;
+        }
+        chmod(url.fileSystemRepresentation, 0755);
+    }
 }
 
 static NSURL *AOKPersistDirectoryURL(void) {
@@ -2251,7 +2309,9 @@ static void PopCurrentTask(struct task *previousCurrent) {
     PopCurrentTask(previousCurrent);
 }
 
-+ (NSString *)defaultUserAccountName {
+// The whole /etc/passwd line for the ISHDefaultUserAccountUID account, split
+// on colons, or nil. One reader for both the name and the uid/gid pair below.
++ (NSArray<NSString *> *)defaultUserPasswdFields {
     struct task *previousCurrent = NULL;
     if (!PushInitTaskAsCurrent(&previousCurrent)) {
         PopCurrentTask(previousCurrent);
@@ -2278,9 +2338,74 @@ static void PopCurrentTask(struct task *previousCurrent) {
     for (NSString *line in [contents componentsSeparatedByString:@"\n"]) {
         NSArray<NSString *> *fields = [line componentsSeparatedByString:@":"];
         if (fields.count >= 3 && fields[2].integerValue == ISHDefaultUserAccountUID)
-            return fields[0];
+            return fields;
     }
     return nil;
+}
+
++ (NSString *)defaultUserAccountName {
+    return [self defaultUserPasswdFields].firstObject;
+}
+
++ (NSString *)headlessCommandAccountName {
+    if (!UserPreferences.shared.shouldLoginAsDefaultUser)
+        return nil;
+    NSString *accountName = [self defaultUserAccountName];
+    return accountName.length > 0 ? accountName : nil;
+}
+
++ (BOOL)headlessCommandAccountOwner:(NSInteger *)uid gid:(NSInteger *)gid {
+    if (!UserPreferences.shared.shouldLoginAsDefaultUser)
+        return NO;
+    NSArray<NSString *> *fields = [self defaultUserPasswdFields];
+    if (fields.count < 4 || fields[0].length == 0)
+        return NO;
+    if (uid) *uid = ISHDefaultUserAccountUID;
+    if (gid) *gid = fields[3].integerValue;
+    return YES;
+}
+
+// ---- Simulated swap: publishing the user's choice to the pager -------------
+//
+// docs/simulated_swap_plan.md section 3.13. Swap ships OFF and its size is the
+// user's choice, so this is the one place those two preferences reach the
+// pager. Both halves go across verbatim: swap_startup() in kernel/swap.c is
+// where "enabled with no size" is refused, and it prints why, so this side must
+// NOT quietly fold the pair into one flag -- a size the user never chose is
+// exactly what section 3.13 forbids inventing, and an enable silently
+// downgraded to "off" here would be indistinguishable from the pager having
+// failed to start.
+//
+// swap_set_preference only RECORDS. Nothing allocates, opens a file or starts a
+// thread until swap_startup() acts on it, which -boot does once, below, for the
+// launch that is actually going to run a guest. That is the whole reason this
+// can be called freely from a KVO observer: the observer's job is to make sure
+// the record is current before the next boot reads it, not to reconfigure a
+// running pager. Section 3.13 says settings take effect at the next launch, and
+// swap_enable()'s own contract is that changing the size means paging
+// everything back in first, so a live resize is deliberately not offered.
+//
+// -boot CALLS THIS ITSELF, and that call is the one that matters. The KVO
+// observer alone would be too late: the usual launch boots from
+// -application:willFinishLaunchingWithOptions:, which reaches +ensureBooted
+// before -application:didFinishLaunchingWithOptions: has run at all, so the
+// observer that the doEnableMulticore block sits beside does not yet exist when
+// the guest starts. Multicore does not care, because it is re-read
+// continuously; a launch-time decision read once by the pager does.
+//
+// The observer still earns its place, for the boots that happen later in a
+// process's life -- the first one after choosing a root, a scene connecting to
+// an app that had none, a Shortcuts intent waking a cold app -- and it publishes
+// SYNCHRONOUSLY rather than hopping to the main queue like its neighbours, so a
+// preference changed in the same turn as a boot cannot lose the race.
+static BOOL ISHPublishSwapConfiguration(NSInteger *outSizeMB) {
+    UserPreferences *prefs = UserPreferences.shared;
+    NSInteger sizeMB = prefs.swapSizeMB; // already clamped to 0...ISHSwapMaxSizeMB
+    BOOL enabled = prefs.shouldEnableSwap;
+    swap_set_preference(enabled ? true : false, (unsigned) sizeMB);
+    if (outSizeMB != NULL)
+        *outSizeMB = sizeMB;
+    return enabled;
 }
 
 static UIViewController *CreateRootSelectionViewController(void) {
@@ -2327,8 +2452,14 @@ static TerminalViewController *CreateTerminalViewController(void) {
 }
 
 - (intptr_t)boot {
-#if !ISH_LINUX
     [ISHDiagnosticsStore recordLaunchStage:@"boot.begin"];
+    // Record what the user asked of the pager before anything can start it.
+    // swap_startup() reads this, further down, once the boot is committed.
+    NSInteger swapSizeMB = 0;
+    BOOL swapEnabled = ISHPublishSwapConfiguration(&swapSizeMB);
+    [ISHDiagnosticsStore recordLaunchStage:@"boot.swap.configured"
+                                   details:@{@"enabled": @(swapEnabled),
+                                             @"sizeMB": @(swapSizeMB)}];
     NSString *defaultRoot = Roots.instance.defaultRoot;
     if (defaultRoot == nil) {
         return RecordBootFailure(_ENOENT,
@@ -2445,6 +2576,11 @@ static TerminalViewController *CreateTerminalViewController(void) {
     // puts a login on the console -- the condition only stat()s it; agetty
     // opens /dev/tty1. vconsole-setup stays skipped regardless (verified on
     // the CLI harness); a stray open of tty0 yields an unattached tty.
+    // The swap area as a block device, so /proc/swaps has a real path to name.
+    // The app builds /dev by hand and never reads dev_standard_nodes, so adding
+    // the row in fs/dev.c reaches the CLI and fresh devtmpfs mounts but NOT the
+    // main root the app ships -- this line is what puts it on a real device.
+    EnsureCharacterDevice("/dev/aokswap0", S_IFBLK|0660, dev_make(AOKSWAP_MAJOR, DEV_AOKSWAP_MINOR));
     EnsureCharacterDevice("/dev/tty0", S_IFCHR|0666, dev_make(TTY_CONSOLE_MAJOR, 0));
     EnsureCharacterDevice("/dev/tty1", S_IFCHR|0666, dev_make(TTY_CONSOLE_MAJOR, 1));
     EnsureCharacterDevice("/dev/tty2", S_IFCHR|0666, dev_make(TTY_CONSOLE_MAJOR, 2));
@@ -2463,6 +2599,13 @@ static TerminalViewController *CreateTerminalViewController(void) {
     EnsureCharacterDevice("/dev/full", S_IFCHR|0666, dev_make(MEM_MAJOR, DEV_FULL_MINOR));
     EnsureCharacterDevice("/dev/random", S_IFCHR|0666, dev_make(MEM_MAJOR, DEV_RANDOM_MINOR));
     EnsureCharacterDevice("/dev/urandom", S_IFCHR|0666, dev_make(MEM_MAJOR, DEV_URANDOM_MINOR));
+    EnsureCharacterDevice("/dev/fuse", S_IFCHR|0666, dev_make(MISC_MAJOR, DEV_FUSE_MINOR));
+    // The kernel log. The driver has always been here (fs/mem.c) but the node
+    // never was, so every syslog daemon that starts with "open the kernel log"
+    // failed on it -- busybox's klogd and rsyslog's imklog both read
+    // /dev/kmsg. Mode matches Linux's 1:11 node: world-readable, and writes
+    // are refused for everyone.
+    EnsureCharacterDevice("/dev/kmsg", S_IFCHR|0644, dev_make(MEM_MAJOR, DEV_KMSG_MINOR));
 
     // Android binder: /dev/binder, /dev/hwbinder, /dev/vndbinder. Each is a
     // separate context with its own service registry, which is why they are
@@ -2486,6 +2629,9 @@ static TerminalViewController *CreateTerminalViewController(void) {
     // after the two procfs files were made to agree. Adds a line only when
     // nothing declares "/" already; see kernel/init.c.
     ensure_root_fstab_entry();
+    // /dev/fd and the three std* links -- see kernel/init.c. Called from both
+    // here and the CLI so the two repair sets cannot drift apart again.
+    ensure_dev_fd_links();
 
     generic_mkdirat(AT_PWD, "/dev/pts", 0755);
 
@@ -2562,6 +2708,22 @@ static TerminalViewController *CreateTerminalViewController(void) {
     }
     EnsureCharacterDevice("/dev/location", S_IFCHR|0666, dev_make(DYN_DEV_MAJOR, DEV_LOCATION_MINOR));
 
+    // /dev/url: write a URL, iOS opens it. Registered like the others rather
+    // than exposed as a command, so it composes with redirection and needs no
+    // binary in the guest filesystem.
+    err = dyn_dev_register(&url_dev, DEV_CHAR, DYN_DEV_MAJOR, DEV_URL_MINOR);
+    if (err != 0) {
+        return RecordBootFailure(err,
+                                 @"boot.device.url.failed",
+                                 @"Boot failed while registering URL device",
+                                 @"The filesystem was mounted, but iSH-AOK could not register /dev/url.",
+                                 @"Restart iSH-AOK. If this repeats, open Diagnostics from recovery mode.",
+                                 @{@"root": defaultRoot,
+                                   @"guestABI": guestABI ?: @"",
+                                   @"path": @"/dev/url"});
+    }
+    EnsureCharacterDevice("/dev/url", S_IFCHR|0666, dev_make(DYN_DEV_MAJOR, DEV_URL_MINOR));
+
     err = dyn_dev_register((struct dev_ops *) &audio_dev, DEV_CHAR, DYN_DEV_MAJOR, DEV_DSP_MINOR);
     if (err != 0) {
         return RecordBootFailure(err,
@@ -2607,6 +2769,33 @@ static TerminalViewController *CreateTerminalViewController(void) {
             // layer by the app's own uid -- see MOUNT_ISH_SHARED_ (kernel/fs.h)
             // for why that means it needs to be forced world-writable rather
             // than relying on ordinary Unix ownership.
+            // bin/lib/etc, created empty on every launch so they are simply
+            // THERE to drop things into -- from the guest or from the Files
+            // app -- rather than something a user has to know to mkdir.
+            //
+            // /AOK/persist/bin is first on the default PATH (see the PATH in
+            // this file, main.c, DisplayViewController.m and kernel/init.c).
+            // Putting a user directory first is safe here in a way it is not
+            // for the SmallCLUE links: this one is EMPTY unless its owner puts
+            // something in it, so it shadows nothing by default.
+            //
+            // What makes it worth having: AOK selects the guest ABI from each
+            // ELF's own header, so an aarch64 binary runs under an i386 or
+            // riscv64 root just as happily -- verified. Combined with persist
+            // surviving root switches, a static binary dropped in here follows
+            // you across every rootfs you ever install.
+            for (NSString *sub in @[@"bin", @"lib", @"etc"]) {
+                NSURL *subURL = [aokPersistURL URLByAppendingPathComponent:sub isDirectory:YES];
+                NSError *subError = nil;
+                if (![NSFileManager.defaultManager createDirectoryAtURL:subURL
+                                           withIntermediateDirectories:YES
+                                                            attributes:nil
+                                                                 error:&subError] &&
+                        ![NSFileManager.defaultManager fileExistsAtPath:subURL.path])
+                    NSLog(@"Could not create /AOK/persist/%@: %@", sub, subError);
+            }
+            ISHWriteWorkspaceLaunchers([aokPersistURL
+                URLByAppendingPathComponent:@"bin" isDirectory:YES]);
             FixSharedDirectoryPermissions(aokPersistURL.fileSystemRepresentation);
             int persistMountErr = do_mount(&realfs, aokPersistURL.fileSystemRepresentation, "/AOK/persist", "", MOUNT_ISH_SHARED_);
             if (persistMountErr >= 0)
@@ -2880,6 +3069,31 @@ static TerminalViewController *CreateTerminalViewController(void) {
     // (real /sbin/init and the fake-init fallback). Docker-exported images ship both as
     // empty 0-byte files, which otherwise leaves the system with an empty hostname.
     ProvisionGuestHostFiles();
+    // Start the pager, if the user asked for one. This is the last point common
+    // to both init paths and the first at which the boot is committed -- every
+    // remaining failure is init's own -- which is what it wants: swap_startup()
+    // reserves the whole swap area up front, and a boot that gives up before
+    // this (no root, an unmountable filesystem, an empty boot command)
+    // should not leave a preallocated file behind it.
+    //
+    // Does nothing at all unless swap_set_preference() above said enabled with
+    // a size; that is the shipping default, and in it the guest sees byte-for-
+    // byte what it saw before any of this existed. Record what actually
+    // happened rather than what was asked for: swap_enabled() is read back
+    // AFTER the call, so an enable that failed to reserve its area shows up
+    // here as off instead of being reported as on because the preference said
+    // so (kernel/swap.c prints the errno as well).
+    // Start listening to the SYSTEM's memory pressure before the pager. This is
+    // the signal that actually predicts a jetsam kill on a small device -- the
+    // SE died with 382 MB of its own headroom unused while the machine had
+    // 40 MB free -- and it is also the only thing that leaves a breadcrumb in
+    // the log before the kill.
+    host_mem_pressure_start();
+    swap_startup();
+    [ISHDiagnosticsStore recordLaunchStage:@"boot.swap.started"
+                                   details:@{@"requested": @(swapEnabled),
+                                             @"requestedSizeMB": @(swapSizeMB),
+                                             @"running": @(swap_enabled())}];
     if (bootUsesNativeFakeInit) {
         FakeInitPrepareGuestRoot();
         err = StartFallbackConsoleSupervisor(command, argvCommand, argv, sizeof(argv), envpData);
@@ -2927,118 +3141,10 @@ static TerminalViewController *CreateTerminalViewController(void) {
         ISHAppGroupReleaseLock(rootLockFd);
     }
 
-#else
-    // On first launch, this will trigger the import of the default root. Make sure to do this before entering the kernel, because it needs to run something on the main thread, and that would deadlock.
-    [Roots instance];
-    NSArray<NSString *> *args = @[];
-    actuate_kernel([args componentsJoinedByString:@" "].UTF8String);
-#endif
     
     return 0;
 }
 
-#if ISH_LINUX
-const char *DefaultRootPath() {
-    return [Roots.instance rootUrl:Roots.instance.defaultRoot].fileSystemRepresentation;
-}
-
-static BOOL GuestHostnameFromFile(char *hostname, size_t size) {
-    if (size == 0)
-        return NO;
-
-    ssize_t len = linux_read_file("/etc/hostname", hostname, size - 1);
-    if (len <= 0)
-        return NO;
-
-    hostname[len] = '\0';
-    while (len > 0 && isspace((unsigned char) hostname[len - 1])) {
-        hostname[--len] = '\0';
-    }
-    size_t start = 0;
-    while (hostname[start] != '\0' && isspace((unsigned char) hostname[start])) {
-        start++;
-    }
-    if (start != 0) {
-        memmove(hostname, hostname + start, len - start + 1);
-    }
-    return hostname[0] != '\0';
-}
-
-static void EnsureGuestHostsEntry(const char *hostname) {
-    if (hostname == NULL || hostname[0] == '\0')
-        return;
-
-    struct task *previousCurrent;
-    if (!PushInitTaskAsCurrent(&previousCurrent))
-        return;
-
-    char hosts[8192];
-    ssize_t len = linux_read_file("/etc/hosts", hosts, sizeof(hosts) - 1);
-    NSMutableString *updatedHosts = nil;
-    BOOL hasHostname = NO;
-
-    if (len >= 0) {
-        hosts[len] = '\0';
-        NSString *existingHosts = [[NSString alloc] initWithBytes:hosts
-                                                           length:len
-                                                         encoding:NSUTF8StringEncoding];
-        if (existingHosts == nil) {
-            existingHosts = [[NSString alloc] initWithCString:hosts encoding:NSISOLatin1StringEncoding];
-        }
-        if (existingHosts != nil) {
-            NSArray<NSString *> *lines = [existingHosts componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet];
-            for (NSString *line in lines) {
-                NSString *content = [[line componentsSeparatedByString:@"#"] firstObject];
-                NSArray<NSString *> *fields = [content componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-                for (NSString *field in fields) {
-                    if ([field length] == 0)
-                        continue;
-                    if ([field isEqualToString:@(hostname)]) {
-                        hasHostname = YES;
-                        break;
-                    }
-                }
-                if (hasHostname)
-                    break;
-            }
-            updatedHosts = [existingHosts mutableCopy];
-        }
-    }
-
-    if (hasHostname)
-        goto out;
-
-    if (updatedHosts == nil) {
-        updatedHosts = [NSMutableString stringWithString:@"127.0.0.1\tlocalhost\n"];
-    } else if (![updatedHosts hasSuffix:@"\n"]) {
-        [updatedHosts appendString:@"\n"];
-    }
-    [updatedHosts appendFormat:@"127.0.1.1\t%s\n", hostname];
-
-    struct fd *fd = generic_open("/etc/hosts", O_WRONLY_ | O_CREAT_ | O_TRUNC_, 0644);
-    if (IS_ERR(fd)) {
-        NSLog(@"failed to write /etc/hosts: %d", PTR_ERR(fd));
-        goto out;
-    }
-    fd->ops->write(fd, updatedHosts.UTF8String, [updatedHosts lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
-    fd_close(fd);
-
-out:
-    PopCurrentTask(previousCurrent);
-}
-
-void SyncHostname(void) {
-    async_do_in_workqueue(^{
-        char hostname[256];
-        if (!GuestHostnameFromFile(hostname, sizeof(hostname))) {
-            if (gethostname(hostname, sizeof(hostname)) < 0)
-                return;
-        }
-        linux_sethostname(hostname);
-        EnsureGuestHostsEntry(hostname);
-    });
-}
-#endif
 
 - (NSData *)forwardDnsQuery:(const uint8_t *)queryBytes
                      length:(size_t)queryLength
@@ -3100,7 +3206,6 @@ void SyncHostname(void) {
 }
 
 - (void)stopLocalDnsServer {
-#if !ISH_LINUX
     int fd = self.localDnsServerFD;
     self.localDnsServerFD = -1;
     if (self.localDnsServerReadSource != nil) {
@@ -3110,13 +3215,9 @@ void SyncHostname(void) {
         close(fd);
     }
     self.localDnsServerRunning = NO;
-#endif
 }
 
 - (BOOL)ensureLocalDnsServer {
-#if ISH_LINUX
-    return NO;
-#else
     if (self.localDnsServerRunning && self.localDnsServerFD >= 0)
         return YES;
 
@@ -3166,11 +3267,9 @@ void SyncHostname(void) {
     [ISHDiagnosticsStore recordBreadcrumb:@"dns.localServer.started"
                                   details:@{@"address": @"127.0.0.1:53"}];
     return YES;
-#endif
 }
 
 - (void)configureDns {
-#if !ISH_LINUX
     [ISHDiagnosticsStore recordBreadcrumb:@"dns.configure.begin"];
     [self ensureLocalDnsServer];
     [self scheduleDnsRefresh:@"manual"];
@@ -3234,17 +3333,13 @@ void SyncHostname(void) {
         }
     }
 #endif
-#endif
 }
 
 - (void)refreshDnsConfiguration {
-#if !ISH_LINUX
     [self scheduleDnsRefresh:@"preference-change"];
-#endif
 }
 
 - (void)scheduleDnsRefresh:(NSString *)reason {
-#if !ISH_LINUX
     @synchronized (self) {
         if (self.dnsRefreshRunning) {
             self.dnsRefreshQueued = YES;
@@ -3258,11 +3353,9 @@ void SyncHostname(void) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         [self performDnsRefresh:reasonCopy];
     });
-#endif
 }
 
 - (void)performDnsRefresh:(NSString *)reason {
-#if !ISH_LINUX
     NSString *dnsSource = @"dnsinfo";
     NSMutableString *resolvConf = nil;
     BOOL customOverrideActive = NO;
@@ -3397,11 +3490,9 @@ void SyncHostname(void) {
     }
     PopCurrentTask(previousCurrent);
     [self finishDnsRefreshAndRescheduleIfNeeded:reason];
-#endif
 }
 
 - (void)finishDnsRefreshAndRescheduleIfNeeded:(NSString *)reason {
-#if !ISH_LINUX
     BOOL shouldReschedule = NO;
     @synchronized (self) {
         shouldReschedule = self.dnsRefreshQueued;
@@ -3412,7 +3503,6 @@ void SyncHostname(void) {
         NSString *nextReason = [NSString stringWithFormat:@"%@-coalesced", reason ?: @"dns"];
         [self scheduleDnsRefresh:nextReason];
     }
-#endif
 }
 
 + (intptr_t)bootError {
@@ -3473,12 +3563,6 @@ void SyncHostname(void) {
                                        details:bootCheckDetails];
     }
 
-#if ISH_LINUX
-    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillEnterForegroundNotification object:UIApplication.sharedApplication queue:nil usingBlock:^(NSNotification * _Nonnull note) {
-        SyncHostname();
-    }];
-    SyncHostname();
-#endif
 
     return YES;
 }
@@ -3501,13 +3585,32 @@ static UINavigationController *CreateAboutNavigationController(BOOL recoveryMode
                                    details:launchOptions.count != 0 ? @{@"launchOptions": launchOptions.description} : nil];
     [ISHDiagnosticsStore recordBreadcrumb:@"application.didFinishLaunching"
                                   details:launchOptions.count != 0 ? @{@"launchOptions": launchOptions.description} : nil];
+    // Re-donate the App Shortcuts phrases (app/ISHAppShortcuts.swift). Looked
+    // up at runtime rather than through the generated Swift header: that
+    // header belongs to the app target, and this file compiles earlier, in
+    // libiSH-AOKApp, where a __has_include would always be false. The class is
+    // absent below iOS 16 or if AppIntents wasn't available at build time.
+    Class appShortcutsBridge = NSClassFromString(@"ISHAppShortcutsBridge");
+    if ([appShortcutsBridge respondsToSelector:@selector(refreshAppShortcuts)])
+        [appShortcutsBridge performSelector:@selector(refreshAppShortcuts)];
     // get the network permissions popup to appear on chinese devices
     [[NSURLSession.sharedSession dataTaskWithURL:[NSURL URLWithString:@"http://captive.apple.com"]] resume];
+
+    // Extraction temp files outlive the process that wrote them. The cache
+    // that knows about them is in-memory only, so a previous run's copies are
+    // unreachable -- never reused, never deleted -- and NSTemporaryDirectory is
+    // purged by iOS on its own schedule, if at all. Reclaim them here, before
+    // anything has had a chance to extract. Bulk lane, dispatched async with no
+    // path claims: it neither holds launch nor orders against later work.
+    [ISHGuestFileBridge.sharedBridge clearExtractionCache];
+
+    // No-op unless ISH_BRIDGE_LANE_SELFTEST is set; it waits for the guest to
+    // come up on a queue of its own rather than holding launch.
+    ISHGuestFileBridgeRunSelfTestIfRequested();
 
     if ([NSUserDefaults.standardUserDefaults boolForKey:@"FASTLANE_SNAPSHOT"])
         [UIView setAnimationsEnabled:NO];
 
-#if !ISH_LINUX
     self.localDnsServerFD = -1;
     NSString *ishVersion = [NSString stringWithFormat:@"iSH-AOK %@ (%@)",
                          [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"],
@@ -3518,13 +3621,10 @@ static UINavigationController *CreateAboutNavigationController(BOOL recoveryMode
     extern void uts_set_boot_hostname(const char *hostname);
     extern bool doEnableMulticore;
     extern bool doEnableExtraLocking;
-    extern pthread_mutex_t multicore_lock;
-    extern pthread_mutex_t extra_lock;
     NSString *hostnameOverride = [NSUserDefaults.standardUserDefaults stringForKey:@"hostnameOverride"];
     if (hostnameOverride) {
         uts_set_boot_hostname(hostnameOverride.UTF8String);
     }
-#endif
     
     [UserPreferences.shared observe:@[@"shouldDisableDimming"] options:NSKeyValueObservingOptionInitial
                               owner:self usingBlock:^(typeof(self) self) {
@@ -3566,7 +3666,17 @@ static UINavigationController *CreateAboutNavigationController(BOOL recoveryMode
             doEnableExtraLocking = UserPreferences.shared.shouldEnableExtraLocking;
         });
     }];
-    
+    // Simulated swap. Both keys go to the same place; ISHPublishSwapConfiguration
+    // above says why this observer does NOT hop to the main queue the way its
+    // neighbours do, and why -boot publishes for itself as well. A change here
+    // is recorded for the next boot and does not reach a running pager -- swap
+    // is sized once at launch and is deliberately not resizable in place
+    // (docs/simulated_swap_plan.md section 3.13).
+    [UserPreferences.shared observe:@[@"shouldEnableSwap", @"swapSizeMB"] options:NSKeyValueObservingOptionInitial
+                              owner:self usingBlock:^(typeof(self) self) {
+        ISHPublishSwapConfiguration(NULL);
+    }];
+
         // This code is IPv4 and IPv6 aware: see https://developer.apple.com/library/archive/samplecode/Reachability/Listings/ReadMe_md.html.
     struct sockaddr_in address = {
         .sin_len = sizeof(address),
@@ -3758,10 +3868,18 @@ void ISHSuspendGuardEnterBackground(void) {
         } else {
             unsigned stragglers = 0;
             bool drained = fakefs_quiesce_begin(2000, &stragglers);
-            os_log(ISHSuspendLog(), "quiesced for suspension: drained=%{public}d straggling=%{public}u",
-                   drained, stragglers);
+            // The pager writes guest memory to a file, so it needs the same
+            // treatment and for the same reason: being mid-write when iOS
+            // freezes us is not a state to be in. It stops new EVICTION only --
+            // a fault already in flight has to finish, or the frame it is
+            // restoring stays PROT_NONE with its bytes only on disk. A no-op
+            // when swap is off, which is the default.
+            bool swapDrained = swap_quiesce_begin(2000);
+            os_log(ISHSuspendLog(), "quiesced for suspension: drained=%{public}d straggling=%{public}u swap=%{public}d",
+                   drained, stragglers, swapDrained);
             [ISHDiagnosticsStore recordBreadcrumb:@"application.fakefsQuiesced"
-                                          details:@{@"drained": @(drained), @"straggling": @(stragglers)}];
+                                          details:@{@"drained": @(drained), @"straggling": @(stragglers),
+                                                    @"swapDrained": @(swapDrained)}];
 
             // Never hold the gate open indefinitely.
             //
@@ -3780,6 +3898,7 @@ void ISHSuspendGuardEnterBackground(void) {
                                          (int64_t) (kISHQuiesceMaxHoldSeconds * NSEC_PER_SEC)),
                            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
                 fakefs_quiesce_end();
+                swap_quiesce_end();
                 os_log(ISHSuspendLog(), "still running after %{public}.0fs backgrounded; gate lifted",
                        kISHQuiesceMaxHoldSeconds);
             });
@@ -3791,6 +3910,7 @@ void ISHSuspendGuardEnterBackground(void) {
 void ISHSuspendGuardEnterForeground(void) {
     // Lift the gate before anything else: guest tasks may be parked on it.
     fakefs_quiesce_end();
+    swap_quiesce_end();
     ISHEndSuspendGuard();
 }
 
@@ -3810,8 +3930,4 @@ void ISHSuspendGuardEnterForeground(void) {
 
 @end
 
-#if !ISH_LINUX
 NSString *const ProcessExitedNotification = @"ProcessExitedNotification";
-#else
-NSString *const KernelPanicNotification = @"KernelPanicNotification";
-#endif

@@ -264,6 +264,15 @@ static inline int sock_type_to_real(int type, int protocol) {
 #define MSG_EOR_    0x80
 #define MSG_WAITALL_ 0x100
 #define MSG_ERRQUEUE_ 0x2000
+// Suppress SIGPIPE for this send only. Nothing is passed to the host: host
+// SIGPIPE is already SIG_IGN process-wide (kernel/init.c), and Darwin has no
+// MSG_NOSIGNAL anyway. What it controls is whether the GUEST gets the signal,
+// which is decided when the host errno is mapped -- see errno_map_flags().
+#define MSG_NOSIGNAL_ 0x4000
+// recvmsg only: mark every fd received through SCM_RIGHTS close-on-exec. It
+// exists because there is no race-free way to do it afterwards -- an exec
+// between the recvmsg and the fcntl leaks the descriptor.
+#define MSG_CMSG_CLOEXEC_ 0x40000000
 
 static inline int sock_flags_to_real(int fake) {
     int real = 0;
@@ -274,7 +283,7 @@ static inline int sock_flags_to_real(int fake) {
     if (fake & MSG_DONTWAIT_) real |= MSG_DONTWAIT;
     if (fake & MSG_EOR_) real |= MSG_EOR;
     if (fake & MSG_WAITALL_) real |= MSG_WAITALL;
-    if (fake & ~(MSG_OOB_|MSG_PEEK_|MSG_CTRUNC_|MSG_TRUNC_|MSG_DONTWAIT_|MSG_EOR_|MSG_WAITALL_|MSG_ERRQUEUE_))
+    if (fake & ~(MSG_OOB_|MSG_PEEK_|MSG_CTRUNC_|MSG_TRUNC_|MSG_DONTWAIT_|MSG_EOR_|MSG_WAITALL_|MSG_ERRQUEUE_|MSG_NOSIGNAL_))
         TRACE("unimplemented socket flags %d\n", fake);
     return real;
 }
@@ -312,7 +321,10 @@ static inline int sock_flags_from_real(int real) {
 #define NETLINK_EXT_ACK_ 11
 #define NETLINK_GET_STRICT_CHK_ 12
 
+#define SO_DEBUG_ 1
 #define SO_REUSEADDR_ 2
+#define SO_DONTROUTE_ 5
+#define SO_OOBINLINE_ 10
 #define SO_TYPE_ 3
 #define SO_ERROR_ 4
 #define SO_BROADCAST_ 6
@@ -328,11 +340,25 @@ static inline int sock_flags_from_real(int real) {
 #define SO_RCVTIMEO_OLD_ 20
 #define SO_SNDTIMEO_OLD_ 21
 #define SO_BINDTODEVICE_ 25
+#define SO_PEEK_OFF_ 42
+#define SO_INCOMING_CPU_ 49
+#define SO_ZEROCOPY_ 60
+#define SO_TIMESTAMPING_ 37
 #define SO_BINDTOIFINDEX_ 62
 #define SO_ATTACH_FILTER_ 26
 #define SO_DETACH_FILTER_ 27
 #define SO_TIMESTAMP_ 29
 #define SO_ACCEPTCONN_ 30
+// Linux SOL_SOCKET options with no Darwin equivalent. Accepted and remembered
+// rather than refused: ENOPROTOOPT here is a state real Linux never produces,
+// and a program tuning a socket sees an error where every Linux gives success.
+// Same treatment tcp_syncnt and friends already get.
+#define SO_NO_CHECK_ 11
+#define SO_PRIORITY_ 12
+#define SO_TIMESTAMPNS_ 35
+#define SO_MARK_ 36
+#define SO_BUSY_POLL_ 46
+
 #define SO_PEERSEC_ 31
 #define SO_SNDBUFFORCE_ 32
 #define SO_RCVBUFFORCE_ 33
@@ -357,6 +383,16 @@ static inline int sock_flags_from_real(int real) {
 #define IP_MTU_ 14
 #define IP_RECVTOS_ 13
 #define TCP_NODELAY_ 1
+#define TCP_MAXSEG_ 2
+#define TCP_CORK_ 3
+#define TCP_KEEPIDLE_ 4
+#define TCP_KEEPINTVL_ 5
+#define TCP_KEEPCNT_ 6
+#define TCP_QUICKACK_ 12
+#define TCP_SYNCNT_ 7
+#define TCP_LINGER2_ 8
+#define TCP_WINDOW_CLAMP_ 10
+#define TCP_USER_TIMEOUT_ 18
 #define TCP_DEFER_ACCEPT_ 9
 #define TCP_INFO_ 11
 #define TCP_CONGESTION_ 13
@@ -371,6 +407,46 @@ static inline int sock_flags_from_real(int real) {
 #define IPV6_RECVPKTINFO_ 49
 #define IPV6_TCLASS_ 67
 #define ICMP6_FILTER_ 1
+
+// Options whose value Linux always reports as exactly 0 or 1. BSD returns the
+// masked option bit out of so_options instead -- SO_REUSEADDR reads back as 4,
+// SO_KEEPALIVE as 8, SO_BROADCAST as 32, SO_REUSEPORT as 512, TCP_NODELAY as
+// 4 -- so a guest doing the very ordinary `if (val == 1)` sees false for an
+// option it just enabled.
+static inline bool sock_opt_is_boolean(int fake, int level) {
+    switch (level) {
+        case SOL_SOCKET_: switch (fake) {
+            case SO_DEBUG_:
+            case SO_REUSEADDR_:
+            case SO_DONTROUTE_:
+            case SO_BROADCAST_:
+            case SO_KEEPALIVE_:
+            case SO_OOBINLINE_:
+            case SO_REUSEPORT_:
+            case SO_ACCEPTCONN_:
+            case SO_TIMESTAMP_:
+            case SO_PASSCRED_:
+                return true;
+        } break;
+        case IPPROTO_TCP: switch (fake) {
+            case TCP_NODELAY_:
+            case TCP_CORK_:
+            case TCP_QUICKACK_:
+                return true;
+        } break;
+        case IPPROTO_IP: switch (fake) {
+            case IP_HDRINCL_:
+            case IP_RECVTTL_:
+            case IP_RECVTOS_:
+                return true;
+        } break;
+        case IPPROTO_IPV6: switch (fake) {
+            case IPV6_V6ONLY_:
+                return true;
+        } break;
+    }
+    return false;
+}
 
 static inline int sock_opt_to_real(int fake, int level) {
     switch (level) {
@@ -390,6 +466,9 @@ static inline int sock_opt_to_real(int fake, int level) {
 #endif
             case SO_TIMESTAMP_: return SO_TIMESTAMP;
             case SO_ACCEPTCONN_: return SO_ACCEPTCONN;
+            case SO_DEBUG_: return SO_DEBUG;
+            case SO_DONTROUTE_: return SO_DONTROUTE;
+            case SO_OOBINLINE_: return SO_OOBINLINE;
             case SO_RCVTIMEO_OLD_:
             case SO_RCVTIMEO_: return SO_RCVTIMEO;
             case SO_SNDTIMEO_OLD_:
@@ -397,7 +476,31 @@ static inline int sock_opt_to_real(int fake, int level) {
         } break;
         case IPPROTO_TCP: switch (fake) {
             case TCP_NODELAY_: return TCP_NODELAY;
-            case TCP_DEFER_ACCEPT_: return 0; // unimplemented
+            case TCP_MAXSEG_: return TCP_MAXSEG;
+#ifdef TCP_NOPUSH
+            // Darwin spells Linux's TCP_CORK TCP_NOPUSH; same semantics
+            // (hold partial segments back until it is cleared).
+            case TCP_CORK_: return TCP_NOPUSH;
+#elif defined(TCP_CORK)
+            case TCP_CORK_: return TCP_CORK;
+#endif
+#ifdef TCP_KEEPALIVE
+            // Darwin's TCP_KEEPALIVE is idle-time-before-first-probe in
+            // seconds, which is exactly Linux's TCP_KEEPIDLE.
+            case TCP_KEEPIDLE_: return TCP_KEEPALIVE;
+#elif defined(TCP_KEEPIDLE)
+            case TCP_KEEPIDLE_: return TCP_KEEPIDLE;
+#endif
+#ifdef TCP_KEEPINTVL
+            case TCP_KEEPINTVL_: return TCP_KEEPINTVL;
+#endif
+#ifdef TCP_KEEPCNT
+            case TCP_KEEPCNT_: return TCP_KEEPCNT;
+#endif
+            // NOT 0: that is a valid option number, so returning it sent the
+            // host a setsockopt for TCP option 0 instead of reporting the
+            // option unmapped. -1 is what the callers test for.
+            case TCP_DEFER_ACCEPT_: return -1; // handled in fs/sock.c
 #if defined(__linux__)
             case TCP_INFO_: return TCP_INFO;
             case TCP_CONGESTION_: return TCP_CONGESTION;
@@ -452,6 +555,26 @@ static inline int sock_opt_to_real(int fake, int level) {
 #define IPV6_MULTICAST_LOOP_ 19
 #define IPV6_ADD_MEMBERSHIP_ 20
 #define IPV6_DROP_MEMBERSHIP_ 21
+
+// Levels this kernel implements. Needed because sock_level_to_real passes an
+// unknown level straight through, so "no mapping" cannot mean "unknown level"
+// -- the option lookup would fail first and report the wrong errno for it.
+// Linux distinguishes the two, and asymmetrically: an unknown LEVEL is
+// EOPNOTSUPP to getsockopt and ENOPROTOOPT to setsockopt, while an unknown
+// OPTION at a known level is ENOPROTOOPT to both.
+static inline bool sock_level_is_known(int fake) {
+    switch (fake) {
+        case SOL_SOCKET_:
+        case IPPROTO_TCP:
+        case IPPROTO_IP:
+        case IPPROTO_IPV6:
+        case IPPROTO_ICMPV6:
+        case IPPROTO_UDP:
+        case SOL_NETLINK_:
+            return true;
+    }
+    return false;
+}
 
 static inline int sock_level_to_real(int fake) {
     if (fake == SOL_SOCKET_)

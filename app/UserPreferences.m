@@ -10,11 +10,6 @@
 #include "jit/jit.h"
 #include "task.h"
 
-// Helpers for cleanup when extra locking is disabled.
-extern bool doEnableExtraLocking;
-extern lock_t pids_lock;
-extern struct list alive_pids_list;
-
 // IMPORTANT: If you add a constant here and expose it via UserPreferences,
 // consider if it also needs to be exposed as a friendly preference and included
 // in the KVO list below. (In most circumstances, the answer is "yes".)
@@ -37,6 +32,8 @@ static NSString *const kPreferenceEnableHLEKey = @"Enable HLE Accel";
 static NSString *const kPreferenceEnableCryptoAccelKey = @"Enable Crypto Accel";
 static NSString *const kPreferenceEnablePixAccelKey = @"Enable Pixman Accel";
 static NSString *const kPreferenceEnableExtraLockingKey = @"Enable Additional Locking";
+static NSString *const kPreferenceEnableSwapKey = @"Enable Swap";
+static NSString *const kPreferenceSwapSizeMBKey = @"Swap Size MB";
 static NSString *const kPreferenceEnableLLMClientKey = @"Enable LLM Client";
 static NSString *const kPreferenceLLMProviderKey = @"LLM Provider";
 static NSString *const kPreferenceLLMServerURLKey = @"LLM Server URL";
@@ -49,6 +46,7 @@ static NSString *const kPreferenceLLMToolTimeoutSecondsKey = @"LLM Tool Timeout 
 static NSString *const kPreferenceLLMToolOutputLimitKBKey = @"LLM Tool Output Limit KB";
 static NSString *const kPreferenceLLMToolMaxRoundsKey = @"LLM Tool Max Rounds";
 static NSString *const kPreferenceLLMHideThinkingKey = @"LLM Hide Thinking";
+static NSString *const kPreferenceShortcutsRunCommandsEnabledKey = @"Shortcuts Run Commands Enabled";
 static NSString *const kPreferenceCustomDnsServersKey = @"Custom DNS Servers";
 
 NSString *const kPreferenceLaunchCommandKey = @"Init Command";
@@ -62,6 +60,7 @@ static NSArray<NSString *> *ISHDefaultBootCommand(void);
 static NSString *const kPreferenceLoginAsDefaultUserKey = @"Login As Default User";
 
 const int ISHDefaultUserAccountUID = 1000;
+const NSInteger ISHSwapMaxSizeMB = 16384;
 static NSString *const kPreferenceCursorStyleKey = @"Cursor Style";
 static NSString *const kPreferenceBlinkCursorKey = @"Blink Cursor";
 NSString *const kPreferenceHideStatusBarKey = @"Status Bar";
@@ -72,7 +71,6 @@ NSDictionary<NSString *, NSString *> *friendlyPreferenceMapping;
 NSDictionary<NSString *, NSString *> *friendlyPreferenceReverseMapping;
 NSDictionary<NSString *, NSString *> *kvoProperties;
 
-extern bool doEnableMulticore;
 static NSString *const kSystemMonospacedFontName = @"ui-monospace";
 
 @interface UserPreferences ()
@@ -175,14 +173,6 @@ void amd64_jit_preference_set(bool enabled) {
 }
 
 // TODO: Move these to Linux
-#if ISH_LINUX
-char **(*get_all_defaults_keys)(void);
-char *(*get_friendly_name)(const char *name);
-char *(*get_underlying_name)(const char *name);
-bool (*get_user_default)(const char *name, char **buffer, size_t *size);
-bool (*set_user_default)(const char *name, char *buffer, size_t size);
-bool (*remove_user_default)(const char *name);
-#endif
 
 @implementation UserPreferences {
     NSUserDefaults *_defaults;
@@ -207,6 +197,14 @@ bool (*remove_user_default)(const char *name);
             kPreferenceEnableCryptoAccelKey: @(NO),
             kPreferenceEnablePixAccelKey: @(NO),
             kPreferenceEnableExtraLockingKey: @(YES),
+            // Simulated swap is off, and has no size, until the user asks for
+            // both (docs/simulated_swap_plan.md section 3.13). @(0) here is not
+            // a size default -- it is the "no size chosen" marker, and it is
+            // registered rather than left absent so that the key shows up in
+            // /proc/ish/defaults and in the iOS Settings pane with an honest
+            // value instead of an empty one.
+            kPreferenceEnableSwapKey: @(NO),
+            kPreferenceSwapSizeMBKey: @(0),
             kPreferenceEnableLLMClientKey: @(NO),
             kPreferenceLLMProviderKey: @"OpenRouter Free",
             kPreferenceLLMServerURLKey: @"https://openrouter.ai/api/v1",
@@ -219,6 +217,7 @@ bool (*remove_user_default)(const char *name);
             kPreferenceLLMToolOutputLimitKBKey: @(64),
             kPreferenceLLMToolMaxRoundsKey: @(20),
             kPreferenceLLMHideThinkingKey: @(YES),
+            kPreferenceShortcutsRunCommandsEnabledKey: @(YES),
             kPreferenceFontSizeKey: @(12),
             // 1 = the height hterm measures, i.e. exactly what every build
             // before this one did. Nobody's terminal moves until they ask.
@@ -229,7 +228,28 @@ bool (*remove_user_default)(const char *name);
             kPreferenceDisableDimmingKey: @(NO),
             kPreferenceLaunchCommandKey: ISHDefaultLaunchCommand(),
             kPreferenceBootCommandKey: ISHDefaultBootCommand(),
-            kPreferenceInitialWindowKey: @"terminal",
+            // The SESSION SHELL, not the console, and that is what makes a
+            // freshly installed rootfs usable at all.
+            //
+            // "Terminal (tty1)" shows the console, where init has a getty
+            // running -- so it is a `login:` prompt, and on a fresh install
+            // root has no password to give it. On Devuan 6 that is a dead end:
+            // util-linux login plus PAM answers "Login incorrect" to every
+            // attempt, including an empty one, because /etc/shadow's root
+            // field is `*` and no password matches `*`. Alpine happens to
+            // escape it -- busybox login lets root straight in -- which is why
+            // this went unnoticed.
+            //
+            // The session shell is a pty the app starts itself with the launch
+            // command, /bin/login -f root, which authenticates nothing and so
+            // works on any rootfs. It is already running in "Terminal" mode;
+            // the app just was not showing it.
+            //
+            // This changes the default only. Anyone who has explicitly chosen
+            // "Terminal (tty1)" keeps it -- registerDefaults supplies a value
+            // only for an ABSENT key -- and tty1 itself is worth fixing
+            // separately, which tools/build-devuan-minirootfs.sh now does.
+            kPreferenceInitialWindowKey: @"session-shell",
             kPreferenceBlinkCursorKey: @(NO),
             kPreferenceCursorStyleKey: @(CursorStyleBlock),
             kPreferenceHideStatusBarKey: @(NO),
@@ -268,6 +288,8 @@ bool (*remove_user_default)(const char *name);
             @"enable_crypto_accel": kPreferenceEnableCryptoAccelKey,
             @"enable_pix_accel": kPreferenceEnablePixAccelKey,
             @"enable_extralocking": kPreferenceEnableExtraLockingKey,
+            @"enable_swap": kPreferenceEnableSwapKey,
+            @"swap_size_mb": kPreferenceSwapSizeMBKey,
             @"caps_lock_mapping": kPreferenceCapsLockMappingKey,
             @"option_mapping": kPreferenceOptionMappingKey,
             @"backtick_mapping_escape": kPreferenceBacktickEscapeKey,
@@ -291,6 +313,7 @@ bool (*remove_user_default)(const char *name);
             @"llm_tool_output_limit_kb": kPreferenceLLMToolOutputLimitKBKey,
             @"llm_tool_max_rounds": kPreferenceLLMToolMaxRoundsKey,
             @"llm_hide_thinking": kPreferenceLLMHideThinkingKey,
+            @"shortcuts_run_commands": kPreferenceShortcutsRunCommandsEnabledKey,
             @"launch_command": kPreferenceLaunchCommandKey,
             @"boot_command": kPreferenceBootCommandKey,
             @"login_as_default_user": kPreferenceLoginAsDefaultUserKey,
@@ -314,6 +337,8 @@ bool (*remove_user_default)(const char *name);
             kPreferenceEnableCryptoAccelKey: property(shouldEnableCryptoAccel),
             kPreferenceEnablePixAccelKey: property(shouldEnablePixAccel),
 	        kPreferenceEnableExtraLockingKey: property(shouldEnableExtraLocking),
+            kPreferenceEnableSwapKey: property(shouldEnableSwap),
+            kPreferenceSwapSizeMBKey: property(swapSizeMB),
             kPreferenceCapsLockMappingKey: property(capsLockMapping),
             kPreferenceOptionMappingKey: property(optionMapping),
             kPreferenceBacktickEscapeKey: property(backtickMapEscape),
@@ -339,6 +364,7 @@ bool (*remove_user_default)(const char *name);
             kPreferenceLLMToolOutputLimitKBKey: property(llmToolOutputLimitKB),
             kPreferenceLLMToolMaxRoundsKey: property(llmToolMaxRounds),
             kPreferenceLLMHideThinkingKey: property(llmHideThinking),
+            kPreferenceShortcutsRunCommandsEnabledKey: property(shortcutsRunCommandsEnabled),
             kPreferenceCustomDnsServersKey: property(customDnsServers),
             kPreferenceLaunchCommandKey: property(launchCommand),
             kPreferenceBootCommandKey: property(bootCommand),
@@ -711,6 +737,19 @@ bool (*remove_user_default)(const char *name);
     return [*value isKindOfClass:NSNumber.class];
 }
 
+// MARK: shortcutsRunCommandsEnabled
+- (BOOL)shortcutsRunCommandsEnabled {
+    return [_defaults boolForKey:kPreferenceShortcutsRunCommandsEnabledKey];
+}
+
+- (void)setShortcutsRunCommandsEnabled:(BOOL)shortcutsRunCommandsEnabled {
+    [_defaults setBool:shortcutsRunCommandsEnabled forKey:kPreferenceShortcutsRunCommandsEnabledKey];
+}
+
+- (BOOL)validateShortcutsRunCommandsEnabled:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSNumber.class];
+}
+
 // MARK: llmToolTimeoutSeconds
 - (NSInteger)llmToolTimeoutSeconds {
     return [_defaults integerForKey:kPreferenceLLMToolTimeoutSecondsKey];
@@ -838,13 +877,66 @@ bool (*remove_user_default)(const char *name);
 }
 
 - (BOOL)validateShouldEnableExtraLocking:(id *)value error:(NSError **)error {
-    // Toggling this at runtime still needs coordinated cleanup of active tasks.
-    if(doEnableExtraLocking == true) {
-//        complex_lockt(&pids_lock, 0, __FILE__, __LINE__);
- //       zero_critical_regions_count();
-  //      unlock(&pids_lock);
-    }
+    // Note: doEnableExtraLocking no longer gates anything in the kernel -- the
+    // reference counts it used to switch off are maintained unconditionally
+    // (see task_ref_cnt_mod). Flipping it at runtime is a no-op; any future
+    // use would need coordinated cleanup of active tasks.
     return [*value isKindOfClass:NSNumber.class];
+}
+
+// MARK: shouldEnableSwap
+//
+// Simulated swap, docs/simulated_swap_plan.md section 3.13. OFF is the shipping
+// state and the registered default, not a staging step: with it off the guest
+// must see byte-for-byte what it sees today, and nothing may allocate, open a
+// file or start a thread on its behalf.
+- (BOOL)shouldEnableSwap {
+    return [_defaults boolForKey:kPreferenceEnableSwapKey];
+}
+
+- (void)setShouldEnableSwap:(BOOL)shouldEnableSwap {
+    [_defaults setBool:shouldEnableSwap forKey:kPreferenceEnableSwapKey];
+}
+
+- (BOOL)validateShouldEnableSwap:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSNumber.class];
+}
+
+// MARK: swapSizeMB
+//
+// Clamped on the way OUT as well as in, for the same reason the launch command
+// is sanitized on the way out: the setter is not the only writer. The iOS
+// Settings pane (app/Settings.bundle/Root.plist) writes this key into
+// NSUserDefaults with none of our code running, and so does anything else that
+// edits the domain directly -- a `defaults write` in the Simulator, a managed
+// configuration, a value left behind by a build whose ceiling was higher. A
+// stored 2^40 would otherwise be handed to the pager's preallocation as a real
+// request. (The guest's own route, /proc/ish/defaults/swap_size_mb, does reach
+// the setter and the validator: set_user_default_impl above looks the key up in
+// kvoProperties and goes through the property.)
+//
+// 0 is "no size chosen", which is not the same as a small swap area: it keeps
+// swap off however shouldEnableSwap reads. Section 3.13 is explicit that there
+// is to be no size derived from device RAM or free disk, so there is no value
+// to fall back to and the honest answer is to stay off until asked.
+- (NSInteger)swapSizeMB {
+    NSInteger value = [_defaults integerForKey:kPreferenceSwapSizeMBKey];
+    return MIN(MAX(value, (NSInteger)0), ISHSwapMaxSizeMB);
+}
+
+- (void)setSwapSizeMB:(NSInteger)swapSizeMB {
+    [_defaults setInteger:MIN(MAX(swapSizeMB, (NSInteger)0), ISHSwapMaxSizeMB)
+                   forKey:kPreferenceSwapSizeMBKey];
+}
+
+- (BOOL)validateSwapSizeMB:(id *)value error:(NSError **)error {
+    if (![*value isKindOfClass:NSNumber.class]) {
+        return NO;
+    }
+    // Reject rather than clamp, so a guest script that asks for a size this
+    // build will not honour is told so instead of silently getting 16 GiB.
+    NSInteger _value = [(NSNumber *)(*value) integerValue];
+    return _value >= 0 && _value <= ISHSwapMaxSizeMB;
 }
 
 // MARK: shouldLoginAsDefaultUser

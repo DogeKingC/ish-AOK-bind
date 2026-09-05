@@ -35,10 +35,21 @@ struct fd {
             // links together fds pointing to the same tty
             // locked by the tty
             struct list tty_other_fds;
+            // tty->hangup_gen as it was when this descriptor was opened.
+            // Differing from the tty's current value means a hangup happened
+            // after this open, and only then does this fd see EIO.
+            unsigned tty_hangup_gen;
         };
         struct {
             struct poll *poll;
         } epollfd;
+        // /proc/<pid>/ns/<type>. Only an index into fs/proc/pid.c's
+        // proc_ns_types, because AOK has exactly one namespace of each type
+        // and the fd's whole identity is which type it names. Read by the
+        // nsfs ioctls (NS_GET_NSTYPE and friends).
+        struct {
+            unsigned type_index;
+        } nsfs;
         struct {
             uint64_t val;
             bool semaphore; // EFD_SEMAPHORE: read returns 1 and decrements by 1
@@ -89,6 +100,12 @@ struct fd {
             bool unix_initctl_sink;
             bool reuseaddr;
             bool reuseport;
+            // euid at bind() time. SO_REUSEPORT lets several sockets share a
+            // port, and Linux requires every member of the group to have the
+            // same effective uid -- otherwise any user could join a root
+            // daemon's port and take its connections. Only meaningful once
+            // the socket is bound.
+            uid_t_ bind_euid;
             bool listening; // listen() called: SO_ACCEPTCONN (Darwin can't report it)
             // The host description is kept nonblocking whenever a guest call
             // that may block has run on it, so no guest task can ever wedge
@@ -127,6 +144,75 @@ struct fd {
             uint32_t icmp6_filter[8];
             dword_t tcp_defer_accept;
             char tcp_congestion[16];
+            // Linux accepts these unconditionally and BSD has no equivalent
+            // knob. Returning ENOPROTOOPT is a state real Linux never produces
+            // -- a program tuning a connection sees an error where every Linux
+            // gives success -- so the value is kept and reported back, the same
+            // way tcp_defer_accept above already is. They are advisory
+            // (retry/timeout/window hints), so a host stack that does not act
+            // on them degrades gracefully; TCP_USER_TIMEOUT is the one with
+            // real teeth, and a connection simply keeps Darwin's own timeout.
+            dword_t tcp_syncnt;
+            dword_t tcp_linger2;
+            dword_t tcp_window_clamp;
+            dword_t tcp_user_timeout;
+            dword_t tcp_quickack;
+            dword_t tcp_maxseg;
+            dword_t tcp_fastopen;
+            bool tcp_quickack_set;
+
+            // SOL_SOCKET options Darwin has no knob for, kept so the get
+            // reports what the set was given (see fs/sock.h).
+            dword_t so_priority;
+            dword_t so_mark;
+            dword_t so_busy_poll;
+            bool so_no_check;
+            bool so_timestampns;
+            // SO_INCOMING_CPU reports which CPU last received on this
+            // socket. Linux answers -1 until one has, and AOK never steers by
+            // CPU, so -1 is the honest and permanent answer -- a state real
+            // Linux produces for every socket that has not received yet. A
+            // value the guest sets is kept and reported back, as Linux does
+            // (there it is a hint for SO_REUSEPORT group selection, which a
+            // stack is free to ignore).
+            dword_t so_incoming_cpu;
+            // SO_PEEK_OFF, but only ever a value that asks for nothing: -1
+            // (disabled) or 0 (peek from the front, which is what AOK does).
+            // A positive offset is refused rather than stored -- see
+            // sys_setsockopt_guest_abi.
+            dword_t so_peek_off;
+            // IP_RETOPTS: whether to attach received IP options to messages.
+            // Darwin cannot deliver them, but the flag itself round-trips --
+            // ping reads it back after setting it.
+            bool ip_retopts;
+            // SO_RCVBUF/SO_SNDBUF as LINUX reports them, once the guest has
+            // set one. Linux stores twice what you ask for (the second half
+            // is its own bookkeeping overhead) with a floor and a cap, and
+            // getsockopt returns that doubled number -- so a program that
+            // sets 8192 and reads back 8192 concludes its request was
+            // silently truncated. Untouched until a set arrives, so the
+            // default keeps coming from the host and stays whatever the host
+            // stack chose.
+            dword_t so_rcvbuf;
+            dword_t so_sndbuf;
+            bool so_rcvbuf_set;
+            bool so_sndbuf_set;
+            // SO_BINDTODEVICE: the interface name this socket was bound to,
+            // empty when it never was. Reported back by getsockopt, which is
+            // what a caller checks after setting it.
+            char so_bindtodevice[16];
+
+            // A TCP bind() that has NOT been handed to the host yet. Linux
+            // refuses connections to a bound-but-not-listening socket (RST);
+            // Darwin silently drops the SYN, so the client hangs for ~8s
+            // instead of getting ECONNREFUSED. Holding the port is what causes
+            // that, so it is not held until listen() or connect() needs it.
+            // The address is kept here so getsockname can still answer.
+            bool bind_deferred;
+            // Raw bytes rather than struct sockaddr_max_: fs/fd.h does not
+            // include fs/sock.h, and this only ever travels back to bind().
+            char deferred_addr[128];
+            uint_t deferred_addr_len;
 
             // Guest-loopback NAT (fs/sock.c inet_nat_*): when a guest
             // bind() asks for a loopback endpoint the host can't provide
@@ -202,6 +288,13 @@ struct fd {
             struct list mountinfo_link;
         } proc;
         struct {
+            // Open /dev/kmsg fds, linked into the global kernel-log watch
+            // list (fs/mem.c) so a newly logged line can poll_wakeup them --
+            // `dmesg --follow` and systemd-journald both epoll this rather
+            // than sitting in a blocking read.
+            struct list link;
+        } kmsg;
+        struct {
             int num;
         } devpts;
         struct {
@@ -215,8 +308,16 @@ struct fd {
 
     // fs/inode data
     struct mount *mount;
+    // The mount flags in force when this fd was opened. Not mount->flags: for
+    // a bind, `mount` is the ORIGIN it aliases and carries the origin's flags,
+    // while ro/nosuid/nodev/noexec belong to the bind. See
+    // find_mount_and_trim_path_flags.
+    int mount_flags;
     int real_fd; // seeks on this fd require the lock TODO think about making a special lock just for that
     bool realfs_fifo_had_data;
+    // Whether the setuid/setgid strip on first write has already been done for
+    // this descriptor. See file_remove_privs in kernel/fs.c.
+    bool privs_checked;
     DIR *dir;
     struct inode_data *inode;
     ino_t fake_inode;
@@ -226,6 +327,16 @@ struct fd {
     // these are used for a variety of things related to the fd
     lock_t lock;
     cond_t cond;
+
+    // Serializes getdents on this descriptor. A directory read is a
+    // read-modify-write of the stream position -- tell, read, tell -- and two
+    // threads sharing the fd interleaved it, so entries came back twice and
+    // others were skipped entirely. Linux holds f_pos_lock across the whole
+    // call for exactly this.
+    //
+    // Separate from `lock` above because tmpfs_readdir takes that one itself
+    // to guard its own dir_pos, and this has to wrap the readdir call.
+    lock_t dir_pos_lock;
 };
 
 typedef sdword_t fd_t;
@@ -268,6 +379,15 @@ static inline byte_t dir_entry_type_for_mode(mode_t_ mode) {
 #define LSEEK_SET 0
 #define LSEEK_CUR 1
 #define LSEEK_END 2
+// SEEK_DATA/SEEK_HOLE. A filesystem is always allowed to report that a file
+// has no holes -- that is what a fully-allocated file looks like, and it is
+// the answer the generic path gives: DATA is wherever you already are, and
+// the only HOLE is the implicit one at EOF. Returning EINVAL instead told
+// callers the file was not seekable that way at all, and tools that use them
+// to copy sparsely (cp --sparse, tar, rsync, systemd-journald's compaction)
+// fall back to a whole-file scan or fail outright.
+#define LSEEK_DATA 3
+#define LSEEK_HOLE 4
 
 struct fd_ops {
     // required for files
@@ -294,6 +414,20 @@ struct fd_ops {
 
     // map the file
     int (*mmap)(struct fd *fd, struct mem *mem, page_t start, pages_t pages, off_t offset, int prot, int flags);
+    // Fetch whatever ->mmap will need for [offset, offset+len) BEFORE the
+    // address space is locked, and report any error that fetch produces.
+    //
+    // ->mmap itself runs under the address-space WRITE lock with the
+    // process's other threads quiesced, so a filesystem whose bytes live
+    // outside the kernel cannot go and get them there: it would freeze every
+    // sibling thread for the duration, and deadlock outright when the thread
+    // it is waiting on is one of them -- which is exactly the shape of a
+    // program that mounts a FUSE filesystem and then maps a file on it.
+    // Linux has no such problem because it faults pages in lazily; AOK maps
+    // eagerly, so the fetch is hoisted out to here instead.
+    //
+    // Optional. NULL means ->mmap needs no preparation.
+    int (*mmap_prepare)(struct fd *fd, off_t offset, size_t len);
 
     // returns a bitmask of operations that won't block
     int (*poll)(struct fd *fd);
@@ -336,10 +470,25 @@ void fdtable_do_cloexec(struct fdtable *table);
 struct fd *fdtable_get(struct fdtable *table, fd_t f);
 
 struct fd *f_get(fd_t f);
+// f_get, but NULL for an O_PATH descriptor -- I/O on one is EBADF on Linux.
+// See the definition in kernel/fs.c.
+struct fd *f_get_io(fd_t f);
+// The *at() base directory for `path`, honouring the rule that an ABSOLUTE
+// path makes dirfd irrelevant -- see the definition in kernel/fs.c for why
+// that matters and what it broke. Declared here rather than duplicated because
+// it already WAS duplicated, in kernel/fs.c and fs/stat.c, and the fix landed
+// in one of them: everything passed except fstatat and statx, which is where
+// modern glibc actually goes.
+struct fd *at_fd_for_path(fd_t f, const char *path);
 struct fd *f_get_retain(fd_t f);
 // steals a reference to the fd, gives it to the table on success and destroys it on error
 // flags is checked for O_CLOEXEC and O_NONBLOCK
 fd_t f_install(struct fd *fd, int flags);
 int f_close(fd_t f);
+
+// Write a FUSE file's shared mapping back to its daemon (fs/fuse.c). A no-op
+// for every other kind of fd, so msync can call it for any file-backed
+// mapping without knowing what is behind it.
+int fuse_fd_msync_writeback(struct fd *fd);
 
 #endif

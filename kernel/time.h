@@ -37,6 +37,12 @@ dword_t sys_stime(addr_t time);
 #define CLOCK_REALTIME_COARSE_ 5
 #define CLOCK_MONOTONIC_COARSE_ 6
 #define CLOCK_BOOTTIME_ 7
+// Linux's alarm clocks. They read exactly like their non-alarm counterparts;
+// the difference is only that a TIMER on one of them may wake a suspended
+// system, which needs CAP_WAKE_ALARM. clock_gettime/clock_getres on them are
+// unprivileged and must not fail.
+#define CLOCK_REALTIME_ALARM_ 8
+#define CLOCK_BOOTTIME_ALARM_ 9
 #define CLOCK_TAI_ 11
 dword_t sys_clock_gettime(dword_t clock, addr_t tp);
 dword_t sys_clock_gettime_guest(dword_t clock, guest_addr_t tp);
@@ -58,9 +64,15 @@ struct amd64_timeval_ {
     int64_t sec;
     int64_t usec;
 };
+// SIGNED, like Linux's struct __kernel_old_timespec, whose tv_sec and tv_nsec
+// are both signed 32-bit longs -- and like struct timespec64_ below, which got
+// this right. Unsigned, a guest passing tv_sec = -1 arrived as 4294967295, so
+// timespec_is_valid()'s ts.tv_sec >= 0 check waved it through and nanosleep
+// slept for 136 years instead of returning EINVAL. On the i386 guest that hung
+// the whole regression run.
 struct timespec_ {
-    dword_t sec;
-    dword_t nsec;
+    sdword_t sec;
+    sdword_t nsec;
 };
 struct timespec64_ {
     int64_t sec;

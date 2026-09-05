@@ -64,6 +64,7 @@ struct termios2_ {
 #define ECHOE_ (1 << 4)
 #define ECHOK_ (1 << 5)
 #define NOFLSH_ (1 << 7)
+#define TOSTOP_ (1 << 8)
 #define ECHOCTL_ (1 << 9)
 // Real Linux/glibc termios c_lflag bit (0004000 octal); was previously
 // misdefined as (1 << 6), which is actually ECHONL's position -- that bug
@@ -76,6 +77,8 @@ struct termios2_ {
 #define IGNCR_ (1 << 7)
 #define ICRNL_ (1 << 8)
 #define IXON_ (1 << 10)
+#define IXANY_ (1 << 11)
+#define IXOFF_ (1 << 12)
 
 #define OPOST_ (1 << 0)
 #define ONLCR_ (1 << 2)
@@ -110,8 +113,16 @@ struct termios2_ {
 #define TCSETS2_ 0x402c542b
 #define TCSETSW2_ 0x402c542c
 #define TCSETSF2_ 0x402c542d
+// tcflow() actions, passed to TCXONC by value.
+#define TCOOFF_ 0
+#define TCOON_  1
+#define TCIOFF_ 2
+#define TCION_  3
+#define TCSBRK_ 0x5409
+#define TCXONC_ 0x540a
 #define TCFLSH_ 0x540b
 #define TIOCSCTTY_ 0x540e
+#define TIOCGSID_ 0x5429
 #define TIOCGPGRP_ 0x540f
 #define TIOCSPGRP_ 0x5410
 #define TIOCGWINSZ_ 0x5413
@@ -121,6 +132,11 @@ struct termios2_ {
 #define TIOCGPTN_ 0x80045430
 #define TIOCSPTLCK_ 0x40045431
 #define TIOCGPKT_ 0x80045438
+#define TIOCOUTQ_ 0x5411
+#define TIOCNOTTY_ 0x5422
+#define TIOCEXCL_ 0x540c
+#define TIOCNXCL_ 0x540d
+#define TIOCGEXCL_ 0x80045440
 
 #define TCIFLUSH_ 0
 #define TCOFLUSH_ 1
@@ -153,6 +169,13 @@ struct tty {
     unsigned refcount;
     struct tty_driver *driver;
     bool hung_up;
+    // Bumped by every hangup. A descriptor records this at open and is hung up
+    // only if the tty has been hung up SINCE -- which is what a hangup means on
+    // Linux: it belongs to the descriptors that were open at the time, and a
+    // fresh open of the same terminal gets a working one. Modelling it as a
+    // single sticky flag made a hung-up console permanently dead: see
+    // tests/manual/tty_hangup_reopen.c.
+    unsigned hangup_gen;
     bool ever_opened;
 
 #define TTY_BUF_SIZE 4096
@@ -160,10 +183,15 @@ struct tty {
     // A flag is a marker indicating the end of a canonical mode input. Flags
     // are created by EOL and EOF characters. You can't backspace past a flag.
     bool buf_flag[TTY_BUF_SIZE];
+    // VLNEXT (^V) latch: the NEXT input character is taken literally, with no
+    // special meaning at all. One-shot, cleared as soon as it is consumed.
+    bool lnext_pending;
     dword_t bufsize;
     uint8_t packet_flags;
     cond_t produced;
     cond_t consumed;
+    // Woken when output flow control is released (^Q, IXANY, TCOON).
+    cond_t flow_resumed;
 
     struct winsize_ winsize;
     struct termios_ termios;
@@ -173,6 +201,15 @@ struct tty {
     dword_t mtime;
     dword_t ctime;
 
+    // XON/XOFF output flow control. `stopped` is what actually gates writes;
+    // `tco_stopped` records that tcflow(TCOOFF) was what stopped them, because
+    // TCOON restarts only output it stopped itself -- a ^S is cleared by ^Q,
+    // never by tcflow. Both measured against Linux 6.12.
+    bool stopped;
+    bool tco_stopped;
+    // TIOCEXCL: while set, only a privileged process may open this terminal
+    // again. Guarded by tty->lock like the rest of this struct.
+    bool excl;
     pid_t_ session;
     pid_t_ fg_group;
 
@@ -200,7 +237,18 @@ struct tty {
 // if blocking, may return _EINTR, otherwise, may return _EAGAIN
 ssize_t tty_input(struct tty *tty, const char *input, size_t len, bool blocking);
 void tty_set_winsize(struct tty *tty, struct winsize_ winsize);
-void tty_hangup(struct tty *tty);
+// Who to signal for a hangup. Captured while tty->lock is held (tty_hangup),
+// then handed to tty_hangup_notify once every tty lock has been dropped --
+// sending a signal takes pids_lock, and fs/tty.c's input path already
+// establishes that signals go out only after tty->lock is released.
+struct tty_hangup_targets {
+    pid_t_ fg_group;
+    pid_t_ session;
+};
+struct tty_hangup_targets tty_hangup(struct tty *tty);
+// SIGHUP (then SIGCONT, as Linux does) to the foreground group and session
+// leader of a terminal that has gone away. Call with no tty lock held.
+void tty_hangup_notify(struct tty_hangup_targets targets);
 bool tty_stat_rdev(dev_t_ rdev, struct statbuf *stat);
 
 // public for the benefit of ptys

@@ -28,9 +28,10 @@ Everything else under `/AOK` is baked into the app at build time:
 ```
 /AOK/README.txt           what this filesystem is, in a dozen lines
 /AOK/VERSION              build identifier
-/AOK/docs/                this documentation set
-/AOK/tools/               scripts and utilities (native-links.sh, manage-roots.sh,
-                          mount-root.sh, ktop, benchmarks, provisioning, Wayland)
+/AOK/docs/                this documentation set, and book/ -- the whole book
+/AOK/tools/               scripts and utilities (native-links.sh, persist-links.sh,
+                          manage-roots.sh, mount-root.sh, ktop, benchmarks,
+                          provisioning, Wayland)
 /AOK/tests/               the guest-side regression suite
 /AOK/fixes/               canned fixes for known upstream-distro bugs
 /AOK/native/              programs compiled into the app -- exec'ing one runs host
@@ -42,20 +43,24 @@ Everything else under `/AOK` is baked into the app at build time:
 
 ## Where the content actually comes from
 
-`/AOK/docs`, `/AOK/tools`, and `/AOK/tests` are generated from plain files
-in the iSH-AOK git repository, not copied onto your device at runtime:
+`/AOK/docs`, `/AOK/tools`, `/AOK/tests` and `/AOK/native/libs` are generated
+from plain files in the iSH-AOK git repository, not copied onto your device
+at runtime:
 
 - Doc sources live under `opt/AOK/docs/` in the repo (this file included).
 - Tool sources live under `opt/AOK/tools/`.
 - Test sources live under `tests/manual/`.
+- Native-program support files live under `deps/helix/runtime/`, and are
+  served at `/AOK/native/libs`.
 
-Three manifest files (`fs/aok-docs.manifest`, `fs/aok-tools.manifest`,
-`fs/aok-tests.manifest`) list exactly which files from those directories
-get shipped. At build time, `tools/gen-aokfs.py` reads each manifest and
-embeds the listed files' contents directly into the compiled emulator as C
-string tables, which `fs/aok.c` then serves at `/AOK/docs`, `/AOK/tools`,
-and `/AOK/tests`. There is no on-device copy step — the bytes you're
-reading right now were compiled into the app binary.
+Four manifest files (`fs/aok-docs.manifest`, `fs/aok-tools.manifest`,
+`fs/aok-tests.manifest`, and `fs/aok-libs.manifest` for `/AOK/native/libs`)
+list exactly which files get shipped. At build time, `tools/gen-aokfs.py`
+reads each manifest and embeds the listed files' contents directly into the
+compiled emulator as C string tables, which `fs/aok.c` then serves at
+`/AOK/docs`, `/AOK/tools`, `/AOK/tests` and `/AOK/native/libs`. There is no
+on-device copy step — the bytes you're reading right now were compiled into
+the app binary.
 
 A couple of things fall out of that:
 
@@ -65,11 +70,18 @@ A couple of things fall out of that:
   show up under `/AOK`, it has to be listed in the matching manifest file,
   or it won't be embedded.
 
-`/AOK/native` is different again: it has no manifest. Each entry is one program
-compiled into the app and registered in `kernel/native.c`, and `execve` of the
-path runs that host code instead of loading a guest image. A program this build
-does not carry has no entry at all, rather than an entry that fails. See
-[native-programs.md](native-programs.md) and [native-setup.md](native-setup.md).
+`/AOK/native` is different again: its program entries have no manifest. Each is
+one program compiled into the app and registered in `kernel/native.c`, and
+`execve` of the path runs that host code instead of loading a guest image. A
+program this build does not carry has no entry at all, rather than an entry that
+fails. See [native-programs.md](native-programs.md) and
+[native-setup.md](native-setup.md).
+
+The one exception is `/AOK/native/libs` — support files a native program reads
+at runtime, such as helix's tree-sitter queries and themes. Those *are*
+manifest-driven, from `fs/aok-libs.manifest`, and unlike the other manifests its
+paths may nest arbitrarily deep: the directories under `/AOK/native/libs` are
+derived from the listed paths rather than declared in `fs/aok.c`.
 
 ## A note on `/proc`, `/sys`, and `/dev`
 
@@ -79,3 +91,58 @@ single true system state no matter which root or chroot you're looking at
 them from. That's what makes tools like [ktop](ktop.md) useful from outside
 a chroot: they see every process across every currently-mounted root,
 labeled by guest architecture.
+
+## The rest of this documentation set
+
+Everything under `/AOK/docs`, in the order most people want it. Two thirds of
+these files were reachable only by `ls /AOK/docs` before this index existed —
+six of them were not linked from anywhere at all.
+
+**Getting things done**
+
+| file | what it covers |
+| --- | --- |
+| [roots.md](roots.md) | installing, switching between and chrooting into several Linux root filesystems |
+| [persist.md](persist.md) | `/AOK/persist` and `/AOK/fakefs` — the two places that survive root switches, app updates and reinstalls |
+| [networking.md](networking.md) | reaching the device from another machine, and what the guest can and cannot listen on |
+| [files-app-integration.md](files-app-integration.md) | the File Provider extension, and how iSH-AOK appears in the iOS Files app |
+| [shortcuts.md](shortcuts.md) | driving iSH-AOK from Apple's Shortcuts app |
+
+**The app around the emulator**
+
+| file | what it covers |
+| --- | --- |
+| [workspace.md](workspace.md) | the in-app multi-window desktop, its applets and saved layouts |
+| [file-browser.md](file-browser.md) | the quick file picker on the keyboard bar (Cmd-B) |
+| [motepad.md](motepad.md) | the built-in text editor |
+| [md.md](md.md) | the Markdown viewer |
+| [themes.md](themes.md) | the fourteen bundled themes and writing your own |
+| [llm-chat.md](llm-chat.md) | the in-app LLM chat client |
+| [ktop.md](ktop.md) | the bundled process viewer, and building it from the source shipped here |
+
+**Going faster, and going native**
+
+| file | what it covers |
+| --- | --- |
+| [native-programs.md](native-programs.md) | what a native program is and why one is not emulated |
+| [native-setup.md](native-setup.md) | putting the native programs on your `PATH` |
+| [crypto-accel.md](crypto-accel.md) | routing OpenSSL through the host's crypto instructions |
+| [benchmarks.md](benchmarks.md) | the bundled microbenchmarks, and how to run them |
+| [tuning-knobs.md](tuning-knobs.md) | `ISH_GUEST_CPU_COUNT` and friends, for the CLI build and Xcode schemes |
+
+**The book**
+
+`/AOK/docs/book` is the full iSH-AOK book -- 43 chapters and 8 appendices on
+how the whole thing works, from the emulator and its four guests through the
+VFS, native programs, the iOS app, testing and releasing, to an honest account
+of what is still wrong. It ships here because a reader with a terminal and no
+browser is exactly who it was written for. Start at
+[book/README.md](book/README.md), or [book/ch00-foreword.md](book/ch00-foreword.md).
+
+**Looking inside**
+
+| file | what it covers |
+| --- | --- |
+| [proc-ish.md](proc-ish.md) | `/proc/ish` — the build, the settings, and the guest-side preference surface |
+| [fuse.md](fuse.md) | the FUSE implementation, `/dev/fuse`, and what it supports |
+| [riscv64-vendor-extensions.md](riscv64-vendor-extensions.md) | how non-standard riscv64 vendor extensions are handled |

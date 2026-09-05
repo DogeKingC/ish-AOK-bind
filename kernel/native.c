@@ -13,6 +13,7 @@
 #include "kernel/native_io.h"
 #include "kernel/signal.h"
 #include "kernel/native_libc.h"
+#include "kernel/native_syscall.h"
 #include "kernel/task.h"
 #include "debug.h"
 
@@ -261,8 +262,56 @@ int native_zsh_main(int argc, char *const argv[], char *const envp[]);
 int native_zsh_multio_main(int argc, char *const argv[], char *const envp[]);
 #endif
 
+#ifdef ISH_NATIVE_RUST
+int rust_native_probe_main(int argc, char *const argv[], char *const envp[]);
+#endif
+
+#ifdef ISH_NATIVE_HELIX
+// Reached the same way as the probe -- a staticlib whose libc imports are
+// rewritten onto the shim -- but its own crate, deps/helix-native, so that the
+// probe stays small enough to be a diagnostic. helix itself is deps/helix.
+int helix_native_main(int argc, char *const argv[], char *const envp[]);
+#endif
+
+// The terminal half of the Workspace MotePad editor (kernel/native_motepad.c).
+// Unconditional: it is one C file with no dependency beyond the shim, so there
+// is nothing to gate it on -- unlike helix or bash, which bring a toolchain and
+// a licence question with them.
+int native_motepad_main(int argc, char *const argv[], char *const envp[]);
+int native_bmm_main(int argc, char *const argv[], char *const envp[]);
+int native_bmt_main(int argc, char *const argv[], char *const envp[]);
+
+// ktop (kernel/ktop_glue.c), compiled from the same opt/AOK/tools/ktop/ktop.c
+// that ships to the guest -- so /AOK/native/ktop and a ktop built from
+// /AOK/tools/ktop are the same program, and neither goes away. Unconditional
+// for the same reason motepad is: one C file, no dependency beyond the shim.
+int native_ktop_main(int argc, char *const argv[], char *const envp[]);
+
 static const struct native_program native_programs[] = {
     { "smallclue", smallclue_real_main },
+    { "motepad", native_motepad_main },
+    // Same program as /AOK/tools/ktop, compiled as host code. Measured 2.7x
+    // faster per refresh on an i386 guest -- worthwhile rather than dramatic,
+    // because most of a refresh is kernel-side /proc work that was never
+    // emulated to begin with. See ktop_glue.c.
+    { "ktop", native_ktop_main },
+    // The /AOK/tools benchmarks, so the same workload can be timed with and
+    // without emulation. kernel/native_bench.c explains what that comparison
+    // is, and what it is not.
+    { "bmm", native_bmm_main },
+    { "bmt", native_bmt_main },
+#ifdef ISH_NATIVE_RUST
+    // Rust, reached by rewriting its libc imports onto the shim rather than by
+    // the #define redirection that only covers what AOK compiles. See
+    // tools/gen-nlibc-renames.py and deps/rust-native-probe.
+    { "rust-probe", rust_native_probe_main },
+#endif
+#ifdef ISH_NATIVE_HELIX
+    // Registered as `hx`, which is what helix calls itself and what a user
+    // types. deps/helix-native is the staticlib wrapper; deps/helix is the
+    // editor.
+    { "hx", helix_native_main },
+#endif
 #ifdef ISH_NATIVE_BASH
     { "bash", native_bash_main },
 #endif
@@ -381,6 +430,43 @@ int native_exec_set_pending(const struct native_program *prog, int argc,
     return 0;
 }
 
+// argv, flattened the way /proc/<pid>/cmdline is defined: each argument
+// NUL-terminated, back to back. See struct task's native_cmdline.
+static void native_cmdline_publish(int argc, char *const argv[]) {
+    size_t len = 0;
+    for (int i = 0; i < argc; i++)
+        if (argv[i] != NULL)
+            len += strlen(argv[i]) + 1;
+    char *buf = NULL;
+    if (len != 0 && (buf = malloc(len)) != NULL) {
+        size_t n = 0;
+        for (int i = 0; i < argc; i++) {
+            if (argv[i] == NULL)
+                continue;
+            size_t one = strlen(argv[i]) + 1;
+            memcpy(buf + n, argv[i], one);
+            n += one;
+        }
+    }
+    lock(&current->general_lock, 0);
+    char *old = current->native_cmdline;
+    current->native_cmdline = buf;
+    current->native_cmdline_len = buf != NULL ? len : 0;
+    unlock(&current->general_lock);
+    free(old);   // an exec over an exec; the reader is done with it by now
+}
+
+void native_cmdline_discard(struct task *task) {
+    if (task == NULL)
+        return;
+    lock(&task->general_lock, 0);
+    char *old = task->native_cmdline;
+    task->native_cmdline = NULL;
+    task->native_cmdline_len = 0;
+    unlock(&task->general_lock);
+    free(old);
+}
+
 void native_exec_run_pending(void) {
     struct native_exec_pending *pending = current != NULL ? current->native_exec : NULL;
     if (pending == NULL)
@@ -406,11 +492,39 @@ void native_exec_run_pending(void) {
     // Before the program runs: getenv() in host code would otherwise answer
     // about the Mac (kernel/native.h).
     native_env_init(envp);
+    // ...and before it runs, because procfs can be asked the moment it does.
+    native_cmdline_publish(argc, argv);
+    // Published for the same reason and for exactly the call's lifetime:
+    // argv is freed below, so a slot left pointing at it would dangle.
+    current->native_argv = argv;
+    current->native_argc = argc;
+
+    // A fresh token for this run, so per-invocation state keyed on it (see the
+    // third bullet in kernel/native.h) can never be mistaken for a previous
+    // run's.
+    nlibc_invocation_token_assign();
 
     int status = prog->main(argc, argv, envp);
 
+    current->native_argv = NULL;
+    current->native_argc = 0;
     native_free_vector(argv);
     native_free_vector(envp);
+
+    // The syscall marshalling arena this thread has been using lives in the
+    // guest address space, and nothing below needs it. Handing it back here
+    // rather than leaving it to the teardown keeps the release beside the run
+    // that owns it -- and covers the case where the address space outlives the
+    // program (kernel/native_syscall.h).
+    native_arena_release();
+
+    // A fatal signal deferred while the program was inside host stdio (see
+    // nlibc_stdio_defer_fatal) is still pending. The program has unwound and
+    // its glue flushed its streams, so this is the safe point to take it:
+    // the task then reports died-by-signal -- what ^C on a blocked native
+    // reader should look like to its parent -- instead of whatever exit code
+    // the error path it was detoured into produced.
+    native_checkpoint();
 
     // Same encoding sys_exit_group uses: the wait status carries the exit code
     // in its high byte.
@@ -431,6 +545,24 @@ static char **native_env_empty(void) {
 
 char **native_env_vector(void) {
     return *native_env_slot();
+}
+
+// The argv equivalents of native_env_slot. Same no-task fallback: a native
+// program can be entered from a context with no current task, and answering
+// with an empty vector is better than a crash in someone else's runtime.
+char ***native_argv_slot(void) {
+    static char **no_task_argv;
+    static char *empty[] = { NULL };
+    if (current == NULL || current->native_argv == NULL)
+        return (no_task_argv = empty, &no_task_argv);
+    return &current->native_argv;
+}
+
+int *native_argc_slot(void) {
+    static int no_task_argc;
+    if (current == NULL || current->native_argv == NULL)
+        return (no_task_argc = 0, &no_task_argc);
+    return &current->native_argc;
 }
 
 // The task's environ SLOT, not its value, so that `environ` can be assigned to
@@ -467,6 +599,25 @@ void native_env_discard(struct task *task) {
         return;
     native_free_vector(task->native_env);
     task->native_env = NULL;
+}
+
+// The signal table goes the same way and at the same time: it is the same kind
+// of per-task native state, and a task that is going away has no dispositions.
+void native_sigtable_discard(struct task *task) {
+    if (task == NULL)
+        return;
+    void *t = task->native_sigtable;
+    task->native_sigtable = NULL;
+    free(t);
+    // The held sets are derived FROM that table (nlibc_update_held_signals),
+    // so they cannot outlive it: they would go on telling the rest of the
+    // kernel that the shim is holding handlers for a task that no longer has
+    // any. task_wake_blocked() subtracts native_held, so a stale one makes a
+    // genuinely blocked signal interrupt a wait -- the same spurious-EINTR
+    // class this pair exists to avoid, pointing the other way.
+    __atomic_store_n(&task->native_held, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&task->native_restart, 0, __ATOMIC_RELEASE);
+    task->native_prog_blocked = 0;
 }
 
 // The index of `name` in the vector, or -1. Matches on the whole name up to
@@ -535,6 +686,10 @@ int native_env_unset(const char *name) {
 
 // ---------------------------------------------------------------- checkpoint
 
+bool native_delivery_deferred(void) {
+    return nlibc_delivery_deferred();
+}
+
 void native_checkpoint(void) {
     if (current == NULL)
         return;
@@ -547,25 +702,37 @@ void native_checkpoint(void) {
     sigset_t_ group_pending = __atomic_load_n(&current->sighand->pending, __ATOMIC_ACQUIRE);
     sigset_t_ blocked = __atomic_load_n(&current->blocked, __ATOMIC_ACQUIRE);
     bool has_saved_mask = __atomic_load_n(&current->has_saved_mask, __ATOMIC_ACQUIRE);
+
+    // Inside a host stdio callback the FILE's lock is held by this thread, and
+    // neither receive_signals (fatal default action exits without returning)
+    // nor nlibc_deliver_signals (a handler may longjmp -- bash's SIGINT does)
+    // may abandon it: Darwin never releases a dead owner's mutex, and one
+    // orphaned stream lock wedges every later _fwalk in the process. Defer
+    // both; the interrupted callback fails back through stdio's own unlock and
+    // the signal is taken at the next checkpoint outside stdio. See the
+    // callbacks in kernel/native_libc.c for the whole story.
+    bool defer = nlibc_stdio_defer_fatal();
+
     if (has_saved_mask || ((pending | group_pending) & ~blocked) != 0) {
         // receive_signals runs the default action, which for SIGINT means
         // do_exit_group -- so this call may not return, and that is the point:
         // ^C on a native program has to end it the way it ends any other.
-        receive_signals();
+        if (!defer)
+            receive_signals();
     }
 
-    // ^Z. A stopped group parks its threads here until SIGCONT, mirroring what
-    // handle_interrupt does for translated code.
-    struct tgroup *group = current->group;
-    if (group->stopped) {
-        lock(&group->lock, 0);
-        while (group->stopped)
-            wait_for_ignore_signals(&group->stopped_cond, &group->lock, NULL);
-        unlock(&group->lock);
-    }
+    // ^Z. A stopped group parks its threads here until SIGCONT -- the SAME
+    // function handle_interrupt uses for translated code (kernel/signal.c),
+    // rather than a second copy of it. The copy this replaces claimed in its
+    // comment to mirror handle_interrupt and did not: it had no ptrace handling
+    // at all, so a traced native program that group-stopped never reported to
+    // its tracer and the tracer's wait4 hung forever. Parking WHILE holding a
+    // stdio lock is fine -- the owner is alive and will release it on SIGCONT.
+    group_stop_wait();
 
     // Signals the program installed a handler for. Those are kept blocked in
     // the kernel -- it cannot jump host code -- so receive_signals above skips
     // them and the shim runs them here instead (kernel/native_libc.c).
-    nlibc_deliver_signals();
+    if (!defer)
+        nlibc_deliver_signals();
 }

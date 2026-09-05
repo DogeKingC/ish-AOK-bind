@@ -1,4 +1,5 @@
 #ifndef SYS_ERRNO_H
+#include <stdbool.h>   // errno_map_flags
 #define SYS_ERRNO_H
 
 #include <errno.h>
@@ -75,6 +76,14 @@
 #define _ELIBEXEC      -83 /* Cannot exec a shared library directly */
 #define _EILSEQ        -84 /* Illegal byte sequence */
 #define _ERESTART      -85 /* Interrupted system call should be restarted */
+// Internal only -- never reaches the guest, which is why it sits outside the
+// errno range rather than taking a number next to _ERESTART. Same as
+// _ERESTART, but under Linux's ERESTARTNOHAND rule: the restart is cancelled
+// and becomes a plain EINTR if a signal handler runs before the syscall gets
+// to re-execute. That is what separates poll/select/epoll_wait, which resume
+// transparently across a job-control stop but not across a handler, from the
+// SA_RESTART interfaces, which resume across both.
+#define _ERESTART_NOHAND -512
 #define _ESTRPIPE      -86 /* Streams pipe error */
 #define _EUSERS        -87 /* Too many users */
 #define _ENOTSOCK      -88 /* Socket operation on non-socket */
@@ -118,5 +127,8 @@
 
 int err_map(int err);
 int errno_map(void);
+// errno_map, but MSG_NOSIGNAL-aware: pass true to return EPIPE without
+// raising the guest's SIGPIPE. See kernel/errno.c.
+int errno_map_flags(bool suppress_sigpipe);
 
 #endif

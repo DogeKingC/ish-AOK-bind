@@ -58,8 +58,76 @@ static int raw_move_mount(int from_dfd, const char *from_path, int to_dfd,
     return syscall(SYS_move_mount, from_dfd, from_path, to_dfd, to_path, flags);
 }
 
+
+// A detached mount -- fsmount'd but not yet placed -- has no mountpoint at all
+// on Linux and therefore appears in NO mount listing. AOK has no mount
+// namespaces and models it as a real mount at a private staging path
+// (/.ish-fsmount/<n>), which used to leave it visible in /proc/mounts,
+// /proc/self/mountinfo and the table a native `df` walks. The staging
+// directory is 0700 and root-owned, so an unprivileged df tried to statfs a
+// directory it could not enter and printed
+//   df: /.ish-fsmount/11: Permission denied
+// for a mount Linux would never have shown it. Reported from a device, 2026-08-29.
+static int count_lines_matching(const char *file, const char *needle) {
+    FILE *f = fopen(file, "r");
+    if (f == NULL)
+        return -1;
+    char line[2048];
+    int n = 0;
+    while (fgets(line, sizeof line, f) != NULL)
+        if (strstr(line, needle) != NULL)
+            n++;
+    fclose(f);
+    return n;
+}
+
+static const char *staging_files[] = { "/proc/mounts", "/proc/self/mountinfo" };
+static int staging_baseline[2] = { 0, 0 };
+
+// What the mount table already said before this test created anything. The
+// check below is RELATIVE to it, because the assertion is about our own mount
+// and the count is a substring match over the whole table.
+//
+// It used to demand an absolute zero, which made it an assertion about the
+// entire system: any pre-existing mount whose path contains "ish-fsmount"
+// failed it, no matter what this test did. The Alpine test roots have an
+// almost-empty mount table and passed by luck of environment; the iPad had one
+// such mount parked at /.ish-fsmount/11 -- an iCloud Drive iosfs, nothing to do
+// with this test -- and failed all four checks by exactly 1, while its own
+// staging mount was correctly hidden the whole time.
+static void snapshot_staging_baseline(void) {
+    for (unsigned i = 0; i < sizeof staging_files / sizeof staging_files[0]; i++) {
+        int n = count_lines_matching(staging_files[i], "ish-fsmount");
+        staging_baseline[i] = n < 0 ? 0 : n;
+        test_logf("  %-24s baseline: %d\n", staging_files[i], staging_baseline[i]);
+    }
+}
+
+static void check_staging_hidden(const char *when, int want) {
+    static const char **files = staging_files;
+    for (unsigned i = 0; i < sizeof staging_files / sizeof staging_files[0]; i++) {
+        int n = count_lines_matching(files[i], "ish-fsmount");
+        if (n < 0) {
+            test_logf("  %s: unreadable, skipped\n", files[i]);
+            continue;
+        }
+        // want is how many of OUR mounts should be visible; anything that was
+        // there before us is not ours to account for.
+        int mine = n - staging_baseline[i];
+        if (mine != want) {
+            printf("FAIL: %s lists %d staging mount(s) of ours %s, want %d "
+                   "(total %d, baseline %d)\n",
+                   files[i], mine, when, want, n, staging_baseline[i]);
+            failures_total++;
+        }
+        test_logf("  %-24s %s: %d of ours (want %d, total %d)\n",
+                  files[i], when, mine, want, n);
+    }
+}
+
 int main(int argc, char **argv) {
     test_init(argc, argv);
+    TEST_SKIP_IF_FOREIGN_PROC("fsopen_move_mount");
     if (geteuid() != 0) {
         // Creating and moving a mount needs privilege, so unprivileged this can
         // only ever report EACCES from FSCONFIG_CMD_CREATE. Skip rather than
@@ -75,6 +143,9 @@ int main(int argc, char **argv) {
         perror("mkdtemp");
         return 1;
     }
+
+    // Before anything of ours exists.
+    snapshot_staging_baseline();
 
     int fs_fd = raw_fsopen("tmpfs", FSOPEN_CLOEXEC);
     test_logf("fsopen(\"tmpfs\") -> %d\n", fs_fd);
@@ -111,6 +182,9 @@ int main(int argc, char **argv) {
     }
     close(wfd);
 
+    // Detached: usable through its fd (just proven), and invisible everywhere.
+    check_staging_hidden("while detached", 0);
+
     r = raw_fsconfig(fs_fd, FSCONFIG_SET_FLAG, "ro", NULL, 0);
     test_log_if(r == 0, "fsconfig(SET_FLAG, \"ro\") ok\n");
     if (r != 0) {
@@ -130,6 +204,10 @@ int main(int argc, char **argv) {
         printf("FAIL: move_mount() -> %d (%s)\n", r, strerror(errno));
         return 1;
     }
+
+    // Placed: the staging path is gone for good, and the mount is listed at
+    // its real point (checked below by reading the file back through it).
+    check_staging_hidden("after move_mount", 0);
 
     char path[512];
     snprintf(path, sizeof(path), "%s/hello", target);

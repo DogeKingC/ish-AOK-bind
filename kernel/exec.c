@@ -20,10 +20,12 @@
 #include "fs/path.h"
 #include "kernel/elf.h"
 #include "kernel/native.h"
+#include "kernel/native_syscall.h"
 #include "kernel/vdso.h"
 #include "jit/jit.h"
 #include "tools/ptraceomatic-config.h"
 #include "util/sync.h"
+#include "kernel/binfmt_misc.h"
 
 #define ARGV_MAX 32 * PAGE_SIZE
 
@@ -304,6 +306,23 @@ static int load_entry(enum guest_abi abi, struct elf_prg_info ph, guest_addr_t b
 
     // Map the file-backed portion of the segment.
     if (fb_pages > 0) {
+        // See fd_ops.mmap_prepare: the filesystem fetches what the mapping
+        // will need, and ->mmap is entitled to assume it has run. This is the
+        // path that loads a program off a FUSE mount, so it is the one that
+        // most needs it.
+        //
+        // The address-space write lock IS held here (elf_exec takes it before
+        // calling this), which for any other caller would be the exact thing
+        // mmap_prepare exists to avoid. It is harmless here alone: exec_de_thread
+        // has already reaped this process's other threads, and the mem being
+        // locked is the freshly created one no other thread has ever seen, so
+        // the quiesce has nothing to stop.
+        if (fd->ops->mmap_prepare != NULL &&
+                (err = fd->ops->mmap_prepare(fd, map_file_start,
+                        (size_t) fb_pages << PAGE_BITS)) < 0) {
+            amd64_trace_exec_loader_failure("segment-mmap-prepare", NULL, abi, &ph, bias, fd, err, NULL);
+            return err;
+        }
         if ((err = fd->ops->mmap(fd, current->mem, PAGE(addr), fb_pages,
                         map_file_start, flags, MMAP_PRIVATE)) < 0) {
             amd64_trace_exec_loader_failure("segment-mmap", NULL, abi, &ph, bias, fd, err, NULL);
@@ -497,6 +516,215 @@ static bool i386_force_safe_exec_comm(const char *comm) {
         strcmp(comm, "pkcsslotd") == 0;
 }
 
+// Linux's de_thread: an execve leaves exactly one thread standing, and the
+// thread that called it becomes the group leader.
+//
+// AOK used to do neither. Every other thread kept running -- three tasks where
+// Linux has one, each still executing the OLD program, since exec here swaps
+// only the calling task's mm and the siblings hold the previous address space
+// alive by reference. And a non-leader exec left the process with
+// getpid() != gettid() forever, a state Linux only ever shows for a thread
+// that is not the leader, and the standard way a program asks "am I the main
+// thread". The new image is single-threaded, so the answer has to be yes.
+//
+// Two AOK specifics shape this:
+//
+//   - SIGKILL cannot express "just this thread": receive_signal routes
+//     SIGNAL_KILL to do_exit_group, which would kill the exec'ing thread too.
+//     So the signal still does the waking and reaching -- that machinery is
+//     subtle and worth reusing -- and task->exit_requested changes only what
+//     it does on arrival.
+//
+//   - A thread here is a child of its CREATOR, not of the leader's parent as
+//     in Linux (kernel/fork.c re-links only for CLONE_PARENT). So when the old
+//     leader exits, find_new_parent hands its children to the first live
+//     thread in the group -- which is us -- and the exec'ing thread ends up
+//     its own parent. The real parent then has no such child at all and its
+//     wait() returns ECHILD. Hence the family-tree fixup below, which has no
+//     counterpart in Linux's de_thread.
+static void exec_de_thread(void) {
+    struct tgroup *group = current->group;
+    struct task *task;
+
+    // Captured before anything is torn down: the old leader's identity is what
+    // this thread is about to inherit, and its parent must be read while the
+    // process tree is still intact.
+    struct task *leader = group->leader;
+    bool taking_over = leader != NULL && leader != current;
+    struct task *inherit_parent = NULL;
+    int inherit_exit_signal = 0;
+    if (taking_over) {
+        complex_lockt(&pids_lock, 0);
+        inherit_parent = leader->parent;
+        inherit_exit_signal = leader->exit_signal;
+        if (inherit_parent != NULL)
+            task_ref_cnt_mod(inherit_parent, 1);
+        unlock(&pids_lock);
+    }
+
+    struct zap_target {
+        struct task *task;
+        struct sighand *sighand;
+    };
+    struct zap_target stack_targets[32];
+    struct zap_target *targets = stack_targets;
+    size_t target_cap = sizeof(stack_targets) / sizeof(stack_targets[0]);
+    size_t target_count = 0;
+    bool zapped_any = false;
+
+    while (true) {
+        complex_lockt(&pids_lock, 0);
+        lock(&group->lock, 0);
+
+        size_t needed = 0;
+        list_for_each_entry(&group->threads, task, group_links) {
+            if (task != current)
+                needed++;
+        }
+        if (needed == 0) {
+            unlock(&group->lock);
+            unlock(&pids_lock);
+            break;
+        }
+        if (needed > target_cap) {
+            unlock(&group->lock);
+            unlock(&pids_lock);
+            if (targets != stack_targets)
+                free(targets);
+            targets = malloc(sizeof(*targets) * needed);
+            if (targets == NULL)
+                die("out of memory collecting exec zap targets");
+            target_cap = needed;
+            continue;
+        }
+
+        target_count = 0;
+        list_for_each_entry(&group->threads, task, group_links) {
+            if (task == current)
+                continue;
+            task_ref_cnt_mod(task, 1);
+            __atomic_store_n(&task->exit_requested, true, __ATOMIC_RELEASE);
+            targets[target_count].task = task;
+            targets[target_count].sighand = task->sighand;
+            if (targets[target_count].sighand != NULL)
+                sighand_retain(targets[target_count].sighand);
+            target_count++;
+        }
+        // A group-stopped sibling is parked in the job-control wait with
+        // nothing left to wake it; clear the stop so they can all run to their
+        // exits.
+        group->stopped = false;
+        unlock(&group->lock);
+        unlock(&pids_lock);
+        zapped_any = true;
+        break;
+    }
+
+    if (zapped_any) {
+        notify(&group->stopped_cond);
+        for (size_t i = 0; i < target_count; i++) {
+            if (targets[i].sighand != NULL) {
+                deliver_signal_with_sighand(targets[i].task, targets[i].sighand,
+                        SIGKILL_, SIGINFO_NIL);
+                sighand_release(targets[i].sighand);
+            }
+            task_ref_cnt_mod(targets[i].task, -1);
+        }
+    }
+    if (targets != stack_targets)
+        free(targets);
+
+    // Wait for them to leave the group. do_exit unlinks a thread from
+    // group->threads partway through, so this is the honest "am I alone yet"
+    // test; the ceiling keeps a sibling wedged somewhere a signal cannot reach
+    // from hanging the exec forever.
+    struct timespec zap_pause = { .tv_sec = 0, .tv_nsec = 200000 };  // 200us
+    bool alone = false;
+    for (int i = 0; i < 50000 && !alone; i++) {                      // ~10s
+        complex_lockt(&pids_lock, 0);
+        lock(&group->lock, 0);
+        size_t others = 0;
+        list_for_each_entry(&group->threads, task, group_links) {
+            if (task != current)
+                others++;
+        }
+        unlock(&group->lock);
+        unlock(&pids_lock);
+        if (others == 0)
+            alone = true;
+        else
+            nanosleep(&zap_pause, NULL);
+    }
+    if (!alone)
+        printk("WARNING: execve gave up waiting for sibling threads to exit "
+               "(pid=%d comm=%s); continuing anyway\n", current->pid, current->comm);
+
+    if (!taking_over || !alone) {
+        if (inherit_parent != NULL)
+            task_ref_cnt_mod(inherit_parent, -1);
+        return;
+    }
+
+    // do_exit drops out of group->threads partway through and keeps working on
+    // its own struct afterwards; releasing it before it is finished would be a
+    // use-after-free. Wait for the marker it sets last.
+    for (int i = 0; i < 50000; i++) {
+        if (atomic_load_explicit(&leader->exit_finished, memory_order_acquire))
+            break;
+        nanosleep(&zap_pause, NULL);
+    }
+    if (!atomic_load_explicit(&leader->exit_finished, memory_order_acquire)) {
+        printk("WARNING: execve could not retire the old thread-group leader "
+               "(pid=%d comm=%s); keeping pid %d\n", current->pid, current->comm, current->pid);
+        if (inherit_parent != NULL)
+            task_ref_cnt_mod(inherit_parent, -1);
+        return;
+    }
+
+    complex_lockt(&pids_lock, 0);
+    // Give up the tid we were allocated as a thread...
+    struct pid *own = pid_get(current->pid);
+    if (own != NULL && own->task == current) {
+        own->task = NULL;
+        list_remove(&own->alive);
+    }
+    // ...and take the leader's, which is this process's pid. Session and
+    // process-group membership hang off struct pid, so they travel with it.
+    struct pid *lead_pid = pid_get(leader->pid);
+    if (lead_pid != NULL)
+        lead_pid->task = current;
+    current->pid = leader->pid;
+    // A thread has no exit signal; the process it now is does.
+    current->exit_signal = inherit_exit_signal;
+    // Before the release below, so task_free_final does not mistake the old
+    // leader for the current one and free the tgroup out from under us.
+    group->leader = current;
+
+    // Take the leader's place in the process tree. Without this the exec'ing
+    // thread stays parented to itself (see the comment above) and its real
+    // parent's wait() reports ECHILD.
+    struct task *new_parent = inherit_parent;
+    if (new_parent == NULL || new_parent == current || new_parent->exiting)
+        new_parent = pid_get_task(1);
+    if (new_parent != NULL && new_parent != current) {
+        list_remove(&current->siblings);
+        list_add(&new_parent->children, &current->siblings);
+        current->parent = new_parent;
+    }
+
+    // The old leader is nobody's child now, and owns no pid.
+    list_remove(&leader->siblings);
+    list_remove_safe(&leader->ptrace_siblings);
+    leader->pid = 0;
+    unlock(&pids_lock);
+
+    if (inherit_parent != NULL)
+        task_ref_cnt_mod(inherit_parent, -1);
+
+    // Defers by itself if anything still holds a reference.
+    task_destroy_unlinked(leader, 2);
+}
+
 static intptr_t elf_exec(struct fd *fd, const char *file, struct exec_args argv, struct exec_args envp) {
     intptr_t err = 0;
     struct task *save = current;
@@ -570,6 +798,11 @@ static intptr_t elf_exec(struct fd *fd, const char *file, struct exec_args argv,
         err = _ENOMEM;
         goto out_free_interp;
     }
+
+    // Every other thread in the group dies here and this thread takes over
+    // the leader's identity, before anything becomes irreversible -- the
+    // same place Linux runs de_thread.
+    exec_de_thread();
 
     // free the process's memory.
     // from this point on, if any error occurs the process will have to be
@@ -731,6 +964,15 @@ static intptr_t elf_exec(struct fd *fd, const char *file, struct exec_args argv,
     struct guest_vm_layout vm_layout = guest_abi_vm_layout(save->abi);
     if ((err = pt_map_nothing(save->mem, vm_layout.stack_page, 1, P_WRITE | P_GROWSDOWN)) < 0)
         goto beyond_hope;
+    // Record where the stack starts and how far down it may grow. Linux bounds
+    // stack expansion at RLIMIT_STACK measured from the stack's top; without
+    // this the only thing stopping a runaway recursion is whatever it collides
+    // with, which on a 64-bit guest is hundreds of megabytes away. See
+    // mem_growsdown_allowed. RLIM_INFINITY is passed through as 0, meaning
+    // "no rlimit bound" -- the guard gap still applies.
+    rlim_t_ stack_limit = rlimit(RLIMIT_STACK_);
+    mem_set_stack_bounds(save->mem, vm_layout.stack_page + 1,
+                         stack_limit == RLIM_INFINITY_ ? 0 : (uint64_t) stack_limit);
     write_unlock(&save->mem->lock);
     mem_locked = false;
 
@@ -776,11 +1018,11 @@ static intptr_t elf_exec(struct fd *fd, const char *file, struct exec_args argv,
             {AX_BASE, interp_base},
             {AX_FLAGS, 0},
             {AX_ENTRY, bias + header.entry_point},
-            {AX_UID, 0},
-            {AX_EUID, 0},
-            {AX_GID, 0},
-            {AX_EGID, 0},
-            {AX_SECURE, 0},
+            {AX_UID, current->exec_auxv_uid},
+            {AX_EUID, current->exec_auxv_euid},
+            {AX_GID, current->exec_auxv_gid},
+            {AX_EGID, current->exec_auxv_egid},
+            {AX_SECURE, current->exec_secure ? 1 : 0},
             {AX_RANDOM, random_addr},
             {AX_HWCAP2, 0},
             {AX_EXECFN, file_addr},
@@ -866,11 +1108,11 @@ static intptr_t elf_exec(struct fd *fd, const char *file, struct exec_args argv,
             {AX_BASE, interp_base},
             {AX_FLAGS, 0},
             {AX_ENTRY, bias + header.entry_point},
-            {AX_UID, 0},
-            {AX_EUID, 0},
-            {AX_GID, 0},
-            {AX_EGID, 0},
-            {AX_SECURE, 0},
+            {AX_UID, current->exec_auxv_uid},
+            {AX_EUID, current->exec_auxv_euid},
+            {AX_GID, current->exec_auxv_gid},
+            {AX_EGID, current->exec_auxv_egid},
+            {AX_SECURE, current->exec_secure ? 1 : 0},
             {AX_RANDOM, random_addr},
             {AX_HWCAP2, 0},
             {AX_EXECFN, file_addr},
@@ -1059,12 +1301,166 @@ static inline int user_memset(guest_addr_t start, byte_t val, dword_t len) {
     return 0;
 }
 
+static struct fd *open_exec(const char *file, struct statbuf *stat);
+static int format_exec(struct fd *fd, const char *file, struct exec_args argv, struct exec_args envp);
+
+// binfmt_misc: hand the file to a registered interpreter.
+//
+// This is what makes /proc/sys/fs/binfmt_misc honest. That directory used to
+// present `register` and `status` with nothing behind them, so update-binfmts
+// registered a format, was told it worked, and execve never consulted it -- a
+// guest looked configured and silently ran nothing. A registration that is
+// visible there has to reach here, or the empty directory was the better lie.
+//
+// Modelled on shebang_exec above, and the argv it builds is Linux's
+// (fs/binfmt_misc.c load_misc_binary):
+//
+//   without P: interpreter, file, original argv[1..]   -- argv[0] is DROPPED
+//   with    P: interpreter, file, original argv[0..]   -- argv[0] preserved
+static int binfmt_misc_exec(struct fd *fd, const char *file, struct exec_args argv,
+                            struct exec_args envp) {
+    if (fd->ops->lseek(fd, 0, SEEK_SET))
+        return _EIO;
+    char header[128];
+    ssize_t size = fd->ops->read(fd, header, sizeof(header));
+    if (size < 0)
+        return _EIO;
+
+    char interpreter[MAX_PATH];
+    bool preserve_argv0 = false;
+    if (!binfmt_misc_match(file, header, (size_t) size, interpreter,
+                           sizeof(interpreter), &preserve_argv0))
+        return _ENOEXEC;
+
+    // Everything after argv[0]. With P the original argv[0] is kept as well,
+    // so the interpreter can see how the program was invoked.
+    struct exec_args argv_rest = {
+        .count = argv.count > 0 ? argv.count - 1 : 0,
+        .args = argv.count > 0 ? argv.args + strlen(argv.args) + 1 : argv.args,
+    };
+    const char *argv0 = argv.count > 0 ? argv.args : NULL;
+    size_t args_rest_size = args_size(argv_rest);
+    size_t interpreter_len = strlen(interpreter);
+    size_t file_len = strlen(file);
+    size_t argv0_len = (preserve_argv0 && argv0 != NULL) ? strlen(argv0) : 0;
+
+    size_t extra = interpreter_len + 1 + file_len + 1;
+    if (preserve_argv0 && argv0 != NULL)
+        extra += argv0_len + 1;
+    if (args_rest_size + extra >= ARGV_MAX)
+        return _E2BIG;
+
+    char *new_argv_buf = malloc(ARGV_MAX);
+    if (new_argv_buf == NULL)
+        return _ENOMEM;
+    struct exec_args new_argv = {.args = new_argv_buf};
+    size_t n = 0;
+    memcpy(new_argv_buf, interpreter, interpreter_len + 1);
+    new_argv.count++;
+    n += interpreter_len + 1;
+    memcpy(new_argv_buf + n, file, file_len + 1);
+    new_argv.count++;
+    n += file_len + 1;
+    if (preserve_argv0 && argv0 != NULL) {
+        memcpy(new_argv_buf + n, argv0, argv0_len + 1);
+        new_argv.count++;
+        n += argv0_len + 1;
+    }
+    memcpy(new_argv_buf + n, argv_rest.args, args_rest_size);
+    new_argv.count += argv_rest.count;
+
+    // The interpreter is executed, so it faces the same rules as any other
+    // program -- execute permission, ordinary file, a mount that allows exec.
+    struct statbuf interpreter_stat;
+    struct fd *interpreter_fd = open_exec(interpreter, &interpreter_stat);
+    if (IS_ERR(interpreter_fd)) {
+        free(new_argv_buf);
+        return (int) PTR_ERR(interpreter_fd);
+    }
+    int err = format_exec(interpreter_fd, interpreter, new_argv, envp);
+    free(new_argv_buf);
+    if (err < 0)
+        fd_close(interpreter_fd);
+    return err;
+}
+
 static int format_exec(struct fd *fd, const char *file, struct exec_args argv, struct exec_args envp) {
     int err = (int)elf_exec(fd, file, argv, envp);
     if (err != _ENOEXEC)
         return err;
-    // other formats would go here
+    // A registered binfmt_misc interpreter is consulted only after every
+    // built-in format has declined, exactly as Linux orders its binfmt list.
+    err = binfmt_misc_exec(fd, file, argv, envp);
+    if (err != _ENOEXEC)
+        return err;
     return _ENOEXEC;
+}
+
+// Open a file for execution, the way Linux's open_exec does: resolve the
+// caller's execute permission BEFORE opening, and refuse anything that is not
+// an ordinary file on a mount that allows execution. Fills *stat with the file
+// it decided on, because the caller needs the set-id bits from the same stat
+// the decision was made on. Returns an ERR_PTR on refusal.
+//
+// It used to be an ordinary O_RDONLY open with no permission question asked at
+// all, which got three separate things wrong. The read check is a different
+// question from the execute check, so a 0644 file the caller could read was
+// executed and a 0711 file -- executable but not readable -- was refused. The
+// type was never checked, so a directory reached the ELF loader and came back
+// EIO while a FIFO reached open(2) and BLOCKED, hanging the task forever with
+// no way to tell it from a slow program. And MS_NOEXEC was recorded on the
+// mount, reported in /proc/mounts, and then never consulted, so `mount -o
+// noexec` was purely decorative -- worse than not supporting it, because the
+// whole point is that somebody is relying on it to hold.
+//
+// The extra stat costs one path resolution per exec. That is the honest price
+// of asking the questions in the right order; exec is not a hot path next to
+// open and stat.
+static struct fd *open_exec(const char *file, struct statbuf *stat) {
+    int err = generic_statat(AT_PWD, file, stat, 0);
+    if (err < 0)
+        return ERR_PTR(err);
+
+    // Only a regular file is ever executable. Linux reports EACCES for a
+    // directory, a fifo or a device alike.
+    if (!S_ISREG(stat->mode))
+        return ERR_PTR(_EACCES);
+
+    // The CALLER's execute permission, not anybody's. access_check keeps
+    // Linux's rule that even root needs at least one execute bit on a
+    // non-directory, which is what the old test got right by accident.
+    err = access_check(stat, AC_X);
+    if (err < 0)
+        return ERR_PTR(err);
+
+    // O_NOACCESS_CHECK_ because the execute check above is the one that
+    // governs: an execute-only file has to load despite being unreadable,
+    // which is why Linux opens it with FMODE_EXEC rather than for reading.
+    struct fd *fd = generic_open(file, O_RDONLY | O_NOACCESS_CHECK_, 0);
+    if (IS_ERR(fd))
+        return fd;
+
+    // fd->mount_flags, not fd->mount->flags: for a bind, fd->mount is the
+    // origin the bind aliases, and noexec on the bind is not noexec on the
+    // origin -- reading it off the mount asked about the wrong one, so
+    // `mount -o remount,bind,noexec` executed anyway.
+    if (fd->mount_flags & MS_NOEXEC_) {
+        fd_close(fd);
+        return ERR_PTR(_EACCES);
+    }
+
+    // MS_NOSUID: the set-id bits on a file here do not apply. Linux drops them
+    // in bprm_fill_uid before anything reads them, so the binary still runs --
+    // just without the privilege. Stripping them from the stat we return does
+    // the same, because every decision downstream (the credential change, and
+    // the AT_SECURE/AT_EUID aux vector) is made from these bits and nothing
+    // else. Nosuid was recorded and printed and never enforced, which is worse
+    // than not supporting it: a caller that mounts untrusted media nosuid,
+    // reads /proc/mounts, and sees "nosuid" has been told a thing that is not
+    // true about a decision it cannot re-check.
+    if (fd->mount_flags & MS_NOSUID_)
+        stat->mode &= ~(mode_t_) (S_ISUID | S_ISGID);
+    return fd;
 }
 
 static int shebang_exec(struct fd *fd, const char *file, struct exec_args argv, struct exec_args envp) {
@@ -1148,7 +1544,13 @@ static int shebang_exec(struct fd *fd, const char *file, struct exec_args argv, 
     memcpy(new_argv_buf + n, argv_rest.args, args_rest_size);
     new_argv.count += argv_rest.count;
 
-    struct fd *interpreter_fd = generic_open(interpreter, O_RDONLY_, 0);
+    // The interpreter is executed, so it faces the same rules as any other
+    // program: the caller must have execute permission on it, it must be an
+    // ordinary file, and its mount must allow execution. This was a plain
+    // O_RDONLY open, so a script could run an interpreter the caller was not
+    // allowed to execute -- Linux answers EACCES.
+    struct statbuf interpreter_stat;
+    struct fd *interpreter_fd = open_exec(interpreter, &interpreter_stat);
     if (IS_ERR(interpreter_fd)) {
         free(new_argv_buf);
         return (int)PTR_ERR(interpreter_fd);
@@ -1159,23 +1561,138 @@ static int shebang_exec(struct fd *fd, const char *file, struct exec_args argv, 
     return err;
 }
 
+// A native program (kernel/native.h) replaces this process image exactly as an
+// ELF would, and everything below format_exec that is NOT about loading an
+// image applies to it just the same. That half used to be skipped altogether,
+// because the native branch returns before reaching any of it.
+//
+// The descriptor half of the omission was a deadlock. A parent that wants to
+// know whether its child's exec worked hands the child a close-on-exec pipe
+// and reads it: EOF means the exec happened, four bytes of errno mean it did
+// not. apt's pager handshake is exactly that, and `apt search maria` wedged
+// the whole app whenever the pager it found resolved to SmallCLUE's native
+// less -- the write end survived an exec that never closed it, so apt sat on a
+// four-byte read while the pager sat on the stdin apt had not begun writing.
+// Neither could move. See docs/TODO.md.
+// POSIX timers (timer_create) do not survive execve on Linux: the new image
+// gets none. AOK kept them armed on the tgroup, which outlives the exec, so a
+// timer set before the exec fired into a program that never created it -- with
+// the old image's signal number and, for SIGALRM's default action, killing it
+// outright. fork() already clears them (kernel/fork.c); this is the other half.
+//
+// Freed rather than merely forgotten, since the tgroup lives on. Clearing
+// tgroup before timer_free mirrors kernel/exit.c: posix_timer_callback bails on
+// a NULL tgroup, and timer_free does not wait for a callback already in flight.
+static void exec_discard_posix_timers(void) {
+    struct tgroup *group = current->group;
+    if (group == NULL)
+        return;
+    lock(&group->lock, 0);
+    for (int i = 0; i < TIMERS_MAX; i++) {
+        struct posix_timer *pt = &group->posix_timers[i];
+        if (pt->timer == NULL)
+            continue;
+        struct timer *timer = pt->timer;
+        pt->tgroup = NULL;
+        pt->timer = NULL;
+        pt->timer_id = 0;
+        unlock(&group->lock);
+        timer_free(timer);
+        lock(&group->lock, 0);
+    }
+    unlock(&group->lock);
+}
+
+// Everything execve does to the PROCESS once a native program is committed to.
+// The image half has no work -- there is no ELF to load -- but a process is
+// more than its image, and each of these was missing for native programs until
+// something noticed out loud.
+//
+// new_mm is the address space the program will run in, already built by the
+// caller so that an out-of-memory failure can still be reported as one.
+static void exec_apply_native_process_state(struct mm *new_mm) {
+    // Every other thread of the process dies here, as it does for an ELF exec
+    // (exec_de_thread, and Linux's de_thread). Skipping it left siblings
+    // running the old image -- which was survivable only for as long as they
+    // went on sharing the exec'ing thread's address space. They do not any
+    // more: the swap below would leave one thread group straddling two address
+    // spaces, which is not a state a thread group can be in.
+    exec_de_thread();
+
+    // The new image gets a new address space, exactly as an ELF one does.
+    //
+    // This was missing entirely, and the effect was that a native program ran
+    // in whatever space it inherited: `/AOK/native/zsh` kept /bin/busybox and
+    // the musl loader mapped for its whole run, holding the memory of a program
+    // that had already been replaced. That is the ordinary read of the bug. The
+    // sharper one is vfork: the parent resumes at vfork_notify below, and until
+    // the swap it resumed into an address space its child was still writing
+    // guest scratch into (kernel/native_syscall.h).
+    //
+    // Empty rather than absent. A native program is host code, but it reaches
+    // the kernel through the same syscalls a guest does, and those take guest
+    // addresses -- so it needs somewhere in the guest to marshal through. What
+    // it does not need is anything that was there before.
+    //
+    // This thread's own scratch goes back to the OLD space first, while it is
+    // still the space that address means something in.
+    native_arena_release();
+    // general_lock protects current->mm against a concurrent procfs read, the
+    // same way elf_exec's swap does.
+    lock(&current->general_lock, 0);
+    struct mm *old_mm = current->mm;
+    task_set_mm(current, new_mm);
+    unlock(&current->general_lock);
+    if (old_mm != NULL)
+        mm_release(old_mm);
+
+    // cloexec: the trigger above, and the reason this function exists.
+    fdtable_do_cloexec(current->files);
+
+    // Caught signals go back to default across an exec; ignored ones stay
+    // ignored. Skipping this left a native program running with the previous
+    // program's handler addresses -- which, since no image was loaded over it,
+    // still pointed into code that is no longer what is executing.
+    lock(&current->sighand->lock, 0);
+    for (int sig = 0; sig < NUM_SIGS; sig++) {
+        struct sigaction_ *action = &current->sighand->action[sig];
+        if (action->handler != SIG_IGN_)
+            action->handler = SIG_DFL_;
+    }
+    current->altstack = 0;
+    current->altstack_size = 0;
+    unlock(&current->sighand->lock);
+    // The shim keeps native code's own view of the dispositions beside the
+    // guest table (kernel/native_libc.c). Resetting one and not the other
+    // would leave the two disagreeing.
+    native_sigtable_discard(current);
+    exec_discard_posix_timers();
+
+    // Linux clears the membarrier registration on exec (membarrier_exec_mmap):
+    // the new image has not asked for expedited barriers and must find out it
+    // needs to register, via the EPERM, exactly as a fresh process would.
+    lock(&current->group->lock, 0);
+    current->group->membarrier_private_expedited = false;
+    unlock(&current->group->lock);
+
+    current->did_exec = true;
+    current->keepcaps = false;
+    // A vfork parent is released by its child's exec, not by its exit. Without
+    // this it stayed blocked for the native program's whole run -- which is
+    // how glibc's posix_spawn waits, so it is not an exotic path.
+    vfork_notify(current);
+}
+
 int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) {
-    struct fd *fd = generic_open(file, O_RDONLY, 0);
+    // open_exec decides what the file IS and whether this caller may execute
+    // it before opening it, which is Linux's do_open_execat order. This used
+    // to open first and then ask only whether ANY execute bit was set, so a
+    // root-owned 0744 binary was executable by every user on the system.
+    struct statbuf stat;
+    struct fd *fd = open_exec(file, &stat);
     if (IS_ERR(fd))
         return (int) PTR_ERR(fd);
-
-    struct statbuf stat;
-    int err = fd->mount->fs->fstat(fd, &stat);
-    if (err < 0) {
-        fd_close(fd);
-        return err;
-    }
-
-    // if nobody has permission to execute, it should be safe to not execute
-    if (!(stat.mode & 0111)) {
-        fd_close(fd);
-        return _EACCES;
-    }
+    int err;
 
     // Natively-implemented programs (/AOK/native/*, kernel/native.h) are
     // dispatched here: after the existence and permission checks above, so
@@ -1197,6 +1714,21 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
                 fd_close(fd);
                 return _ENOMEM;
             }
+            // Built here, before anything is committed, for the same reason
+            // elf_exec builds its new_mm before exec_de_thread: past the
+            // commit point a failure has nowhere to go but a dead process.
+            struct mm *native_mm = mm_new(current->abi);
+            if (native_mm == NULL) {
+                free(native_argv);
+                free(native_envp);
+                fd_close(fd);
+                return _ENOMEM;
+            }
+            // /proc/<pid>/exe should name what was exec'd. Inheriting the mm
+            // meant it named the PARENT's binary -- /bin/busybox for anything
+            // a shell started -- which is worse than either the truth or
+            // nothing.
+            native_mm->exefile = fd_retain(fd);
             fd_close(fd);
             // Recorded rather than run here. Running a native program never
             // returns, so doing it at this point would strand every buffer the
@@ -1208,13 +1740,47 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
                     native_argv, native_envp);
             free(native_argv);
             free(native_envp);
-            return perr;
+            if (perr < 0) {
+                mm_release(native_mm);
+                return perr;
+            }
+            // Only once the record is safely taken: everything below commits
+            // the exec, and there is no undoing a closed descriptor.
+            exec_apply_native_process_state(native_mm);
+            return 0;
         }
     }
 
+    // Stage what the credentials will be once this exec commits, for the aux
+    // vector elf_exec is about to build. The real change stays below, after
+    // the image is loaded: doing it here would leave a FAILED exec holding
+    // elevated privilege. musl and glibc both decide a process is
+    // secure-execution from AT_SECURE, and musl additionally from
+    // AT_UID == AT_EUID && AT_GID == AT_EGID -- all four were hardcoded 0, so
+    // a setuid-root binary looked like an ordinary one and honoured
+    // LD_PRELOAD, giving any local user root.
+    current->exec_secure = (stat.mode & (S_ISUID | S_ISGID)) != 0;
+    current->exec_auxv_uid  = current->uid;
+    current->exec_auxv_gid  = current->gid;
+    current->exec_auxv_euid = (stat.mode & S_ISUID) ? stat.uid : current->euid;
+    current->exec_auxv_egid = (stat.mode & S_ISGID) ? stat.gid : current->egid;
+
     err = format_exec(fd, file, argv, envp);
-    if (err == _ENOEXEC)
+    if (err == _ENOEXEC) {
+        // Linux ignores set-id bits on a #! script -- the interpreter runs
+        // with the caller's credentials. We were applying the SCRIPT's bits in
+        // the credential change below, so a root-owned mode-4755 script with a
+        // cooperative interpreter handed any local user a root shell.
+        //
+        // Clear them before shebang_exec, which builds the interpreter's aux
+        // vector from the staged values above, so the interpreter is neither
+        // marked secure-execution nor given the script's owner as its euid.
+        stat.mode &= ~(mode_t_) (S_ISUID | S_ISGID);
+        current->exec_secure = false;
+        current->exec_auxv_euid = current->euid;
+        current->exec_auxv_egid = current->egid;
         err = shebang_exec(fd, file, argv, envp);
+    }
     fd_close(fd);
     if (err < 0) {
         amd64_trace_exec_loader_failure("do-execve", file, current->abi, NULL, 0, NULL, err, NULL);
@@ -1238,6 +1804,27 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
         current->egid = stat.gid;
         current->sgid = stat.gid;  // saved-set-gid = new egid, not old
         current->fsgid = current->egid;
+    }
+
+    // Capabilities do not survive an ordinary exec. Linux recomputes them from
+    // the file's own capabilities and the ambient set; with no file
+    // capabilities and a caller that is not root, permitted and effective
+    // collapse to the ambient set, which is normally empty.
+    //
+    // Nothing dropped them here, so a process that had lowered its uid while
+    // holding capabilities -- exactly what prctl(PR_SET_KEEPCAPS) plus
+    // setresuid is for -- handed the full set to whatever it exec'd next. That
+    // is the escalation the recomputation exists to prevent.
+    //
+    // The AMBIENT set is preserved, which is the supported way to carry a
+    // capability across an exec deliberately, and the root path is left
+    // exactly as it was: Linux re-grants there too (handle_privileged_root),
+    // and the setuid-root branch above depends on it.
+    if (current->euid != 0 && current->uid != 0) {
+        current->cap_permitted[0] = current->cap_ambient[0];
+        current->cap_permitted[1] = current->cap_ambient[1];
+        current->cap_effective[0] = current->cap_ambient[0];
+        current->cap_effective[1] = current->cap_ambient[1];
     }
 
     // save current->comm
@@ -1326,6 +1913,18 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
     current->altstack = 0;
     current->altstack_size = 0;
     unlock(&current->sighand->lock);
+    // And the shim's own copy of the dispositions, for a task whose previous
+    // image was a native program. A no-op for every other task, which never
+    // allocates one.
+    native_sigtable_discard(current);
+    exec_discard_posix_timers();
+
+    // Linux clears the membarrier registration on exec (membarrier_exec_mmap):
+    // the new image has not asked for expedited barriers and must find out it
+    // needs to register, via the EPERM, exactly as a fresh process would.
+    lock(&current->group->lock, 0);
+    current->group->membarrier_private_expedited = false;
+    unlock(&current->group->lock);
 
     current->did_exec = true;
     current->keepcaps = false;

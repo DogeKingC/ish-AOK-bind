@@ -13,8 +13,10 @@
 #include <string.h>
 
 #include "kernel/calls.h"
+#include "util/timer.h"
 #include "kernel/errno.h"
 #include "kernel/sysvipc.h"
+#include "fs/proc.h"
 #include "kernel/task.h"
 #include "util/list.h"
 #include "util/sync.h"
@@ -74,6 +76,7 @@ struct sem_set {
 };
 
 static struct list sem_sets = LIST_INITIALIZER(sem_sets);
+
 static lock_t sem_lock = LOCK_INITIALIZER;
 static int sem_next_id = 1;
 
@@ -195,7 +198,14 @@ static_assert(sizeof(struct sembuf_) == 6, "sembuf size");
 
 #define SEMOPM_ 500
 
-static int_t semop_common(int_t semid, guest_addr_t sops_addr, uint_t nsops) {
+// semop_common takes an optional deadline: NULL waits forever, otherwise the
+// wait ends at that CLOCK_MONOTONIC instant with EAGAIN. The deadline is
+// absolute rather than a duration because the loop below can wake several
+// times before the operation succeeds -- handing wait_for the original
+// duration each time would restart the clock on every wakeup and make the
+// timeout unbounded in exactly the contended case it exists for.
+static int_t semop_common(int_t semid, guest_addr_t sops_addr, uint_t nsops,
+                          const struct timespec *deadline) {
     if (nsops == 0)
         return _EINVAL;
     if (nsops > SEMOPM_)
@@ -209,6 +219,13 @@ static int_t semop_common(int_t semid, guest_addr_t sops_addr, uint_t nsops) {
     if (set == NULL) {
         unlock(&sem_lock);
         return _EINVAL;
+    }
+
+    // semop alters the set, so it needs write permission. Without this any uid
+    // could operate on another user's private semaphores.
+    if (!ipc_access_ok(set->uid, set->gid, set->cuid, set->cgid, set->mode, 2)) {
+        unlock(&sem_lock);
+        return _EACCES;
     }
     for (unsigned i = 0; i < nsops; i++) {
         if (sops[i].sem_num >= set->nsems) {
@@ -277,7 +294,17 @@ static int_t semop_common(int_t semid, guest_addr_t sops_addr, uint_t nsops) {
         else
             bsem->ncnt++;
         set->waiters++;
-        int err = wait_for(&set->cond, &sem_lock, NULL);
+        int err;
+        if (deadline != NULL) {
+            struct timespec remaining = timespec_subtract(*deadline, timespec_now(CLOCK_MONOTONIC));
+            if (!timespec_positive(remaining)) {
+                err = _ETIMEDOUT;
+            } else {
+                err = wait_for(&set->cond, &sem_lock, &remaining);
+            }
+        } else {
+            err = wait_for(&set->cond, &sem_lock, NULL);
+        }
         set->waiters--;
         if (for_zero)
             bsem->zcnt--;
@@ -288,6 +315,13 @@ static int_t semop_common(int_t semid, guest_addr_t sops_addr, uint_t nsops) {
             unlock(&sem_lock);
             return _EIDRM;
         }
+        if (err == _ETIMEDOUT) {
+            // The operation never became possible in the time allowed. Linux
+            // answers EAGAIN, the same as IPC_NOWAIT would have.
+            sem_set_maybe_free(set);
+            unlock(&sem_lock);
+            return _EAGAIN;
+        }
         if (err < 0) {
             unlock(&sem_lock);
             return _EINTR;
@@ -296,16 +330,26 @@ static int_t semop_common(int_t semid, guest_addr_t sops_addr, uint_t nsops) {
 }
 
 int_t sys_semop_guest(int_t semid, guest_addr_t sops_addr, uint_t nsops) {
-    return semop_common(semid, sops_addr, nsops);
+    return semop_common(semid, sops_addr, nsops, NULL);
 }
 
-// The timeout is ignored for now: fakeroot and friends pass NULL, and a
-// bounded wait would only change how a doomed wait ends. semtimedop with an
-// actual timeout still blocks interruptibly, so signals get through.
+// The timeout used to be dropped on the floor, so semtimedop was semop: a
+// caller that asked to wait 200ms for a semaphore waited for as long as it
+// took, or forever. That is the one thing the call exists to avoid -- every
+// user of it is a program that has decided it would rather give up than hang,
+// and it was given the hang anyway, with no way to tell.
 int_t sys_semtimedop_guest(int_t semid, guest_addr_t sops_addr, uint_t nsops,
                            guest_addr_t timeout_addr) {
-    (void) timeout_addr;
-    return semop_common(semid, sops_addr, nsops);
+    if (timeout_addr == 0)
+        return semop_common(semid, sops_addr, nsops, NULL);
+
+    struct timespec timeout;
+    if (read_guest_timespec_abi(current->abi, timeout_addr, &timeout))
+        return _EFAULT;
+    if (timeout.tv_sec < 0 || timeout.tv_nsec < 0 || timeout.tv_nsec >= 1000000000)
+        return _EINVAL;
+    struct timespec deadline = timespec_add(timespec_now(CLOCK_MONOTONIC), timeout);
+    return semop_common(semid, sops_addr, nsops, &deadline);
 }
 
 struct semid64_ds_i386_ {
@@ -359,6 +403,11 @@ int_t sys_semctl_guest(int_t semid, int_t semnum, int_t cmd, guest_addr_t arg) {
 
     switch (cmd_base) {
     case IPC_RMID_:
+        // Owner or creator only, like Linux.
+        if (!ipc_owner_ok(set->uid, set->cuid)) {
+            unlock(&sem_lock);
+            return _EPERM;
+        }
         set->removed = true;
         notify(&set->cond);
         sem_set_maybe_free(set);
@@ -559,4 +608,26 @@ int_t sys_semtimedop(int_t semid, addr_t sops, dword_t nsops, addr_t timeout) {
 }
 int_t sys_semctl(int_t semid, int_t semnum, int_t cmd, addr_t arg) {
     return sys_semctl_guest(semid, semnum, cmd, arg);
+}
+
+// /proc/sysvipc/sem. Written here, where the list and its lock are, rather
+// than reaching into them from procfs. ipcs(1) reads this file and nothing
+// else -- with it absent, `ipcs -s` reported an empty system no matter how
+// many semaphore sets existed, which is the one answer that makes the tool
+// useless for finding a leak.
+void proc_sysvipc_show_sem(struct proc_data *buf) {
+    proc_printf(buf, "%10s %10s %-10s %10s %5s %5s %5s %5s %10s %10s\n",
+                "key", "semid", "perms", "nsems", "uid", "gid", "cuid", "cgid",
+                "otime", "ctime");
+    lock(&sem_lock, 0);
+    struct sem_set *set;
+    list_for_each_entry(&sem_sets, set, slist) {
+        if (set->removed)
+            continue;
+        proc_printf(buf, "%10d %10d %-10o %10u %5u %5u %5u %5u %10lld %10lld\n",
+                    (int) set->key, set->id, set->mode & 0777, set->nsems,
+                    set->uid, set->gid, set->cuid, set->cgid,
+                    (long long) set->otime, (long long) set->ctime);
+    }
+    unlock(&sem_lock);
 }

@@ -34,6 +34,16 @@ struct rowcol {
 }
 @end
 
+@interface AOKInputSlot : NSObject
+// The bytes this press produced, or nil while they are still in flight.
+@property (nonatomic) NSData *payload;
+// What the press would type, used to tell this press's key command apart from
+// a repeat of some other key arriving in the same handful of milliseconds.
+@property (nonatomic, copy) NSString *input;
+@end
+@implementation AOKInputSlot
+@end
+
 @interface TerminalView ()
 
 @property (nonatomic) NSMutableArray<UIKeyCommand *> *keyCommands;
@@ -49,6 +59,14 @@ struct rowcol {
 @property struct rowcol floatingCursor;
 @property CGSize floatingCursorSensitivity;
 @property CGSize actualFloatingCursorSensitivity;
+
+@property (nonatomic) NSTimer *keyRepeatTimer;
+@property (nonatomic, copy, nullable) NSString *keyRepeatText;
+
+@property (nonatomic) NSMutableArray *pendingInput;
+@property (nonatomic) AOKInputSlot *keyEventSlot;
+@property (nonatomic) NSTimer *pendingInputTimeout;
+@property (nonatomic) NSUInteger immediateKeyInputDepth;
 
 @end
 
@@ -218,7 +236,11 @@ static void ISHRecordTerminalViewEvent(NSString *event, Terminal *terminal, NSDi
         @"blinkCursor": @(prefs.blinkCursor),
         @"cursorShape": prefs.htermCursorShape,
     } mutableCopy];
-    if (prefs.palette.colorPaletteOverrides) {
+    // Ask the palette that is actually being rendered, not prefs.palette: with
+    // an appearance override in play those are different objects, and testing
+    // one while reading the other drops a light palette's overrides whenever
+    // the dark half of the same theme happens not to define any.
+    if (palette.colorPaletteOverrides) {
         themeInfo[@"colorPaletteOverrides"] = palette.colorPaletteOverrides;
     }
     NSString *json = [[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:themeInfo options:0 error:nil] encoding:NSUTF8StringEncoding];
@@ -265,6 +287,8 @@ static void ISHRecordTerminalViewEvent(NSString *event, Terminal *terminal, NSDi
 }
 - (BOOL)resignFirstResponder {
     self.terminalFocused = NO;
+    [self stopKeyRepeat];
+    [self discardPendingInput];
     return [super resignFirstResponder];
 }
 - (void)windowDidBecomeKey:(NSNotification *)notif {
@@ -273,6 +297,8 @@ static void ISHRecordTerminalViewEvent(NSString *event, Terminal *terminal, NSDi
 }
 - (void)windowDidResignKey:(NSNotification *)notif {
     self.terminalFocused = NO;
+    [self stopKeyRepeat];
+    [self discardPendingInput];
 }
 
 - (IBAction)loseFocus:(id)sender {
@@ -359,6 +385,135 @@ static void ISHRecordTerminalViewEvent(NSString *event, Terminal *terminal, NSDi
     }
 }
 
+#pragma mark Keyboard input ordering
+
+// The keyboard reaches the tty by two routes with different latencies. A
+// UIKeyCommand is dispatched straight off the key event -- measured 0.3 ms
+// after the press -- while an ordinary printable character arrives at
+// -insertText: through UIKit's text-input pipeline, measured ~5 ms after the
+// press (25 ms for the first keystroke after an idle spell, and further behind
+// once that pipeline has a backlog). Nothing sequenced the two, so a key
+// command could overtake text typed before it. That is what put h/j/k/l ahead
+// of typed characters until they were taken off the key-command path; arrows,
+// Tab, Esc, the function keys and the Ctrl chords are still key commands and
+// kept the same head start.
+//
+// -pressesBegan: sees every hardware key, in the order the user pressed them,
+// before either route runs, so it is the one place that knows the true order.
+// Each press that can produce input reserves a slot; whichever route produces
+// the bytes fills that press's slot; slots are emitted strictly from the front.
+// A lone keystroke -- overwhelmingly the common case -- fills the only slot and
+// flushes with no added latency, and input with no press behind it (the
+// on-screen keyboard, paste, the arrow bar, key repeat) has no slot to wait
+// behind and goes straight out.
+//
+// Two invariants hold this together. Every submission is emitted exactly once:
+// a slot is filled by one submission and removed when emitted, and a filled
+// slot is always drained -- by the flush after every fill, by the timeout
+// below, or by -discardPendingInput. And every uncertain case degrades to
+// sending immediately, which is precisely the behaviour before any of this
+// existed, so a mis-identified slot can only fail to improve the ordering, not
+// lose or duplicate a keystroke.
+
+// How long a reservation may hold the queue before it is written off. It has to
+// clear the worst text-path latency (25 ms, cold) by a wide margin, because
+// giving up early is what reintroduces the reordering. It only costs anything
+// when a press produces no input at all -- a chord that belongs to another
+// responder, a keystroke swallowed into an IME composition.
+static const NSTimeInterval kPendingInputTimeout = 0.075;
+
+- (AOKInputSlot *)reserveInputSlotForInput:(NSString *)input {
+    if (self.pendingInput == nil)
+        self.pendingInput = [NSMutableArray new];
+    AOKInputSlot *slot = [AOKInputSlot new];
+    slot.input = input;
+    [self.pendingInput addObject:slot];
+    [self armPendingInputTimeout];
+    return slot;
+}
+
+- (void)armPendingInputTimeout {
+    if (self.pendingInputTimeout != nil)
+        return;
+    __weak typeof(self) weakSelf = self;
+    NSTimer *timer = [NSTimer timerWithTimeInterval:kPendingInputTimeout repeats:NO block:^(NSTimer *t) {
+        typeof(self) strongSelf = weakSelf;
+        strongSelf.pendingInputTimeout = nil;
+        // Write off the reservations at the front that never produced anything,
+        // and let whatever queued up behind them through.
+        while (strongSelf.pendingInput.count > 0 && ((AOKInputSlot *) strongSelf.pendingInput.firstObject).payload == nil)
+            [strongSelf.pendingInput removeObjectAtIndex:0];
+        [strongSelf flushPendingInput];
+    }];
+    [NSRunLoop.mainRunLoop addTimer:timer forMode:NSRunLoopCommonModes];
+    self.pendingInputTimeout = timer;
+}
+
+- (void)cancelPendingInputTimeout {
+    [self.pendingInputTimeout invalidate];
+    self.pendingInputTimeout = nil;
+}
+
+- (void)flushPendingInput {
+    while (self.pendingInput.count > 0) {
+        AOKInputSlot *head = self.pendingInput.firstObject;
+        if (head.payload == nil)
+            break;
+        [self.pendingInput removeObjectAtIndex:0];
+        if (head.payload.length > 0)
+            [self.terminal sendInput:head.payload];
+    }
+    if (self.pendingInput.count == 0)
+        [self cancelPendingInputTimeout];
+    else
+        [self armPendingInputTimeout];
+}
+
+// Focus is going away: emit what is already in hand, in order, and write off
+// reservations whose bytes this view will never see.
+- (void)discardPendingInput {
+    NSMutableArray *kept = [NSMutableArray new];
+    for (AOKInputSlot *slot in self.pendingInput)
+        if (slot.payload != nil)
+            [kept addObject:slot];
+    self.pendingInput = kept;
+    self.keyEventSlot = nil;
+    [self flushPendingInput];
+}
+
+// Every byte the keyboard produces leaves through here.
+- (void)submitInput:(NSData *)data {
+    if (data == nil)
+        return;
+    AOKInputSlot *slot = nil;
+    if (self.immediateKeyInputDepth > 0) {
+        // Produced synchronously by the key event being dispatched right now,
+        // so it belongs to that press's reservation and to no other. A key
+        // repeat arrives here with no press behind it and no slot claimed, and
+        // goes straight out.
+        slot = self.keyEventSlot;
+        self.keyEventSlot = nil;
+    } else {
+        // Came back through the text pipeline, so it belongs to the oldest
+        // press still waiting for its bytes.
+        for (AOKInputSlot *candidate in self.pendingInput) {
+            if (candidate.payload == nil) {
+                slot = candidate;
+                break;
+            }
+        }
+        if (slot == self.keyEventSlot)
+            self.keyEventSlot = nil;
+    }
+    if (slot == nil || slot.payload != nil) {
+        if (data.length > 0)
+            [self.terminal sendInput:data];
+        return;
+    }
+    slot.payload = data;
+    [self flushPendingInput];
+}
+
 #pragma mark Keyboard Input
 
 // implementing these makes a keyboard pop up when this view is first responder
@@ -377,13 +532,13 @@ static void ISHRecordTerminalViewEvent(NSString *event, Terminal *terminal, NSDi
 
     text = [text stringByReplacingOccurrencesOfString:@"\n" withString:@"\r"];
     NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
-    [self.terminal sendInput:data];
+    [self submitInput:data];
 }
 
 // This method is used with text that requires no further processing; like the escape sequences from function keys
 - (void)insertRawText:(NSString *)text {
     NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
-    [self.terminal sendInput:data];
+    [self submitInput:data];
 }
 
 - (void)insertControlChar:(char)ch {
@@ -393,7 +548,7 @@ static void ISHRecordTerminalViewEvent(NSString *event, Terminal *terminal, NSDi
         if (ch == '6') ch = '^';
         if (ch != '\0')
             ch = toupper(ch) ^ 0x40;
-        [self.terminal sendInput:[NSData dataWithBytes:&ch length:1]];
+        [self submitInput:[NSData dataWithBytes:&ch length:1]];
     }
 }
 
@@ -574,6 +729,23 @@ static void ISHRecordTerminalViewEvent(NSString *event, Terminal *terminal, NSDi
 #pragma mark Hardware Keyboard
 
 - (void)handleKeyCommand:(UIKeyCommand *)command {
+    // Everything this produces comes straight off the key event being
+    // dispatched now, so it takes the reservation -pressesBegan: just made for
+    // that press -- but only if the reservation really is this key's. UIKit
+    // repeats a held key by calling here again with no press in between, and
+    // that repeat must not take a reservation belonging to a key someone typed
+    // a millisecond ago. If it does not match, drop the claim and let this go
+    // straight out, exactly as it did before any of this existed.
+    NSString *owner = self.keyEventSlot.input;
+    if (owner == nil || command.input == nil ||
+        [owner caseInsensitiveCompare:command.input] != NSOrderedSame)
+        self.keyEventSlot = nil;
+    self.immediateKeyInputDepth++;
+    [self dispatchKeyCommand:command];
+    self.immediateKeyInputDepth--;
+}
+
+- (void)dispatchKeyCommand:(UIKeyCommand *)command {
     NSString *key = command.input;
     if (@available(iOS 13.0, *)) {
         if ( command.propertyList != nil ) {
@@ -617,6 +789,11 @@ static void ISHRecordTerminalViewEvent(NSString *event, Terminal *terminal, NSDi
 static const char *alphabet = "abcdefghijklmnopqrstuvwxyz";
 static const char *controlKeys = "abcdefghijklmnopqrstuvwxyz@^26-=[]\\ ";
 static const char *metaKeys = "abcdefghijklmnopqrstuvwxyz0123456789-=[]\\;',./";
+// Held-key repeat for the vi movement keys is synthesised in -pressesBegan:
+// (see -startKeyRepeatForPresses:). These four used to be registered as bare
+// UIKeyCommands purely to borrow UIKit's key-command repeat, which put them on
+// a different delivery path from every other printable character -- see the
+// comment on -startKeyRepeatForPresses: for why that reordered typed text.
 static const char *viRepeatKeys = "hjkl";
 
 - (NSArray<UIKeyCommand *> *)keyCommands {
@@ -624,9 +801,6 @@ static const char *viRepeatKeys = "hjkl";
         return _keyCommands;
     _keyCommands = [NSMutableArray new];
     [self addKeys:controlKeys withModifiers:UIKeyModifierControl];
-    // Route vi movement keys through UIKeyCommand so held keys repeat instead of
-    // falling back to system accent handling.
-    [self addKeys:viRepeatKeys withModifiers:0];
 
     if (@available(iOS 13.4, *)) {
         [self addFunctionKey:UIKeyInputUpArrow withName:@"Up" withNormalEscapeSequence:@"\x1b[A" withShiftEscapeSequence:@"\x1b[1;2A" withControlEscapeSequence:@"\x1b[1;5A" withAltEscapeSequence:@"\x1b[1;3A"];
@@ -799,10 +973,92 @@ static const char *viRepeatKeys = "hjkl";
     [self handleKeyCommand:newCommand];
 }
 
+// UIKit repeats a held key only for keys claimed by a UIKeyCommand, so h/j/k/l
+// used to be registered as bare key commands just to get vi movement to repeat.
+// That bought repeat at the cost of ordering: a key command is dispatched
+// straight off the key event (~0.3 ms after the press), while an ordinary
+// printable character reaches -insertText: through UIKit's text-input pipeline
+// (~5 ms after the press, and further behind once that pipeline has a backlog).
+// Two delivery paths with nothing sequencing them, so h/j/k/l overtook the
+// characters typed before them -- "abcdefghijklmnopqrst" reached the tty as
+// "abcdhejkflgimnopqrst", with only h, j, k and l out of place. The window is
+// about 5 ms, so it takes a machine to type into it, but the terminal has no
+// business reordering anything it is handed.
+//
+// Repeat is driven from the press stream instead: the first character of a hold
+// travels the same in-order path as every other letter, and only the repeats are
+// synthesised here. Timings match what UIKit's key-command repeat did (a 0.4 s
+// delay, then ~0.1 s per repeat), measured against the previous build.
+static const NSTimeInterval kKeyRepeatDelay = 0.4;
+static const NSTimeInterval kKeyRepeatInterval = 0.1;
+
+- (void)stopKeyRepeat {
+    [self.keyRepeatTimer invalidate];
+    self.keyRepeatTimer = nil;
+    self.keyRepeatText = nil;
+}
+
+- (void)startKeyRepeatForPresses:(NSSet<UIPress *> *)presses API_AVAILABLE(ios(13.4)) {
+    // Any new press ends the previous key's repeat, which is what a real
+    // keyboard does when you roll from one key on to the next.
+    [self stopKeyRepeat];
+    if (presses.count != 1)
+        return;
+    UIKey *key = presses.anyObject.key;
+    if (key == nil || key.modifierFlags != 0)
+        return;
+    NSString *characters = key.charactersIgnoringModifiers;
+    if (characters.length != 1)
+        return;
+    unichar c = [characters characterAtIndex:0];
+    if (c == 0 || c > 0x7f || strchr(viRepeatKeys, (char) c) == NULL)
+        return;
+    self.keyRepeatText = characters;
+    // Repeats at kKeyRepeatInterval, with the first one held off until
+    // kKeyRepeatDelay so a normal tap never produces a second character.
+    __weak typeof(self) weakSelf = self;
+    NSTimer *timer = [NSTimer timerWithTimeInterval:kKeyRepeatInterval repeats:YES block:^(NSTimer *t) {
+        typeof(self) strongSelf = weakSelf;
+        NSString *text = strongSelf.keyRepeatText;
+        if (strongSelf == nil || text == nil) {
+            [t invalidate];
+            return;
+        }
+        // The sink the key-command handler used, so a synthesised repeat is
+        // indistinguishable from the one UIKit used to deliver (including the
+        // on-screen Ctrl modifier, if it happens to be armed).
+        [strongSelf insertText:text];
+    }];
+    timer.fireDate = [NSDate dateWithTimeIntervalSinceNow:kKeyRepeatDelay];
+    timer.tolerance = kKeyRepeatInterval / 4;
+    // Common modes: a repeat must keep going while the scroll view is tracking,
+    // which is exactly when the default mode stops servicing timers.
+    [NSRunLoop.mainRunLoop addTimer:timer forMode:NSRunLoopCommonModes];
+    self.keyRepeatTimer = timer;
+}
+
 - (void)pressesBegan:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
+    if (@available(iOS 13.4, *)) {
+        [self startKeyRepeatForPresses:presses];
+        // Reserve each press's place in the input stream before anything can
+        // produce bytes for it. Skipped for presses that cannot reach the tty,
+        // so they never hold the queue: a modifier on its own produces no
+        // characters, and a Command chord is always somebody else's (the
+        // terminal only ever acts on shift/alt/caps/control).
+        self.keyEventSlot = nil;
+        for (UIPress *press in presses) {
+            UIKey *key = press.key;
+            if (key == nil || key.characters.length == 0)
+                continue;
+            if (key.modifierFlags & UIKeyModifierCommand)
+                continue;
+            self.keyEventSlot = [self reserveInputSlotForInput:key.charactersIgnoringModifiers];
+        }
+    }
     bool handled = false;
     UIKeyModifierFlags modifier;
 
+    self.immediateKeyInputDepth++;
     if (@available(iOS 13.4, *)) {
         // this is all to handle Ins/Help key as Apple don't support that key using UIKey interface
         UIKey *key;
@@ -843,12 +1099,18 @@ static const char *viRepeatKeys = "hjkl";
             }
         }
     }
+    self.immediateKeyInputDepth--;
     if ( !handled) {
        return [super pressesBegan:presses withEvent:event];
     }
 }
 
 - (void)pressesEnded:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
+    [self stopKeyRepeat];
+}
+
+- (void)pressesCancelled:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
+    [self stopKeyRepeat];
 }
 
 #pragma mark UITextInput stubs

@@ -1,0 +1,237 @@
+#!/bin/sh
+# Build the Rust native program and rewrite its libc imports onto the shim.
+#
+# Three steps that have to happen together, which is why they are one script
+# rather than three meson rules: cargo produces an archive whose open()/read()
+# bind to the HOST, and it is only safe to link once those are renamed. A
+# half-applied version of this is an object that silently reads iOS's
+# filesystem, so the rename is not an optimisation to skip on a rebuild.
+set -eu
+
+crate_dir=$1; out=$2; cargo=$3; objcopy=$4; renames=$5; target=${6:-}; features=${7:-}
+
+cargo_args="--release --quiet --manifest-path $crate_dir/Cargo.toml"
+# Reproducing the tokio measurement has to go through the real build, because
+# the rename pass is the thing under test. Two ways in, and both make ninja
+# rerun this on their own -- the argument is part of the command line:
+#     Xcode:  set AOK_RUST_FEATURES in app/iSH.xcconfig
+#     meson:  -Dnative_rust_features=tokio-probe
+# The environment is still honoured for a bare `ninja -C build ish`.
+[ -z "$features" ] && features="${AOK_RUST_FEATURES:-}"
+[ -n "$features" ] && cargo_args="$cargo_args --features $features"
+built_dir="$crate_dir/target/release"
+if [ -n "$target" ]; then
+    cargo_args="$cargo_args --target $target"
+    built_dir="$crate_dir/target/$target/release"
+fi
+
+# C that CARGO builds gets the shim force-included, the same way AOK's own
+# sources do.
+#
+# The rename pass cannot reach it. objcopy rewrites CALLS, and a C dependency's
+# reference to Darwin's `stderr` is not a call -- it reads the variable
+# `__stderrp` and passes it. There is nothing to rename it to either: the
+# shim's stderr is a per-THREAD FILE (nlibc_std[3]), and a global variable
+# cannot be one.
+#
+# Force-including turns it back into a call. tree-sitter's runtime, vendored
+# inside tree-house-bindings and built by cc-rs, was the case that found this:
+# unrouted it wrote its parser diagnostics to the app's stderr instead of the
+# program's. With the header it compiles clean and calls nlibc_stderr.
+#
+# Both variables, because cc-rs picks by whether it is cross-compiling:
+# TARGET_CFLAGS for a cross build, CFLAGS for a native one.
+repo_root=$(cd "$(dirname "$0")/.." && pwd)
+# _DARWIN_C_SOURCE because the header is force-included BEFORE the translation
+# unit's own feature-test macros, and a dependency that asks for strict POSIX
+# takes the BSD types with it: tree-house-bindings builds tree-sitter with
+# -D_POSIX_C_SOURCE=200112L, which hides u_int/u_short/u_long, and the shim
+# header includes <sys/mount.h>, which needs them. Eleven errors inside the
+# SDK's own headers, none of them in anyone's code.
+shim_include="-include $repo_root/kernel/native_libc.h -I$repo_root -D_DARWIN_C_SOURCE"
+CFLAGS="${CFLAGS:-} $shim_include"
+TARGET_CFLAGS="${TARGET_CFLAGS:-} $shim_include"
+export CFLAGS TARGET_CFLAGS
+
+# CARGO_TARGET_DIR is left alone deliberately: cargo's own layout is what the
+# path above assumes, and overriding it in one place and not the other is how
+# this breaks silently.
+"$cargo" build $cargo_args
+
+# Found rather than named: a staticlib crate produces exactly one lib*.a at the
+# top of its profile directory (the copies under deps/ are not it), so there is
+# nothing to keep in step with a crate's [lib] name. This script builds more
+# than one crate now -- the probe and helix -- and spelling the name here was
+# the obvious way for the second one to silently get the first one's archive.
+staticlib=""
+for candidate in "$built_dir"/lib*.a; do
+    [ -f "$candidate" ] || continue
+    if [ -n "$staticlib" ]; then
+        echo "build-rust-native: $built_dir has more than one lib*.a; which is the crate?" >&2
+        exit 1
+    fi
+    staticlib="$candidate"
+done
+[ -n "$staticlib" ] || { echo "build-rust-native: cargo produced no lib*.a in $built_dir" >&2; exit 1; }
+
+# Why the archive is flattened into one object before anything else:
+#
+#  1. It is the only form meson can hand to libish's `objects:`, and being
+#     inside libish.a is what lets the Xcode build link this without knowing
+#     it exists. A separate archive needs a -force_load that only meson's own
+#     link line carries, so the app build fails to resolve the registry entry.
+#  2. llvm-objcopy --redefine-sym does not reliably rewrite undefined symbols
+#     in Mach-O *archive members* -- it skips some and still exits 0. On a
+#     single flat object it rewrites all of them. Merging first turned a
+#     rename that needed a documented exception into one with no survivors.
+#
+# It has to be `ar x` and then a partial link of the extracted members: `ld -r`
+# reading the archive directly, with -all_load or -force_load, produces an
+# 11MB object holding four symbols and exits 0. That output links, and every
+# call in it goes nowhere.
+work=$(mktemp -d "${TMPDIR:-/tmp}/rust-native.XXXXXX")
+trap 'rm -rf "$work"' EXIT INT TERM
+abs_staticlib=$(cd "$(dirname "$staticlib")" && pwd)/$(basename "$staticlib")
+
+# tools/ar-extract.py rather than `ar x`, because members really do share
+# names and `ar x` keeps only one of each -- silently, leaving the link short a
+# translation unit it will not miss until something calls into it. With the
+# fifteen tree-sitter grammars linked in there are TWELVE members called
+# parser.o, so this is not a hypothetical: eleven grammars would have gone
+# missing and every file of those languages would simply not have highlighted.
+extracted=$(python3 "$repo_root/tools/ar-extract.py" "$abs_staticlib" "$work")
+echo "build-rust-native: $extracted object(s) from $(basename "$abs_staticlib")" >&2
+merged="$work/merged.o"
+# clang, not ld: it supplies -platform_version from the triple, which bare
+# `ld -r` refuses to go without. -sdk keeps the iOS build off the macOS
+# sysroot; a host build takes the default.
+sdk=""
+clang_target=""
+# $target is CARGO's triple, and cargo does not spell triples the way LLVM
+# does: the simulator is `-sim` to cargo and `-simulator` to clang, and the
+# deployment version goes BEFORE that environment rather than after it.
+#
+# This used to be a concatenation, "$target${IPHONEOS_DEPLOYMENT_TARGET}", and
+# it survived only because the device case is the one where the two spellings
+# coincide -- aarch64-apple-ios + 15.0 really is the valid aarch64-apple-ios15.0.
+# The simulator got aarch64-apple-ios-sim15.0, which clang rejects outright
+# ("version 'sim15.0' in target triple ... is invalid"), so the partial link
+# below failed and took the whole Ninja target with it. Nothing could be built
+# for the Simulator at all -- UI work was device-only. Bare `ninja` was broken
+# the same way, just less visibly: with no IPHONEOS_DEPLOYMENT_TARGET in the
+# environment the concatenation left aarch64-apple-ios-sim, which is equally
+# invalid.
+#
+# So this translates rather than concatenates, and every arm has to name the
+# environment explicitly. A new cargo triple that is not listed here falls
+# through and is passed as given, which is wrong-but-visible; appending a
+# version to it was wrong-and-silent.
+ios_version="${IPHONEOS_DEPLOYMENT_TARGET:-15.0}"
+# arm64, not cargo's aarch64. clang takes either, but this is the spelling
+# xcode-meson.sh's cross file already uses for the very same build, and one
+# spelling per build is what keeps the two greppable together.
+target_arch=${target%%-*}
+[ "$target_arch" = aarch64 ] && target_arch=arm64
+case "$target" in
+    "")                 ;;
+    *-apple-ios-sim)    sdk="iphonesimulator"
+                        clang_target="-target $target_arch-apple-ios$ios_version-simulator" ;;
+    *-apple-ios-macabi) sdk="iphonesimulator"
+                        clang_target="-target $target_arch-apple-ios$ios_version-macabi" ;;
+    *-apple-ios)        sdk="iphoneos"
+                        clang_target="-target $target_arch-apple-ios$ios_version" ;;
+    # The host build. No version appended: clang defaults it to the running
+    # macOS, which is what a host build wants, and IPHONEOS_DEPLOYMENT_TARGET
+    # was never meaningful here in the first place.
+    *-apple-darwin)     sdk="macosx"
+                        clang_target="-target $target" ;;
+    *)                  clang_target="-target $target" ;;
+esac
+# shellcheck disable=SC2086
+(cd "$work" && xcrun ${sdk:+-sdk $sdk} clang $clang_target -nostdlib -Wl,-r -o "$merged" ./*.o)
+
+# The rename list is generated from kernel/native_libc.h at build time, so it
+# cannot fall behind the header. See tools/gen-nlibc-renames.py.
+#
+# The two --redefine-sym below are NOT libc routing, which is why they are
+# spelled here rather than added to that generated list.
+#
+# Rust's std defines __isPlatformVersionAtLeast / __isOSVersionAtLeast -- the
+# compiler-rt builtins clang emits for Objective-C's `@available` -- as
+# ordinary global symbols. Linking the crate into the app therefore makes
+# RUST's copy win over the toolchain's for AOK's own Objective-C.
+#
+# On device the two agree, so nothing showed. In the SIMULATOR they do not:
+# Rust's reads the system plist relative to $IPHONE_SIMULATOR_ROOT and
+# .expect()s that variable, which is NOT set for an app the simulator
+# launches. app/AccessibilityFixes.m asks `if (@available(iOS 15.7, *))` from
+# a __attribute__((constructor)), so the panic landed inside a dyld static
+# initializer and iSH-AOK took SIGABRT before main() on every launch. The
+# build being fixed is what made this reachable at all.
+#
+# Renamed rather than deleted: objcopy rewrites the definition AND the crate's
+# own references to it in one pass, so Rust keeps its implementation for its
+# own callers and only AOK's Objective-C falls through to compiler-rt -- which
+# is the implementation that knows how to answer this under a simulator.
+# shellcheck disable=SC2046
+"$objcopy" $(tr '\n' ' ' < "$renames") \
+    --redefine-sym ___isPlatformVersionAtLeast=___rust_isPlatformVersionAtLeast \
+    --redefine-sym ___isOSVersionAtLeast=___rust_isOSVersionAtLeast \
+    "$merged" "$out"
+
+# Second pass, driven by what the object actually imports rather than by a
+# list of suffixes someone guessed.
+#
+# Darwin exports several libc entry points under a suffixed symbol as well as
+# the bare name, and the suffixes COMPOUND: rustix imports
+# `select$DARWIN_EXTSN$NOCANCEL`. gen-nlibc-renames.py emits the single
+# suffixes it knows, and that list had already been wrong twice -- first
+# missing $DARWIN_EXTSN entirely, then missing the compound -- each time as a
+# SILENT escape to the host. Enumerating harder is the same bet again.
+#
+# So: take every undefined symbol that still carries a `$`, and if the part
+# before the first `$` is a name this rename list routes, route the variant to
+# the same place. A suffix nobody has seen yet is handled by construction.
+variants=$(nm -u "$out" 2>/dev/null | sed 's/^ *//' | grep '\$' | sort -u | while read -r sym; do
+    base=${sym%%\$*}
+    dest=$(grep -m1 -- "^${base}=" "$renames" 2>/dev/null | cut -d= -f2)
+    [ -n "$dest" ] && printf -- '--redefine-sym\n%s=%s\n' "$sym" "$dest"
+done)
+if [ -n "$variants" ]; then
+    echo "build-rust-native: routing $(printf '%s' "$variants" | grep -c '=') suffixed variant(s)" >&2
+    # shellcheck disable=SC2046
+    "$objcopy" $(printf '%s' "$variants" | tr '\n' ' ') "$out" "$out.variants"
+    mv "$out.variants" "$out"
+fi
+
+# A rewritten object that still imports a raw libc name is the failure this
+# whole mechanism exists to prevent, and it is SILENT: the link succeeds and
+# the guest reads the host's files.
+#
+# Checked against the whole generated list rather than a hand-picked few, and
+# with no exceptions -- since the merge above, there are none.
+raw=$(nm -u "$out" 2>/dev/null | sed 's/^ *U //' | sort -u)
+missed=""
+while IFS= read -r line; do
+    case $line in
+        *--redefine-sym) continue ;;
+        _*=_*) from=${line%%=*} ;;
+        *) continue ;;
+    esac
+    if printf '%s\n' "$raw" | grep -qxF -- "$from"; then
+        missed="$missed $from"
+    fi
+    # And the same name wearing any suffix, which is the form that escaped.
+    for sym in $(printf '%s\n' "$raw" | grep -E "^${from}\\\$"); do
+        missed="$missed $sym"
+    done
+done < "$renames"
+
+if [ -n "$missed" ]; then
+    echo "build-rust-native: these libc imports survived the rename:" >&2
+    for m in $missed; do echo "    $m" >&2; done
+    echo "  llvm-objcopy could not rewrite them. Either the symbol is genuinely" >&2
+    echo "  meant to reach the host (say so in tools/check-native-libc.py), or" >&2
+    echo "  the crate must stop calling it." >&2
+    exit 1
+fi

@@ -1,9 +1,11 @@
 # ktop
 
 A small, dependency-free `htop`-style process viewer with one extra column:
-**ARCH**, the guest CPU architecture (`arm64` / `x86_64` / `x86` /
-`riscv64`) of each process's binary, read from its ELF header via
-`/proc/<pid>/exe`.
+**ARCH**, the CPU architecture (`arm64` / `x86_64` / `x86` / `riscv64`) of
+each process's binary, read from its ELF header via `/proc/<pid>/exe`.
+Natively-dispatched programs (`/AOK/native/*`) have no ELF image of their own,
+so for those it reports the host's architecture -- which is what that code
+really is, and makes the native processes stand out at a glance.
 
 iSH-AOK can run i386, amd64, arm64 and riscv64 binaries side by side in the
 same booted guest -- most usefully via `chroot`ing into another installed
@@ -13,6 +15,16 @@ colored per-CPU / memory / swap meter bars, a cursor-selectable scrolling
 process list, sort hotkeys, and kill. Batch mode (`-b`) prints a plain
 top-style table for scripting. No ncurses, no procps -- just libc, ANSI
 escapes and `/proc`.
+
+## Already built in: /AOK/native/ktop
+
+ktop is also compiled into iSH-AOK from this same `ktop.c`, and runs as host
+code with no build step:
+
+    /AOK/native/ktop
+
+Present on every build and every guest architecture. Everything below is still
+the way to build it yourself, and nothing here has been replaced.
 
 ## Prebuilt binaries (aarch64) -- source tree only
 
@@ -31,6 +43,13 @@ exist on the device -- build from source below, on aarch64 too.
 sh /AOK/tools/ktop/build.sh          # builds ./ktop under /tmp/ktop-build
 sh /AOK/tools/ktop/build.sh install  # also installs to /usr/local/bin/ktop
 ```
+
+Installing writes to `/usr/local/bin`, which is root-owned on a normal root, so
+run that second form as root (`sudo sh /AOK/tools/ktop/build.sh install`) or
+install the built binary yourself with
+`sudo make -C /tmp/ktop-build install PREFIX=/usr/local`. Re-running either
+form is fine: the work directory is refreshed from `/AOK` each time, so a ktop
+fix reaches an already-installed copy by building again.
 
 `/AOK` is a read-only mount, so the script copies the source to a writable
 work directory (`$WORK_DIR`, default `/tmp/ktop-build`) before running `make`.

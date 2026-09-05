@@ -245,11 +245,9 @@ static NSURL *DownloadedBundledArchiveURL(NSDictionary<NSString *, NSString *> *
 // One spelling, because unmounting the old name and mounting the new one have
 // to agree with each other and with what boot produced. (Only the iSH kernel
 // has /AOK/roots; the iSH+Linux build has no mounts to name.)
-#if !ISH_LINUX
 static NSString *ExposedRootPoint(NSString *name) {
     return [@"/AOK/roots/" stringByAppendingString:name];
 }
-#endif
 
 // "It wasn't there" is a fine outcome for something we are removing, not a
 // failure worth logging. (AppDelegate.m has its own copy for the same reason;
@@ -766,7 +764,69 @@ static NSString *PreferredDefaultRootName(NSOrderedSet<NSString *> *roots) {
     [self requestFileProviderDomainSync];
 }
 
+// The File Provider extension cannot run on a Mac, and registering a domain
+// there does not fail politely -- it crashes.
+//
+// FileProviderExtension subclasses NSFileProviderExtension, whose availability
+// macro in Apple's own SDK is
+//
+//     API_AVAILABLE(ios(8.0)) API_UNAVAILABLE(macos, macCatalyst)
+//
+// and the extension point is com.apple.fileprovider-nonui, the classic API.
+// macOS hosts only the replicated API (NSFileProviderReplicatedExtension). So
+// on an Apple Silicon Mac running this as a "Designed for iPad" app, the
+// framework loads the extension, finds one it cannot host, and aborts it with
+// __FILEPROVIDER_BAD_EXTENSION__ inside beginRequestWithDomain: -- before a
+// single line of ours runs, which is why the crash reports carry no AOK frame.
+//
+// Nothing inside the extension can prevent that; the only lever is here, in the
+// app: do not register a domain, and the extension is never asked to begin a
+// request. Everything else about AOK works on a Mac -- it is the Files
+// integration specifically that is unavailable.
+static BOOL ISHFileProviderUnavailableOnThisPlatform(void) {
+    if (@available(iOS 14.0, *)) {
+        NSProcessInfo *info = NSProcessInfo.processInfo;
+        return info.isiOSAppOnMac || info.isMacCatalystApp;
+    }
+    return NO;
+}
+
+// Drop a domain a previous run (or an earlier build) left registered, so a Mac
+// -- or a re-signed build that has since lost its app group -- does not keep a
+// stale one that Finder or Files would try to open.
+- (void)removeAllFileProviderDomains {
+    [NSFileProviderManager getDomainsWithCompletionHandler:^(NSArray<NSFileProviderDomain *> *domains, NSError *error) {
+        if (error != nil || domains.count == 0)
+            return;
+        for (NSFileProviderDomain *domain in domains) {
+            [NSFileProviderManager removeDomain:domain completionHandler:^(NSError *removeError) {
+                if (removeError != nil)
+                    NSLog(@"error removing file provider domain: %@", removeError);
+            }];
+        }
+    }];
+}
+
 - (void)requestFileProviderDomainSync {
+    if (ISHFileProviderUnavailableOnThisPlatform()) {
+        [ISHDiagnosticsStore recordBreadcrumb:@"fileprovider.domainSync.unsupportedPlatform"
+                                      details:@{@"reason": @"NSFileProviderExtension is unavailable on macOS"}];
+        [self removeAllFileProviderDomains];
+        return;
+    }
+
+    // Without an app group the app runs out of its own private container
+    // (ContainerURL()), which the extension -- a separate process with a
+    // separate private container -- cannot see. A domain registered here would
+    // be an empty folder in Files whose every operation failed, so don't
+    // register one. Everything else about AOK works in that state.
+    if (!ContainerIsSharedAppGroup()) {
+        [ISHDiagnosticsStore recordBreadcrumb:@"fileprovider.domainSync.noAppGroup"
+                                      details:@{@"reason": @"no shared app group container; using the private fallback"}];
+        [self removeAllFileProviderDomains];
+        return;
+    }
+
     NSArray<NSString *> *rootsSnapshot = nil;
     NSUInteger requestedGeneration = 0;
     @synchronized (self) {
@@ -1050,12 +1110,13 @@ void root_progress_callback(void *cookie, double progress, const char *message, 
 // directory out from under a still-mounted (or actively chrooted-into) fake
 // filesystem would corrupt or orphan it, so tear those mounts down first.
 //
-// The guard here used to be `#if ISH_LINUX`, which is backwards: /AOK/roots
-// only exists in the iSH kernel (-boot's whole body is `#if !ISH_LINUX`, and
-// do_umount is that kernel's, not liblinux's). So in every shipping build this
-// method was compiled down to `return YES` -- no unmount, and no busy check at
-// all. A rename then moved a live fakefs's data/ and meta.db out from under it
-// while a chroot was still running on them, and a delete removed them outright.
+// This body was once guarded by `#if ISH_LINUX`, which was backwards --
+// /AOK/roots only ever existed in the iSH kernel, not the retired Linux one --
+// so in every shipping build the method compiled down to `return YES`: no
+// unmount, and no busy check at all. A rename then moved a live fakefs's data/
+// and meta.db out from under it while a chroot was still running on them, and
+// a delete removed them outright. The guard is gone with that kernel; the
+// history is kept because the failure it caused is not obvious from the code.
 //
 // Returns NO with *error set only if the root is genuinely busy (something
 // still has an open fd/cwd/root inside it, e.g. an active chroot session --
@@ -1064,7 +1125,6 @@ void root_progress_callback(void *cookie, double progress, const char *message, 
 // mounted at all) is harmless and silently ignored -- mount_detach is safe to
 // call unconditionally on a path that isn't currently mounted.
 - (BOOL)unmountExposedRootNamed:(NSString *)name error:(NSError **)error {
-#if !ISH_LINUX
     NSString *base = ExposedRootPoint(name);
     NSArray<NSString *> *binds = @[@"AOK/tools", @"run", @"dev/pts", @"dev", @"sys", @"proc"];
     for (NSString *bind in binds)
@@ -1077,7 +1137,6 @@ void root_progress_callback(void *cookie, double progress, const char *message, 
         }
         return NO;
     }
-#endif
     return YES;
 }
 
@@ -1094,7 +1153,6 @@ void root_progress_callback(void *cookie, double progress, const char *message, 
 // root was mounted moments earlier (so no migration is pending) and the guest
 // must see the new name before the caller reports the rename as done.
 - (BOOL)exposeRootNamed:(NSString *)name {
-#if !ISH_LINUX
     // The booted root is already /, and /AOK/roots is deliberately "every
     // OTHER root": mounting it a second time would give the same fakefs two
     // live SQLite connections in one process.
@@ -1148,9 +1206,6 @@ void root_progress_callback(void *cookie, double progress, const char *message, 
     [ISHDiagnosticsStore recordLaunchStage:@"boot.root.secondary.mounted"
                                    details:@{@"root": name, @"path": mountPoint}];
     return YES;
-#else
-    return NO;
-#endif
 }
 
 // The mkdir'd directory the mount above sits on. Once that mount is gone the
@@ -1608,10 +1663,12 @@ static NSURL *HostURLForGuestPath(NSString *guestPath, id<ProgressReporter> prog
             dispatch_semaphore_signal(done);
         }];
     // Safe to wait: this always runs on the roots-control queue, never on main,
-    // and the bridge completes on its own queue. The timeout is a backstop
-    // rather than a policy -- a completion that never arrives would wedge the
-    // one serial queue for good, and every later command would answer EBUSY
-    // with nothing running to explain it.
+    // and the bridge does its work on a lane of its own -- the completion that
+    // signals us is dispatched to MAIN, which is why nothing may ever block main
+    // on the roots-control queue. The timeout is a backstop rather than a policy
+    // -- a completion that never arrives would wedge the one serial queue for
+    // good, and every later command would answer EBUSY with nothing running to
+    // explain it.
     if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * 60 * NSEC_PER_SEC))) != 0) {
         if (token != nil)
             [bridge cancelExtraction:token];

@@ -125,11 +125,14 @@ if [ "$is_x86_guest" -eq 1 ]; then
     need_file x86/atomic_cmpxchg32.c
     need_file x86/atomic_cmpxchg8b.c
     need_file x86/atomic_logic32.c
+    need_file x86/atomic_lock_contended.c
     need_file x86/cow_atomic_fault.c
     need_file x86/x87_fpu.c
     need_file x86/x86_loop.c
     need_file x86/bcd_adjust.c
     need_file x86/port_io_gpf.c
+    need_file x86/cpuid_xsave.c
+    need_file x86/fpu_state_span.c
 fi
 if [ "$is_x86_guest" -eq 1 ] && [ "$is_amd64_guest" -eq 0 ]; then
     need_file x86/avx32_smoke.c
@@ -150,6 +153,7 @@ if [ "$is_arm64_guest" -eq 1 ]; then
     need_file arm64/cow_store_restart.c
     need_file arm64/fork_parent_store.c
     need_file arm64/parked_wait_store.c
+    need_file arm64/dc_zva.c
 fi
 if [ "$is_riscv64_guest" -eq 1 ]; then
     need_file riscv64/ptrace_regset.c
@@ -168,6 +172,7 @@ need_file futex_core.c
 need_file process_lifecycle.c
 need_file pthread_sync.c
 need_file ptrace_group_stop.c
+need_file native_ptrace_group_stop.c
 need_file ptrace_thread_follow.c
 need_file epoll_mod_wake.c
 need_file epoll_oneshot_rearm.c
@@ -205,6 +210,11 @@ need_file getpeername_smallbuf.c
 need_file netlink_route.c
 need_file netlink_audit.c
 need_file mount_flags.c
+need_file mount_bind_rbind.c
+need_file fuse_basic.c
+need_file fuse_threaded_daemon.c
+need_file sysfs_dev_ns.c
+need_file native_stdio_lock.c
 need_file devtmpfs_mount.c
 need_file clone_error_cleanup.c
 need_file uts_namespace.c
@@ -215,6 +225,11 @@ need_file vfork_exec_stale_jit_peer.c
 need_file getppid_thread.c
 need_file concurrent_exec_tlb.c
 need_file exec_i386_fault_addr.c
+need_file native_exec_cloexec.c
+need_file reparent_zombie_notify.c
+need_file subreaper_not_inherited.c
+need_file fork_tgroup_reset.c
+need_file rusage_monotonic.c
 need_file random_seed.c
 need_file getrusage_group.c
 need_file pty_line_discipline.c
@@ -240,6 +255,7 @@ need_file mmap_truncate_sigbus.c
 need_file null_page_fault.c
 need_file signalfd_epoll_deadlock.c
 need_file pidfd_epoll_deadlock.c
+need_file pidfd_zombie.c
 need_file signalfd_thread_group.c
 need_file wayland_scm_shm.c
 need_file chroot_getcwd.c
@@ -251,6 +267,68 @@ need_file fifo_open_creat_deadlock.c
 need_file proc_stat_monotonic.c
 need_file proc_field_layout.c
 need_file sock_getfd_errno.c
+need_file sock_nosignal.c
+need_file signal_restart_coverage.c
+need_file signal_stop_restart.c
+need_file utimensat_omit.c
+need_file creds_groups_access.c
+need_file sock_optlen.c
+need_file inotify_events.c
+need_file posix_timer_exec.c
+need_file sock_options.c
+need_file ptrace_attach.c
+need_file inet_nat_bind.c
+need_file signal_process_target.c
+need_file fs_remove_enoent_order.c
+need_file exec_de_thread.c
+need_file jit_writer_starvation.c
+need_file tty_hangup_signal.c
+need_file create_eexist_first.c
+need_file sigchld_disposition.c
+need_file proc_conformance.c
+need_file fcntl_lock_validation.c
+need_file tty_line_discipline.c
+need_file tty_ctty_ioctls.c
+need_file tty_job_control.c
+need_file mmap_validation.c
+need_file mmap_shared_integrity.c
+need_file fs_permission_rules.c
+need_file fs_at_validation.c
+need_file sock_conformance_opts.c
+need_file poll_rdhup_bounds.c
+need_file poll_default_mask.c
+need_file poll_idle_cpu.c
+need_file kmsg_stream.c
+need_file resource_limits_sched.c
+need_file signal_routing_perms.c
+need_file mounts_list_race.c
+need_file sysctl_write_rules.c
+need_file fallocate_modes.c
+need_file openat2_resolve.c
+need_file splice_vmsplice.c
+need_file privs_syscall_misc.c
+need_file timeout_and_cpu_timer.c
+need_file open_tmpfile.c
+need_file mount_flag_perms.c
+need_file sgid_inherit.c
+need_file sockopt_conventions.c
+need_file tty_canon_queue.c
+need_file timer_conventions.c
+need_file mmap_conventions.c
+need_file fd_conventions.c
+need_file proc_files.c
+need_file signal_conventions.c
+need_file dir_tmpfs.c
+need_file futex_validation.c
+need_file orphan_pgrp_wait.c
+need_file dirfd_position.c
+need_file cross_process_state.c
+need_file concurrent_dir_futex.c
+need_file exec_perm_rules.c
+need_file sock_bind_refuse.c
+need_file time_clocks_ticks.c
+need_file futex_robust_requeue.c
+need_file inotify_mask_queue.c
 need_file sock_conn_error.c
 need_file inotify_close_race.c
 need_file inotify_mount_paths.c
@@ -272,6 +350,7 @@ need_file tmpfs_exec.c
 need_file kcmp.c
 need_file procfd_reopen.c
 need_file sysfs_cpu_topology.c
+need_file stack_guard_gap.c
 if [ "$is_amd64_guest" -eq 1 ]; then
     need_file x86/amd64_regress.c
     need_file x86/avx_regress.c
@@ -488,20 +567,111 @@ src_for() {
     echo "$src_dir/$1.c"
 }
 
+# ---- compiled-test cache -----------------------------------------------------
+#
+# Compiling ~190 tests under emulation is most of a gate run -- 30-40 minutes a
+# leg on the Mac, and considerably worse on a device, repeated for every one of
+# the five architectures and again for every release. Almost none of it is new
+# work: between two releases the great majority of test sources are byte-for-byte
+# identical and so is the compiler.
+#
+# So key each binary on what can actually change its contents -- the source, the
+# shared headers, the compiler identity, and the machine -- and reuse it when the
+# key matches. A test that was edited, a rebuilt app whose embedded sources
+# changed, a different arch or a different toolchain all miss the cache and
+# recompile, which is the only correctness property that matters here.
+#
+# Default location is /AOK/fakefs, which is writable, survives app updates and
+# root switches, and keeps the exec bit (unlike /AOK/persist, which is
+# host-backed and flattens Linux metadata -- a cached binary there would come
+# back non-executable). Where that is not writable -- the CLI harness serves
+# /AOK/fakefs read-only -- fall back to a directory beside the work dir, which
+# still helps across repeated local runs. ISH_AOK_REGRESS_CACHE overrides it,
+# and ISH_AOK_REGRESS_NOCACHE=1 turns the whole thing off.
+cache_dir=
+cache_key_base=
+
+cache_init() {
+    [ "${ISH_AOK_REGRESS_NOCACHE:-0}" = "1" ] && return
+    command -v sha256sum >/dev/null 2>&1 || return   # no hash, no cache
+    if [ -n "${ISH_AOK_REGRESS_CACHE:-}" ]; then
+        cache_dir=$ISH_AOK_REGRESS_CACHE
+    elif [ -d /AOK/fakefs ] && (: >/AOK/fakefs/.regress-cache-probe) 2>/dev/null; then
+        rm -f /AOK/fakefs/.regress-cache-probe
+        cache_dir=/AOK/fakefs/regress-cache
+    else
+        cache_dir=$work_dir/../ish-aok-regress-cache
+    fi
+    if ! mkdir -p "$cache_dir" 2>/dev/null; then
+        cache_dir=
+        return
+    fi
+    # Probe the CACHE DIRECTORY, not its parent. /AOK/fakefs is 1777 while
+    # regress-cache inside it is whatever the run that created it left behind
+    # -- root-owned 0755 after any root run -- so the parent probe above says
+    # "writable" and every store then fails for an unprivileged run. Falling
+    # back costs a rebuild; not falling back meant an unwritable cache, and
+    # before the unlink fix it meant the whole suite dying at the first miss.
+    if ! (: >"$cache_dir/.probe") 2>/dev/null; then
+        cache_dir=$work_dir/../ish-aok-regress-cache
+        if ! mkdir -p "$cache_dir" 2>/dev/null ||
+                ! (: >"$cache_dir/.probe") 2>/dev/null; then
+            cache_dir=
+            return
+        fi
+    fi
+    rm -f "$cache_dir/.probe" 2>/dev/null
+    # Everything shared by every test: the headers they all include, the
+    # compiler, and the machine. Folded in once so the per-test key is one hash.
+    cache_key_base=$(
+        {
+            cc --version 2>&1 | head -1
+            uname -m
+            cat "$src_dir"/test_common.h "$src_dir"/x86/atomic_common.h 2>/dev/null
+        } | sha256sum | cut -c1-32
+    )
+    echo "test cache: $cache_dir (key $cache_key_base)"
+}
+
+# Echo the cache path for a test, or nothing when caching is off.
+cache_path_for() {
+    [ -n "$cache_dir" ] || return
+    _h=$(sha256sum "$2" | cut -c1-32)
+    echo "$cache_dir/$1.$cache_key_base.$_h"
+}
+
+# Serve $1 from the cache entry at $2 if there is one. Returns 0 on a hit (the
+# binary is in place and nothing needs compiling), 1 on a miss. Split out of
+# build_one so the vfork_exec_stale_jit_peer sweep below, which cannot use
+# build_one, still gets the cache.
+cache_try() {
+    _name=$1
+    [ -n "$2" ] && [ -x "$2" ] || return 1
+    cp "$2" "$work_dir/bin/$_name" 2>/dev/null || return 1
+    chmod +x "$work_dir/bin/$_name" 2>/dev/null
+    echo "  (cached)"
+    return 0
+}
+
 build_one() {
     name=$1
     echo "+ build $name"
     src_file=$(src_for "$name")
+
+    cached=$(cache_path_for "$name" "$src_file")
+    cache_try "$name" "$cached" && return
     # avx32_smoke is freestanding on purpose: it makes raw int $0x80 syscalls so
     # it can run on an i386 root with no libc, and defines its own _start, which
     # collides with the crt startup object under the ordinary link. It needs
     # -mavx2 to emit VEX at all, and none of the libc flags apply.
     if [ "$name" = avx32_smoke ]; then
-        cc -O1 -mavx2 -nostdlib -static -o "$work_dir/bin/$name" "$src_file"
+        cc -O1 -mavx2 -nostdlib -static -o "$work_dir/bin/$name" "$src_file" || return
+        cache_store "$cached" "$work_dir/bin/$name"
         return
     fi
     if [ "$gas_imm_reg_workaround" -eq 0 ]; then
-        cc -O2 -pthread -I"$src_dir" -o "$work_dir/bin/$name" "$src_file" -lm -ldl
+        cc -O2 -pthread -I"$src_dir" -o "$work_dir/bin/$name" "$src_file" -lm -ldl || return
+        cache_store "$cached" "$work_dir/bin/$name"
         return
     fi
 
@@ -509,13 +679,29 @@ build_one() {
     fixed_asm=$work_dir/$name.gas-workaround.s
     cc -O2 -pthread -I"$src_dir" -S -o "$asm" "$src_file"
     awk -f "$work_dir/rewrite-gas-imm-reg.awk" "$asm" >"$fixed_asm"
-    cc -pthread -o "$work_dir/bin/$name" "$fixed_asm" -lm -ldl
+    cc -pthread -o "$work_dir/bin/$name" "$fixed_asm" -lm -ldl || return
+    cache_store "$cached" "$work_dir/bin/$name"
 }
 
-all_tests="signal_core signal_restart signal_realtime signal_altstack signal_stop_cont signal_forced_trap signal_poll signal_child_burst eventfd_interrupt futex_core process_lifecycle pthread_sync ptrace_group_stop ptrace_thread_follow epoll_mod_wake epoll_oneshot_rearm epoll_mod_spurious_wake epoll_data_layout epoll_eloop epoll_exclusive epoll_dup_add ptrace_exit_kill fcntl_lock fcntl_ofd fcntl_setown at_empty_path utimensat_fd copy_file_range name_to_handle_at sendfile_vhangup pidfd_open pidfd_clone pidfd_fdinfo_pid fsopen_move_mount keyctl_link mountinfo_epollet tmpfs_nlink unix_dgram_cred ambient_caps scm_rights_stress scm_rights_pidfd fs_conformance process_conformance time_conformance mem_conformance sock_conformance getpeername_smallbuf netlink_route netlink_audit mount_flags devtmpfs_mount clone_error_cleanup uts_namespace posix_timer_fork vfork_fatal_signal vfork_exec_stale_jit getppid_thread concurrent_exec_tlb exec_i386_fault_addr random_seed getrusage_group pty_line_discipline proc_pid_io taskstats_genl tmpfs_mmap tmpfs_statfs tmpfs_append memfd_mmap binder_ipc ashmem dma_heap selinuxfs kmsg proc_random binder_ping property_area logd_sink pipe_size mount_stdev mount_cross_dev cgroup2_rmdir mmap_truncate_sigbus null_page_fault signalfd_epoll_deadlock pidfd_epoll_deadlock signalfd_thread_group wayland_scm_shm chroot_getcwd iovec_abi_marshal fakefs_type_race fakefs_casefold fakefs_inode_alias fifo_open_creat_deadlock proc_stat_monotonic proc_field_layout sock_conn_error sock_getfd_errno inotify_close_race inotify_mount_paths statx_mnt_id_timerfd timerfd_settime_readiness opath_symlink_pidfd_wait pidfd_self_exit_deadlock prctl_capbset_drop oom_score_adj sysv_ipc accept_rcvtimeo accept_kill socket_kill inaddr_any_iface procfd_reopen siocoutq epoll_nested tmpfs_exec kcmp pixman_accel aes_gcm_accel file_perms ftruncate_fd_mode syscall_wiring sysfs_cpu_topology"
+# Publish a freshly built binary into the cache. Written to a temporary name in
+# the same directory and renamed, so a concurrent run (two architectures at
+# once is routine) never sees a half-copied binary and treats it as a hit.
+cache_store() {
+    [ -n "$1" ] || return 0
+    _tmp=$1.tmp.$$
+    if cp "$2" "$_tmp" 2>/dev/null; then
+        chmod +x "$_tmp" 2>/dev/null
+        mv -f "$_tmp" "$1" 2>/dev/null || rm -f "$_tmp"
+    else
+        rm -f "$_tmp" 2>/dev/null
+    fi
+    return 0
+}
+
+all_tests="signal_core signal_restart signal_restart_coverage signal_stop_restart utimensat_omit creds_groups_access sock_optlen inotify_events posix_timer_exec sock_options ptrace_attach inet_nat_bind signal_process_target exec_de_thread jit_writer_starvation tty_hangup_signal create_eexist_first sigchld_disposition proc_conformance fcntl_lock_validation tty_line_discipline tty_ctty_ioctls tty_job_control mmap_validation mmap_shared_integrity fs_permission_rules fs_remove_enoent_order fs_at_validation sock_conformance_opts poll_rdhup_bounds poll_default_mask poll_idle_cpu exec_perm_rules kmsg_stream resource_limits_sched signal_routing_perms mounts_list_race sysctl_write_rules fallocate_modes openat2_resolve splice_vmsplice privs_syscall_misc timeout_and_cpu_timer open_tmpfile mount_flag_perms sgid_inherit sockopt_conventions tty_canon_queue timer_conventions mmap_conventions fd_conventions proc_files signal_conventions dir_tmpfs futex_validation orphan_pgrp_wait reparent_zombie_notify subreaper_not_inherited fork_tgroup_reset rusage_monotonic dirfd_position cross_process_state concurrent_dir_futex sock_bind_refuse time_clocks_ticks futex_robust_requeue inotify_mask_queue time_conformance signal_realtime signal_altstack signal_stop_cont signal_forced_trap signal_poll signal_child_burst eventfd_interrupt futex_core process_lifecycle pthread_sync ptrace_group_stop ptrace_thread_follow epoll_mod_wake epoll_oneshot_rearm epoll_mod_spurious_wake epoll_data_layout epoll_eloop epoll_exclusive epoll_dup_add ptrace_exit_kill fcntl_lock fcntl_ofd fcntl_setown at_empty_path at_absolute_path utimensat_fd copy_file_range name_to_handle_at sendfile_vhangup pidfd_open pidfd_zombie pidfd_clone pidfd_fdinfo_pid fsopen_move_mount keyctl_link mountinfo_epollet tmpfs_nlink unix_dgram_cred ambient_caps scm_rights_stress scm_rights_pidfd fs_conformance process_conformance time_conformance mem_conformance sock_conformance getpeername_smallbuf netlink_route netlink_audit mount_flags mount_bind_rbind fuse_basic fuse_threaded_daemon native_stdio_lock devtmpfs_mount clone_error_cleanup uts_namespace posix_timer_fork vfork_fatal_signal vfork_exec_stale_jit getppid_thread concurrent_exec_tlb exec_i386_fault_addr native_exec_cloexec native_ptrace_group_stop random_seed getrusage_group pty_line_discipline proc_pid_io taskstats_genl tmpfs_mmap tmpfs_statfs tmpfs_append memfd_mmap mount_stdev mount_cross_dev cgroup2_rmdir mmap_truncate_sigbus null_page_fault signalfd_epoll_deadlock pidfd_epoll_deadlock signalfd_thread_group wayland_scm_shm chroot_getcwd iovec_abi_marshal fakefs_type_race fakefs_casefold fakefs_inode_alias fifo_open_creat_deadlock proc_stat_monotonic proc_field_layout sock_conn_error sock_getfd_errno sock_nosignal inotify_close_race inotify_mount_paths statx_mnt_id_timerfd timerfd_settime_readiness opath_symlink_pidfd_wait pidfd_self_exit_deadlock prctl_capbset_drop oom_score_adj sysv_ipc accept_rcvtimeo accept_kill socket_kill inaddr_any_iface procfd_reopen siocoutq epoll_nested tmpfs_exec kcmp pixman_accel aes_gcm_accel file_perms ftruncate_fd_mode syscall_wiring sysfs_cpu_topology sysfs_dev_ns stack_guard_gap binder_ipc ashmem dma_heap selinuxfs kmsg proc_random binder_ping property_area logd_sink pipe_size"
 if [ "$is_x86_guest" -eq 1 ]; then
     # x86 flag-semantics atomics (lock-prefixed inline asm)
-    all_tests="atomic_xadd32 atomic_cmpxchg32 atomic_cmpxchg8b atomic_logic32 cow_atomic_fault x87_fpu x86_loop bcd_adjust port_io_gpf $all_tests"
+    all_tests="atomic_xadd32 atomic_cmpxchg32 atomic_cmpxchg8b atomic_logic32 atomic_lock_contended cow_atomic_fault x87_fpu x86_loop bcd_adjust port_io_gpf cpuid_xsave fpu_state_span $all_tests"
 fi
 if [ "$is_x86_guest" -eq 1 ] && [ "$is_amd64_guest" -eq 0 ]; then
     # VEX on the i386 guest, which is JIT-only and decodes VEX at codegen time.
@@ -526,7 +712,7 @@ if [ "$is_amd64_guest" -eq 1 ]; then
     all_tests="$all_tests amd64_regress avx_regress amd64_incdec"
 fi
 if [ "$is_arm64_guest" -eq 1 ]; then
-    all_tests="$all_tests atomics64 arm64_regress vector_smoke smc_stale_block ret_retcache stlr_ldar_publish ptrace_singlestep ands_bcond_fusion hle_loop tagged_pointer thread_identity hle_callee_saved cow_store_restart fork_parent_store parked_wait_store"
+    all_tests="$all_tests atomics64 arm64_regress vector_smoke smc_stale_block ret_retcache stlr_ldar_publish ptrace_singlestep ands_bcond_fusion hle_loop dc_zva tagged_pointer thread_identity hle_callee_saved cow_store_restart fork_parent_store parked_wait_store"
 fi
 if [ "$is_riscv64_guest" -eq 1 ]; then
     all_tests="$all_tests ptrace_regset jalr_retcache"
@@ -542,6 +728,8 @@ test_selected() {
         *) return 1 ;;
     esac
 }
+
+cache_init
 
 selected_tests=
 for test in $all_tests; do
@@ -560,12 +748,32 @@ for test in $all_tests; do
             # Deliberately not build_one: these need a per-peer -D, and they
             # skip its gas_imm_reg_workaround path. Safe only because the peer
             # source is trivial; keep it that way.
+            #
+            # Cached like everything else, though. Skipping build_one used to
+            # mean skipping the cache with it, so these twelve were the only
+            # things a fully-warm run still compiled. Measured on
+            # alpine-arm64-test: 4s for the twelve, against a ~4.5min suite --
+            # worth removing because "a warm run compiles nothing" is a rule
+            # worth being able to state, not because it was ever the slow part.
+            # (avx32_smoke had the same gap: it looked its entry up and never
+            # stored one.) The pad is part of the cache NAME, so the twelve
+            # entries stay distinct, and the key is the peer source's hash, so they
+            # rebuild when that source (or the compiler, or the arch) changes
+            # and not otherwise. An edit to vfork_exec_stale_jit.c itself moves
+            # which peer collides with it, not what the peers are -- that is
+            # the whole reason a sweep is built rather than one.
             peer_src=$(src_for vfork_exec_stale_jit_peer)
             pad=0
             while [ "$pad" -lt 12 ]; do
-                echo "+ build vfork_exec_stale_jit_peer$pad"
-                cc -O2 -pthread -DSTALE_JIT_PAD_PAGES="$pad" \
-                    -o "$work_dir/bin/vfork_exec_stale_jit_peer$pad" "$peer_src"
+                peer_name=vfork_exec_stale_jit_peer$pad
+                echo "+ build $peer_name"
+                peer_cached=$(cache_path_for "$peer_name" "$peer_src")
+                if ! cache_try "$peer_name" "$peer_cached"; then
+                    if cc -O2 -pthread -DSTALE_JIT_PAD_PAGES="$pad" \
+                            -o "$work_dir/bin/$peer_name" "$peer_src"; then
+                        cache_store "$peer_cached" "$work_dir/bin/$peer_name"
+                    fi
+                fi
                 pad=$((pad + 1))
             done
         fi
@@ -577,15 +785,42 @@ if [ -z "$selected_tests" ]; then
     exit 1
 fi
 
+# Tests that genuinely need uid 0 -- they exercise chown, capabilities, audit
+# netlink, mount/chroot containment, or the root-bypasses-permissions paths.
+#
+# Each of these already skips itself when unprivileged, and that is the wrong
+# outcome on a device: a session with "Open Everything as Default User" on runs
+# as uid 1000, so the suite quietly retires this whole group and still reports
+# a clean run. Re-invoke them under passwordless sudo instead. Where sudo is
+# absent or wants a password we fall through to the plain invocation and the
+# test's own guard skips it, which is exactly the old behaviour.
+needs_root_tests=" at_empty_path ambient_caps chroot_getcwd file_perms fsopen_move_mount fuse_basic fuse_threaded_daemon mount_bind_rbind mount_flags netlink_audit oom_score_adj sysfs_dev_ns uts_namespace "
+
 cat >"$work_dir/run-regressions.sh" <<EOF
 #!/bin/sh
 set -eu
+
+needs_root_tests="$needs_root_tests"
+sudo_prefix=""
+if [ "\$(id -u)" -ne 0 ]; then
+    if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+        sudo_prefix="sudo -n"
+        echo "note: running as uid \$(id -u); privileged tests go through sudo -n" >&2
+    else
+        echo "note: running as uid \$(id -u) with no passwordless sudo;" >&2
+        echo "      privileged tests will skip themselves:\$needs_root_tests" >&2
+    fi
+fi
 
 status=0
 for test in$selected_tests; do
     echo "==> \$test"
     output="$work_dir/\$test.out"
-    if "$work_dir/bin/\$test" "\$@" >"\$output" 2>&1; then
+    as_root=""
+    case "\$needs_root_tests" in
+        *" \$test "*) as_root="\$sudo_prefix" ;;
+    esac
+    if \$as_root "$work_dir/bin/\$test" "\$@" >"\$output" 2>&1; then
         rc=0
     else
         rc=\$?

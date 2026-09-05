@@ -1,3 +1,4 @@
+#include <stdatomic.h>
 #include "kernel/calls.h"
 #include <pthread.h>
 #include "futex.h"
@@ -55,8 +56,6 @@
                      FUTEX_PRIVATE_FLAG_)
 //#define FUTEX_CMD_MASK_ ~(FUTEX_PRIVATE_FLAG_)
 
-extern bool doEnableMulticore;
-
 struct futex {
     atomic_uint refcount;
     struct mem *mem;
@@ -72,7 +71,19 @@ struct futex {
     uint64_t wake_seq;
 };
 
+// A queued futex_wait is a STACK LOCAL of futex_wait_masked whose address is
+// published on a shared queue, so every wake path below calls
+// pthread_cond_broadcast on another task thread's host stack. That is only
+// sound while the waiter is still in that frame. This magic is the check:
+// set when the object is built, cleared the instant it leaves the queue and
+// its frame is about to die. A waker that finds a queued entry without it is
+// looking at a corpse -- see docs/TODO.md's pread_stack_thread_race entry,
+// where a stray 8 bytes landing at that exact stack depth is what kills the
+// thread later, inside pthread_exit.
+#define FUTEX_WAIT_MAGIC 0x0FEEDFACEF00D01ULL
+
 struct futex_wait {
+    uint64_t magic;
     cond_t cond;
     struct futex *futex; // The futex on which the thread is waiting
     pthread_t thread;    // The thread that is waiting
@@ -80,6 +91,22 @@ struct futex_wait {
     bool interrupted;
     struct list queue;   // For linking in the futex's queue
 };
+
+// 0 = off, 1 = put the waiter on the heap, 2 = DECOY: do the same allocation
+// and then use the stack object anyway. Mode 2 is the control that keeps mode 1
+// honest: it has identical allocator traffic and identical timing perturbation
+// but identical aliasing too, so if the crash also goes away under 2 then 1
+// proved nothing except that this test is sensitive to being disturbed.
+static int futex_heap_wait_mode(void) {
+    static _Atomic int mode = -1;
+    int m = atomic_load_explicit(&mode, memory_order_relaxed);
+    if (m < 0) {
+        const char *v = getenv("ISH_FUTEX_HEAP_WAIT");
+        m = (v == NULL || *v == '\0' || *v == '0') ? 0 : (*v == '2' ? 2 : 1);
+        atomic_store_explicit(&mode, m, memory_order_relaxed);
+    }
+    return m;
+}
 
 #define FUTEX_HASH_BITS 12
 #define FUTEX_HASH_SIZE (1 << FUTEX_HASH_BITS)
@@ -176,13 +203,41 @@ static int futex_load(guest_addr_t addr, dword_t *out) {
     // sibling futex waits reproduced writers asleep on a FREE lock).
     // Parking here instead is deadlock-free: the barrier writer never takes
     // futex_lock, so it completes and its release broadcast wakes us.
+    //
+    // That comment is about WHICH lock to take. Separately, the load below has
+    // to happen INSIDE it, and has to stay there. It used to sit after the
+    // unlock, which made this a use-after-free: the pointer mem_ptr returns is
+    // minted from the page table and is only alive while the read lock is
+    // held. A sibling munmap takes the address-space barrier the instant we
+    // let go and munmaps the backing (pt_unmap_always_unlocked, emu/memory.c),
+    // and the stale load then goes one of two ways, decided only by what the
+    // host has already done with the freed range.
+    //
+    // Range re-taken, the common case: the load does not fault. Task threads
+    // take their 4 MB stacks from the same host arena those pages go back to
+    // -- the reuse the ISH_MEM_QUARANTINE comment in emu/memory.c describes,
+    // there for a write scribbling on a live thread's bookkeeping, here for a
+    // read, so we collect the garbage instead of causing it. Whatever now
+    // occupies the address goes straight into FUTEX_WAIT's "does the word
+    // still say val?" check, so the damage is a wrong answer to that one
+    // question: a waiter that should have blocked gets EAGAIN, or one whose
+    // word had already changed blocks with nobody left to wake it. That half
+    // is a hang with no crash report to point at.
+    //
+    // Range still unmapped: the same load is a host bad access, taken in
+    // kernel context, where the JIT's crash recovery is disarmed --
+    // jit_crash_unwind_active and jit_crash_lock are set only inside the JIT
+    // loop (jit/jit.c) -- so nothing converts it into a guest signal: on
+    // device jit_crash_bus_fn reaches its abort(), and the CLI installs no
+    // SIGSEGV handler at all. That half is loud, but the report names this
+    // load rather than the sibling unmap that made it stale.
     mem_read_lock_quiesce_aware(current->mem);
     dword_t *ptr = mem_ptr(current->mem, addr, MEM_READ);
+    bool fault = ptr == NULL;
+    if (!fault)
+        *out = *ptr;
     mem_read_unlock_quiesce_aware(current->mem);
-    if (ptr == NULL)
-        return 1;
-    *out = *ptr;
-    return 0;
+    return fault;
 }
 
 static bool futex_wait_has_pending_signal(void) {
@@ -335,13 +390,31 @@ static int futex_wait_masked(guest_addr_t uaddr, dword_t op, dword_t val, struct
         struct timespec deadline = {};
         if (timeout != NULL)
             deadline = timespec_add(timespec_now(CLOCK_MONOTONIC), *timeout);
-        struct futex_wait wait = {
+        // ISH_FUTEX_HEAP_WAIT=1: take this object off the stack. It is
+        // published on a shared queue and every wake path runs
+        // pthread_cond_broadcast over it, so on the stack it aliases the very
+        // bytes libpthread uses for that thread's pthread_cond_wait cleanup
+        // record -- measured, see docs/TODO.md. The heap copy is deliberately
+        // never freed: the point is to give it a lifetime that outlives the
+        // frame, so a stale wake lands somewhere harmless. That makes this an
+        // A/B for whether the stack lifetime is what kills the thread later,
+        // not a fix, and it leaks a few tens of MB over an 8-second stress run.
+        struct futex_wait wait_storage;
+        struct futex_wait *w = &wait_storage;
+        int heap_mode = futex_heap_wait_mode();
+        if (heap_mode != 0) {
+            struct futex_wait *heap = calloc(1, sizeof(*heap));
+            if (heap != NULL && heap_mode == 1)
+                w = heap;
+        }
+        *w = (struct futex_wait) {
+            .magic = FUTEX_WAIT_MAGIC,
             .cond = COND_INITIALIZER,
         };
-        wait.futex = futex;
-        wait.thread = pthread_self();
-        wait.bitset = bitset;
-        list_add_tail(&futex->queue, &wait.queue);
+        w->futex = futex;
+        w->thread = pthread_self();
+        w->bitset = bitset;
+        list_add_tail(&futex->queue, &w->queue);
         for (;;) {
             struct timespec remaining = wait_slice;
             if (timeout != NULL) {
@@ -363,13 +436,13 @@ static int futex_wait_masked(guest_addr_t uaddr, dword_t op, dword_t val, struct
             }
             TASK_MAY_BLOCK {
                 lock(&current->waiting_cond_lock, 0);
-                current->waiting_interrupt_flag = &wait.interrupted;
+                current->waiting_interrupt_flag = &w->interrupted;
                 unlock(&current->waiting_cond_lock);
                 should_mark_wait_interrupted = true;
-                err = wait_for(&wait.cond, &futex_lock, &remaining);
+                err = wait_for(&w->cond, &futex_lock, &remaining);
                 should_mark_wait_interrupted = false;
             }
-            if (__atomic_load_n(&wait.interrupted, __ATOMIC_ACQUIRE) || futex_wait_has_pending_signal()) {
+            if (__atomic_load_n(&w->interrupted, __ATOMIC_ACQUIRE) || futex_wait_has_pending_signal()) {
                 err = _EINTR;
                 break;
             }
@@ -378,7 +451,7 @@ static int futex_wait_masked(guest_addr_t uaddr, dword_t op, dword_t val, struct
             // Keep waiting instead of leaking a spurious EINTR to the guest.
             if (err == _EINTR)
                 continue;
-            if (list_null(&wait.queue)) {
+            if (list_null(&w->queue)) {
                 // FUTEX_WAKE removed us from the queue. The wake may have
                 // fired while we were between wait_for iterations (not
                 // sleeping), so the cond notification was lost and the next
@@ -392,8 +465,11 @@ static int futex_wait_masked(guest_addr_t uaddr, dword_t op, dword_t val, struct
             if (err != _ETIMEDOUT)
                 break;
         }
-        futex = wait.futex;
-        list_remove_safe(&wait.queue);
+        futex = w->futex;
+        list_remove_safe(&w->queue);
+        // Off the queue: from here the frame may die at any point, so no waker
+        // may touch this object again.
+        w->magic = 0;
 
         if (err == _EINTR) {
             // The wait was interrupted by a signal that may restart the syscall
@@ -440,6 +516,38 @@ static int futex_read_timeout(guest_addr_t timeout_addr, bool time64, struct tim
     return 0;
 }
 
+// Returns true if `wait` still looks like a live queued waiter. A false here
+// means a wake was about to run pthread_cond_broadcast over stack that its
+// owner has already left, which is a use-after-free of another thread's frame.
+// task->waiting_interrupt_flag is only ever set to &wait.interrupted, so the
+// container is recoverable and its magic says whether that object is still a
+// live queued waiter. wake_waiting_task (kernel/signal.c) uses this to count
+// stores it is about to make into a frame that has already returned. Reading
+// through a stale pointer here is safe -- it is mapped stack either way, and a
+// wrong magic is exactly the answer being asked for.
+bool futex_wait_flag_is_live(const bool *flag) {
+    if (flag == NULL)
+        return true;
+    const struct futex_wait *wait = (const struct futex_wait *)
+        ((const char *) flag - offsetof(struct futex_wait, interrupted));
+    return wait->magic == FUTEX_WAIT_MAGIC;
+}
+
+static bool futex_wait_is_live(struct futex_wait *wait, const char *where) {
+    if (wait != NULL && wait->magic == FUTEX_WAIT_MAGIC)
+        return true;
+    static _Atomic int reported;
+    // stderr, NOT printk: printk goes to fd 555, which an ordinary CLI run
+    // never opens, so this would have been discarded in silence.
+    if (atomic_fetch_add_explicit(&reported, 1, memory_order_relaxed) < 8)
+        fprintf(stderr, "URGENT: futex %s found a STALE waiter at %p (magic=%#llx, thread=%p): "
+                "its frame is gone and notifying it would write into that thread's stack\n",
+                where, (void *) wait,
+                wait != NULL ? (unsigned long long) wait->magic : 0ULL,
+                wait != NULL ? (void *) wait->thread : NULL);
+    return false;
+}
+
 static int futex_wakelike(int op, guest_addr_t uaddr, dword_t wake_max, dword_t requeue_max,
         guest_addr_t requeue_addr, dword_t wake_mask) {
     struct futex *futex = futex_get(uaddr, op);
@@ -460,6 +568,10 @@ static int futex_wakelike(int op, guest_addr_t uaddr, dword_t wake_max, dword_t 
             break;
         if ((wait->bitset & wake_mask) == 0)
             continue;
+        if (!futex_wait_is_live(wait, "wake")) {
+            list_remove(&wait->queue);
+            continue;
+        }
         notify(&wait->cond);
         list_remove(&wait->queue);
         woken++;
@@ -517,12 +629,17 @@ static int futex_wake_op(guest_addr_t uaddr, dword_t wake_max, dword_t wake_max2
     int32_t cmparg = futex_op_sign_extend12(encoded_op);
     bool shift = raw_op & FUTEX_OP_OPARG_SHIFT_;
     unsigned op = raw_op & ~FUTEX_OP_OPARG_SHIFT_;
+    // An op or comparison this kernel does not know is ENOSYS, not EINVAL:
+    // the encoding names an operation, and "I do not implement that one" is
+    // what Linux says. EINVAL means the caller passed a bad VALUE, which is a
+    // different thing to go looking for.
     if (op > FUTEX_OP_XOR_ || cmp > FUTEX_OP_CMP_GE_)
-        return _EINVAL;
+        return _ENOSYS;
     if (shift) {
-        if (oparg < 0 || oparg > 31)
-            return _EINVAL;
-        oparg = 1 << oparg;
+        // FUTEX_OP_OPARG_SHIFT means "the argument is a shift count", and
+        // Linux masks it to the register width rather than refusing: oparg 40
+        // becomes 8. Rejecting it turned a legal encoding into an error.
+        oparg = 1 << (oparg & 31);
     }
 
     struct futex *futex1 = futex_get(uaddr, FUTEX_WAKE_OP_);
@@ -536,17 +653,51 @@ static int futex_wake_op(guest_addr_t uaddr, dword_t wake_max, dword_t wake_max2
         futex_put(futex1);
         return _EFAULT;
     }
-    int32_t oldval = (int32_t) *ptr;
+    // The operation on *uaddr2 is a read-modify-write and it has to be ATOMIC
+    // against the guest's own atomic instructions -- Linux does it with an
+    // arch cmpxchg loop (futex_atomic_op_inuser), and the whole point of
+    // WAKE_OP is to combine that update with a wake without a window in
+    // between. A plain load, compute, store lost updates to any guest thread
+    // touching the same word: measured 594 lost out of 40000 with one thread
+    // doing atomic adds and another doing WAKE_OP adds, where Linux loses
+    // none.
+    //
+    // A host compare-exchange interlocks with the guest only where the
+    // emulator implements guest atomics with host atomics on the same word.
+    // Until 553 the amd64 path did not -- it serialised locked instructions
+    // on the global atomic_l_lock -- so this function had to take that lock
+    // too, agreeing with the weaker mechanism rather than relying on the
+    // stronger one (1107 of 40000 updates lost without it). Every aligned
+    // locked instruction on both x86 guests is now a real host atomic
+    // (x86_atomic_rmw, emu/tlb.c), so the CAS below is sufficient on its own
+    // and the global lock is gone.
+    //
+    // What that rests on: a futex word is rejected unless it is 4-byte
+    // aligned (sys_futex_common), and an aligned access is exactly the case
+    // the emulator does with a host atomic. The residual is a guest doing a
+    // MISALIGNED locked access that happens to overlap a futex word -- that
+    // one still falls back to atomic_l_lock and would not interlock. No real
+    // program does it, and Linux on real hardware is atomic there because the
+    // CPU is, so it is a gap in the emulation rather than in this function.
+    _Atomic int32_t *aptr = (_Atomic int32_t *) ptr;
+    int32_t oldval = atomic_load_explicit(aptr, memory_order_relaxed);
     int32_t newval;
-    switch (op) {
-        case FUTEX_OP_SET_:  newval = oparg; break;
-        case FUTEX_OP_ADD_:  newval = oldval + oparg; break;
-        case FUTEX_OP_OR_:   newval = oldval | oparg; break;
-        case FUTEX_OP_ANDN_: newval = oldval & ~oparg; break;
-        default: /* FUTEX_OP_XOR_, the only value left after the range check above */
-                              newval = oldval ^ oparg; break;
+    if (op == FUTEX_OP_SET_) {
+        oldval = atomic_exchange_explicit(aptr, oparg, memory_order_acq_rel);
+        newval = oparg;
+    } else {
+        do {
+            switch (op) {
+                case FUTEX_OP_ADD_:  newval = oldval + oparg; break;
+                case FUTEX_OP_OR_:   newval = oldval | oparg; break;
+                case FUTEX_OP_ANDN_: newval = oldval & ~oparg; break;
+                default: /* FUTEX_OP_XOR_, the only value left after the check above */
+                                     newval = oldval ^ oparg; break;
+            }
+        } while (!atomic_compare_exchange_weak_explicit(aptr, &oldval, newval,
+                                                        memory_order_acq_rel,
+                                                        memory_order_relaxed));
     }
-    *ptr = (dword_t) newval;
     mem_read_unlock_quiesce_aware(current->mem);
 
     unsigned woken = 0;
@@ -554,6 +705,10 @@ static int futex_wake_op(guest_addr_t uaddr, dword_t wake_max, dword_t wake_max2
     list_for_each_entry_safe(&futex1->queue, wait, tmp, queue) {
         if (woken >= wake_max)
             break;
+        if (!futex_wait_is_live(wait, "wake_op")) {
+            list_remove(&wait->queue);
+            continue;
+        }
         notify(&wait->cond);
         list_remove(&wait->queue);
         woken++;
@@ -574,6 +729,10 @@ static int futex_wake_op(guest_addr_t uaddr, dword_t wake_max, dword_t wake_max2
         list_for_each_entry_safe(&futex2->queue, wait, tmp, queue) {
             if (woken2 >= wake_max2)
                 break;
+            if (!futex_wait_is_live(wait, "wake_op2")) {
+                list_remove(&wait->queue);
+                continue;
+            }
             notify(&wait->cond);
             list_remove(&wait->queue);
             woken2++;
@@ -586,8 +745,22 @@ static int futex_wake_op(guest_addr_t uaddr, dword_t wake_max, dword_t wake_max2
     return (int) woken;
 }
 
+// FUTEX_CMP_REQUEUE: check *uaddr1 against val3, wake up to val waiters, and
+// move up to val2 of the rest onto uaddr2.
+//
+// All three parts were wrong. The comparison used `val` -- the number to wake
+// -- instead of val3, so the guard fired on entirely unrelated values: a
+// caller doing the ordinary thing (word == val3) got a spurious EAGAIN, and a
+// caller whose word happened to equal the wake count sailed past a check that
+// should have stopped it. Nothing was woken at all, only requeued, so a
+// broadcast lost every wakeup it was supposed to deliver. And the return value
+// counted only the requeued waiters, where Linux returns woken + requeued.
+//
+// This is what a pre-2.25 glibc condvar broadcast and Bionic-style runtimes
+// use. Current musl is unaffected -- it uses plain FUTEX_REQUEUE, which goes
+// through futex_wakelike -- which is why it took a probe to find.
 static int futex_cmp_requeue(guest_addr_t uaddr1, dword_t op, dword_t val, guest_addr_t uaddr2, dword_t val2,
-        dword_t UNUSED(val3)) {
+        dword_t val3) {
     struct futex *futex1 = futex_get(uaddr1, op);
     struct futex *futex2 = futex_get_unlocked(uaddr2, op);
     int err = 0;
@@ -595,21 +768,31 @@ static int futex_cmp_requeue(guest_addr_t uaddr1, dword_t op, dword_t val, guest
 
     if (futex_load(uaddr1, &tmp)) {
         err = _EFAULT;
-    } else if (tmp != val) {
+    } else if (tmp != val3) {
         err = _EAGAIN;
     } else {
         struct futex_wait *wait, *tmp_wait;
+        dword_t woken = 0;
         dword_t requeued = 0;
         list_for_each_entry_safe(&futex1->queue, wait, tmp_wait, queue) {
-            if (requeued >= val2) {
-                break;
+            if (!futex_wait_is_live(wait, "cmp_requeue")) {
+                list_remove(&wait->queue);
+                continue;
             }
+            if (woken < val) {
+                notify(&wait->cond);
+                list_remove(&wait->queue);
+                woken++;
+                continue;
+            }
+            if (requeued >= val2)
+                break;
             list_remove(&wait->queue);
             list_add_tail(&futex2->queue, &wait->queue);
             wait->futex = futex2;
             requeued++;
         }
-        err = requeued;
+        err = (int) (woken + requeued);
     }
 
     futex_put(futex1);
@@ -690,6 +873,21 @@ dword_t sys_futex_common(guest_addr_t uaddr, dword_t op, dword_t val, guest_addr
     if (!(op & FUTEX_PRIVATE_FLAG_)) {
         STRACE("!FUTEX_PRIVATE ");
     }
+    // A futex word is a 32-bit value and every operation on it has to be
+    // atomic, so it must be 4-byte aligned; get_futex_key rejects anything
+    // else outright. Accepting an unaligned address meant the atomicity the
+    // whole interface rests on quietly did not hold, and a caller that had
+    // miscomputed its address got a lock that sometimes worked.
+    if (uaddr % 4 != 0)
+        return _EINVAL;
+    switch (op & FUTEX_CMD_MASK_) {
+        case FUTEX_REQUEUE_:
+        case FUTEX_CMP_REQUEUE_:
+        case FUTEX_WAKE_OP_:
+            if (uaddr2 % 4 != 0)
+                return _EINVAL;
+            break;
+    }
     struct timespec timeout = {0};
     if (((op & FUTEX_CMD_MASK_) == FUTEX_WAIT_ || (op & FUTEX_CMD_MASK_) == FUTEX_WAIT_BITSET_) && timeout_or_val2) {
         int err = futex_read_timeout(timeout_or_val2, timeout_time64, &timeout);
@@ -698,8 +896,16 @@ dword_t sys_futex_common(guest_addr_t uaddr, dword_t op, dword_t val, guest_addr
         if ((op & FUTEX_CMD_MASK_) == FUTEX_WAIT_BITSET_) {
             clockid_t clock = (op & FUTEX_CLOCK_REALTIME_) ? CLOCK_REALTIME : CLOCK_MONOTONIC;
             timeout = timespec_subtract(timeout, timespec_now(clock));
+            // An already-expired deadline does NOT short-circuit to
+            // ETIMEDOUT. Linux runs futex_wait_setup first, so a value that
+            // does not match is EAGAIN and an unreadable address is EFAULT --
+            // and only a caller whose word DID match gets ETIMEDOUT. Returning
+            // ETIMEDOUT for all three told a caller its lock was contended
+            // when the truth was that it had passed the wrong value or a bad
+            // pointer, which is the difference between retrying forever and
+            // reporting a bug.
             if (!timespec_positive(timeout))
-                return _ETIMEDOUT;
+                timeout = (struct timespec) {0};
         }
     }
     
@@ -781,6 +987,108 @@ dword_t sys_futex_time64(addr_t uaddr, dword_t op, dword_t val, addr_t timeout_o
     return sys_futex_common(uaddr, op, val, timeout_or_val2, uaddr2, val3, true);
 }
 
+// Bits userspace keeps in a robust mutex's lock word (linux/futex.h).
+#define FUTEX_WAITERS_    0x80000000
+#define FUTEX_OWNER_DIED_ 0x40000000
+#define FUTEX_TID_MASK_   0x3fffffff
+// Linux's ROBUST_LIST_LIMIT: a corrupt or hostile list must not walk forever.
+#define ROBUST_LIST_LIMIT 2048
+
+// entry + futex_offset, wrapped at the guest's pointer width. The offset is
+// negative, so on a 32-bit guest the sum must wrap around 2^32 exactly as it
+// does in the guest's own arithmetic rather than borrowing into the upper half
+// of the 64-bit guest_addr_t.
+static guest_addr_t robust_futex_addr(uint64_t entry, int64_t offset, bool is64) {
+    uint64_t sum = entry + (uint64_t) offset;
+    if (!is64)
+        sum &= 0xffffffffu;
+    return (guest_addr_t) sum;
+}
+
+// One word of the robust list, whose width follows the ABI.
+static bool robust_read(guest_addr_t addr, bool is64, uint64_t *out) {
+    if (is64) {
+        qword_t v;
+        if (user_get(addr, v))
+            return false;
+        *out = v;
+    } else {
+        dword_t v;
+        if (user_get(addr, v))
+            return false;
+        *out = v;
+    }
+    return true;
+}
+
+// A lock word this dying thread still owns: mark it, and wake somebody.
+//
+// Linux clears the TID, sets FUTEX_OWNER_DIED, keeps FUTEX_WAITERS, and wakes
+// one waiter if there was one -- which is what turns a waiter's blocking lock
+// into an immediate EOWNERDEAD instead of a hang forever. Nothing here walked
+// the list at all, so a thread dying while holding a robust mutex left every
+// waiter blocked for good; the whole point of a robust mutex is that it does
+// not.
+static void robust_handle_death(guest_addr_t futex_addr, pid_t_ tid) {
+    dword_t uval;
+    if (user_get(futex_addr, uval))
+        return;
+    if ((uval & FUTEX_TID_MASK_) != (dword_t) tid)
+        return;
+    dword_t nval = (uval & FUTEX_WAITERS_) | FUTEX_OWNER_DIED_;
+    if (user_put(futex_addr, nval))
+        return;
+    if (nval & FUTEX_WAITERS_)
+        futex_wake(futex_addr, 1);
+}
+
+// Walk the list this thread registered with set_robust_list and release every
+// lock it still holds. Runs on the dying thread itself, before its address
+// space goes away -- the same place Linux runs exit_robust_list.
+void futex_exit_robust_list(struct task *task) {
+    guest_addr_t head = task->robust_list;
+    if (head == 0)
+        return;
+    bool is64 = guest_abi_is_64bit(task->abi);
+    size_t word = is64 ? 8 : 4;
+
+    // struct robust_list_head is { list.next, futex_offset, list_op_pending }.
+    uint64_t entry, offset_raw, pending;
+    if (!robust_read(head, is64, &entry))
+        return;
+    if (!robust_read(head + word, is64, &offset_raw))
+        return;
+    if (!robust_read(head + 2 * word, is64, &pending))
+        return;
+
+    // futex_offset is a SIGNED long in the guest, and in practice it is always
+    // negative: it is the distance from the list link back to the lock word,
+    // and the lock word comes first in every real mutex layout (musl and glibc
+    // both register -12 on a 32-bit ABI). robust_read zero-extends, so on a
+    // 32-bit guest -4 arrived as 0x00000000fffffffc; added to an entry address
+    // it produced something past 4 GiB, user_get failed, and NOT ONE robust
+    // futex was ever marked. The owner-died bit is how the next waiter learns
+    // the holder died mid-critical-section, so this was silent: no error, just
+    // a lock nobody recovers.
+    int64_t futex_offset = is64 ? (int64_t) offset_raw
+                                : (int64_t) (int32_t) (uint32_t) offset_raw;
+
+    // The list is circular through the head, so that is the terminator.
+    for (unsigned limit = ROBUST_LIST_LIMIT; entry != head && limit > 0; limit--) {
+        uint64_t next;
+        bool have_next = robust_read((guest_addr_t) entry, is64, &next);
+        // The pending entry is handled after the loop: it is mid-operation,
+        // and Linux deliberately leaves it until last.
+        if (entry != pending)
+            robust_handle_death(robust_futex_addr(entry, futex_offset, is64), task->pid);
+        if (!have_next)
+            return;
+        entry = next;
+    }
+    if (pending != 0)
+        robust_handle_death(robust_futex_addr(pending, futex_offset, is64), task->pid);
+}
+
 static dword_t robust_list_head_size(enum guest_abi abi) {
     return abi == GUEST_ABI_AMD64 ? 24 : 12;
 }
@@ -798,10 +1106,18 @@ static int_t sys_get_robust_list_common(pid_t_ pid, guest_addr_t robust_list_ptr
     STRACE("get_robust_list(%d, %#llx, %#llx)", pid,
             (unsigned long long) robust_list_ptr, (unsigned long long) len_ptr);
 
-    struct task *task = pid_get_task_ref(pid);
-    bool is_current = task == current;
-    if (task != NULL)
-        task_ref_cnt_mod(task, -1);
+    // pid 0 means the calling thread, as everywhere else in the API. It was
+    // looked up like any other pid, and pid 0 is never allocated, so it came
+    // back EPERM -- and musl gates ALL robust-mutex support on exactly this
+    // probe succeeding once, so no musl program on AOK could create a robust
+    // mutex at all.
+    bool is_current = pid == 0;
+    if (!is_current) {
+        struct task *task = pid_get_task_ref(pid);
+        is_current = task == current;
+        if (task != NULL)
+            task_ref_cnt_mod(task, -1);
+    }
     if (!is_current)
         return _EPERM;
 

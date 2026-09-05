@@ -2,6 +2,7 @@
 #define FS_FAKEFS_API_H
 
 #include <sqlite3.h>
+#include "fs/fake-lockstats.h"
 #include "fs/fix_path.h"
 #include "misc.h"
 
@@ -27,11 +28,71 @@ struct fakefs_db {
         sqlite3_stmt *path_from_inode;
         sqlite3_stmt *try_cleanup_inode;
     } stmt;
+    // Serializes writers. Every pooled connection carries the same mutex
+    // pointer as the mount's primary, so the write path is unchanged.
     sqlite3_mutex *lock;
+
+    // --- per-thread read connections (fs/fake-conn.c) --------------------
+    // Opt-in via ISH_FAKEFS_PARALLEL_READS. The mount's primary fakefs_db owns
+    // a pool; each pooled connection is itself a struct fakefs_db with its own
+    // sqlite3 handle and its own prepared statements, so every existing
+    // fs->db / fs->stmt.* access keeps working unchanged on the thread's own
+    // handles. `shared` points back at the primary for the state that must
+    // stay common (next_inode), and doubles as "this is a pooled connection,
+    // reads here need no mutex".
+    struct fakefs_db *shared;
+    struct fakefs_pool *pool;
+    struct fakefs_db *pool_next;  // registry of every connection
+    struct fakefs_db *idle_next;  // free list; a connection is on both
+    struct fakefs_pool *owner_pool;  // pool that owns a pooled connection
 };
+
+// The mount's primary db: where next_inode lives, and the only handle
+// fake-migrate.c / fake-rebuild.c ever run on.
+static inline struct fakefs_db *fakefs_db_shared(struct fakefs_db *fs) {
+    return fs->shared != NULL ? fs->shared : fs;
+}
+
+// The calling thread's private connection for this mount, or `fs` itself when
+// pooling is off, unavailable, or already at its connection cap. Cheap after
+// the first call on a thread.
+struct fakefs_db *fakefs_db_thread(struct fakefs_db *fs);
+int fakefs_pool_init(struct fakefs_db *fs, const char *db_path);
+void fakefs_pool_deinit(struct fakefs_db *fs);
+// Opens one more connection to the same database, with the same pragmas and
+// the same prepared statements as the primary. fake-db.c.
+int fake_db_open_conn(struct fakefs_db *conn, const char *db_path);
+void fake_db_close_conn(struct fakefs_db *conn);
+
+// Read-side critical region. A pooled connection touches only its own
+// statements and takes a WAL read snapshot, so it needs no mutex at all --
+// that is the whole point. The primary still serializes, so a thread that
+// could not get a pooled connection behaves exactly as before.
+#define FAKEFS_LOCK_READ(fs) do {                                             \
+    if ((fs)->shared != NULL) {                                               \
+        if (fakefs_lockstats_on) {                                            \
+            static struct lock_site *_flr_site;                               \
+            if (_flr_site == NULL)                                            \
+                _flr_site = lockstats_site("fakefs", __func__);               \
+            lockstats_held(_flr_site, (fs), lockstats_now());                 \
+        }                                                                     \
+        break;                                                                \
+    }                                                                         \
+    FAKEFS_LOCK(fs);                                                          \
+} while (0)
+
+#define FAKEFS_UNLOCK_READ(fs) do {                                           \
+    if ((fs)->shared != NULL) {                                              \
+        if (fakefs_lockstats_on)                                              \
+            lockstats_account((fs), lockstats_now());                         \
+        break;                                                                \
+    }                                                                         \
+    FAKEFS_UNLOCK(fs);                                                        \
+} while (0)
 
 int fake_db_init(struct fakefs_db *fs, const char *db_path, int root_fd);
 int fake_db_deinit(struct fakefs_db *fs);
+void fake_db_finalize_statements(struct fakefs_db *fs);
 // Lays down a brand-new, empty fakefs metadata db at db_path (base schema,
 // no root inode) so fake_db_init -- whose migration path assumes the base
 // tables already exist -- can open it immediately. Mirrors the schema
@@ -39,10 +100,22 @@ int fake_db_deinit(struct fakefs_db *fs);
 // callers still need to seed a root ("") path_create themselves.
 int fake_db_create_schema(const char *db_path);
 
-void db_begin_read(struct fakefs_db *fs);
-void db_begin_write(struct fakefs_db *fs);
+// A transaction holds fs->lock from begin to commit/rollback. The macros exist
+// only so ISH_FAKEFS_LOCKSTATS can attribute the hold to the fakefs entry point
+// that opened it (fakefs_stat, fakefs_unlink, ...) rather than to db_begin_*.
+void db_begin_read_at(struct fakefs_db *fs, struct lock_site *site);
+void db_begin_write_at(struct fakefs_db *fs, struct lock_site *site);
 void db_commit(struct fakefs_db *fs);
 void db_rollback(struct fakefs_db *fs);
+
+#define FAKEFS_DB_BEGIN(fs, which) do {                                       \
+    static struct lock_site *_fls_txn;                                 \
+    if (fakefs_lockstats_on && _fls_txn == NULL)                              \
+        _fls_txn = lockstats_site("fakefs", __func__);                        \
+    which((fs), _fls_txn);                                                    \
+} while (0)
+#define db_begin_read(fs) FAKEFS_DB_BEGIN(fs, db_begin_read_at)
+#define db_begin_write(fs) FAKEFS_DB_BEGIN(fs, db_begin_write_at)
 
 // Suspension quiesce gate.
 //

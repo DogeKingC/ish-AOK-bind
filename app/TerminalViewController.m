@@ -18,8 +18,8 @@
 #import "NSObject+SaneKVO.h"
 #import "UIViewController+Extras.h"
 #import "WorkspaceViewController.h"
+#import "ShellFileBrowser.h"
 #import "SceneDelegate.h"
-#import "LinuxInterop.h"
 #import <GameController/GameController.h>
 #include "kernel/init.h"
 #include "kernel/task.h"
@@ -61,7 +61,6 @@ static UISceneSession *ISHFindExistingWorkspaceSceneSession(UISceneSession *excl
     return bestSession;
 }
 
-#if !ISH_LINUX
 static BOOL ISHCommandIsDefaultLogin(NSArray<NSString *> *command) {
     return command.count == 3 &&
             [command[0] isEqualToString:@"/bin/login"] &&
@@ -192,9 +191,8 @@ static NSArray<NSString *> *ISHSessionCommandWithFallback(NSArray<NSString *> *c
                                             @"attempts": attempts}];
     return command;
 }
-#endif
 
-@interface TerminalViewController () <UIGestureRecognizerDelegate, UITextFieldDelegate>
+@interface TerminalViewController () <UIGestureRecognizerDelegate, UITextFieldDelegate, ISHShellFileBrowserDelegate>
 
 @property UITapGestureRecognizer *tapRecognizer;
 @property (weak, nonatomic) IBOutlet TerminalView *termView;
@@ -362,7 +360,6 @@ static const NSInteger kMaximumTerminalFontSize = 72;
     [super viewDidLoad];
     [self _installTerminalStartupOverlay];
 
-#if !ISH_LINUX
     if (!Roots.instance.needsInitialRootSelection) {
         intptr_t bootError = [AppDelegate ensureBooted];
         if (bootError < 0) {
@@ -374,7 +371,6 @@ static const NSInteger kMaximumTerminalFontSize = 72;
             NSLog(@"boot failed: %@", subtitle);
         }
     }
-#endif
 
     [self _applyCurrentTerminalToViewIfPossible];
     if (UserPreferences.shared.autoShowKeyboard)
@@ -1113,17 +1109,10 @@ static const CGFloat kFindBarHeight = 44;
 
 - (void)awakeFromNib {
     [super awakeFromNib];
-#if !ISH_LINUX
     [NSNotificationCenter.defaultCenter addObserver:self
                                            selector:@selector(processExited:)
                                                name:ProcessExitedNotification
                                              object:nil];
-#else
-    [NSNotificationCenter.defaultCenter addObserver:self
-                                           selector:@selector(kernelPanicked:)
-                                               name:KernelPanicNotification
-                                             object:nil];
-#endif
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -1250,7 +1239,6 @@ static const CGFloat kFindBarHeight = 44;
 	    self.sessionFailureMessage = nil;
 	    self.sessionFailureOverlayText = nil;
 
-#if !ISH_LINUX
 	    intptr_t err = [AppDelegate ensureBooted];
 	    if (err < 0) {
 	        [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.start.failed"
@@ -1358,35 +1346,6 @@ static const CGFloat kFindBarHeight = 44;
         task_never_ran_destroy(failed);
         return _EAGAIN;
     }
-#else
-    const char *argv_arr[command.count + 1];
-    for (NSUInteger i = 0; i < command.count; i++)
-        argv_arr[i] = command[i].UTF8String;
-    argv_arr[command.count] = NULL;
-    const char *envp_arr[] = {
-        "TERM=screen-256color",
-        NULL,
-    };
-    const char *const *argv = argv_arr;
-    const char *const *envp = envp_arr;
-    __block Terminal *terminal = nil;
-    __block int sessionPid = 0;
-    __block int err = 1;
-    sync_do_in_workqueue(^(void (^done)(void)) {
-        linux_start_session(argv[0], argv, envp, ^(int retval, int pid, nsobj_t term) {
-            err = retval;
-            if (term)
-                terminal = CFBridgingRelease(term);
-            sessionPid = pid;
-            done();
-        });
-    });
-    NSAssert(err <= 0, @"session start did not finish??");
-    if (err < 0)
-        return err;
-    self.sessionTerminal = terminal;
-    self.sessionPid = sessionPid;
-#endif
     return 0;
 }
 
@@ -1398,7 +1357,6 @@ static const NSTimeInterval kQuickSessionExitThreshold = 2.0;
 // app in a tight respawn loop that burns CPU until iOS's watchdog kills it.
 static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
 
-#if !ISH_LINUX
 - (void)processExited:(NSNotification *)notif {
     int pid = [notif.userInfo[@"pid"] intValue];
     if (pid != self.sessionPid)
@@ -1448,15 +1406,7 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
     }
     [self startNewSession];
 }
-#endif
 
-#if ISH_LINUX
-- (void)kernelPanicked:(NSNotification *)notif {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"panik" message:notif.userInfo[@"message"] preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    [self presentViewController:alert animated:YES completion:nil];
-}
-#endif
 
 - (void)showMessage:(NSString *)message subtitle:(NSString *)subtitle {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1776,6 +1726,34 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
     [self.termView resignFirstResponder];
 }
 
+- (IBAction)showFileBrowser:(id)sender {
+    // Give up the keyboard while the sheet is up. Keeping it looked right --
+    // the sheet exists to put text on the command line, so why put the
+    // keyboard away -- but the bar is the terminal's inputAccessoryView, and
+    // an accessory view floats ABOVE a presented sheet. It covered the sheet's
+    // own toolbar, which is where cd Here and Insert Path live, so the two
+    // verbs the sheet exists for could not be tapped. Focus comes back in
+    // -shellFileBrowserDidDismiss:.
+    [self.termView resignFirstResponder];
+    [ISHShellFileBrowserViewController presentFromViewController:self
+                                                          ttyType:self.terminal.type
+                                                        ttyNumber:self.terminal.number
+                                                     fallbackPath:@"/"
+                                                         delegate:self];
+}
+
+#pragma mark ISHShellFileBrowserDelegate
+
+- (void)shellFileBrowser:(ISHShellFileBrowserViewController *)browser insertText:(NSString *)text {
+    NSData *input = [text dataUsingEncoding:NSUTF8StringEncoding];
+    if (input != nil)
+        [self.terminal sendInput:input];
+}
+
+- (void)shellFileBrowserDidDismiss:(ISHShellFileBrowserViewController *)browser {
+    [self focusTerminal];
+}
+
 - (IBAction)showWorkspaceDashboard:(id)sender {
     [self.termView resignFirstResponder];
     if (@available(iOS 13.0, *)) {
@@ -2072,6 +2050,11 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
                              modifierFlags:UIKeyModifierCommand
                                     action:@selector(showFindBar:)
                       discoverabilityTitle:@"Find in Scrollback"]];
+        [commands addObject:
+         [UIKeyCommand keyCommandWithInput:@"b"
+                             modifierFlags:UIKeyModifierCommand
+                                    action:@selector(showFileBrowser:)
+                      discoverabilityTitle:@"Browse Files"]];
         [commands addObject:
          [UIKeyCommand keyCommandWithInput:@"g"
                              modifierFlags:UIKeyModifierCommand

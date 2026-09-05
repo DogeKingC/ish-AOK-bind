@@ -1,4 +1,5 @@
 #include "kernel/task.h"
+#include "kernel/signal.h"
 #include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +15,8 @@
 #include "kernel/fs.h"
 #include "fs/fd.h"
 #include "fs/poll.h"
+
+extern const struct fd_ops socket_fdops;
 #include "fs/real.h"
 #include "fs/sock.h"
 #include "fs/sockrestart.h"
@@ -36,7 +39,7 @@ struct real_poll_event {
 #endif
 };
 static void *rpe_data(struct real_poll_event *rpe);
-static int rpe_events(struct real_poll_event *rpe);
+static int rpe_events(struct real_poll_event *rpe, struct poll_fd *pfd);
 static int real_poll_wait(struct real_poll *real, struct real_poll_event *events, int max, struct timespec *timeout);
 static int real_poll_update(struct real_poll *real, int fd, int types, void *data);
 static inline bool poll_fd_has_host_wait(struct poll_fd *pollfd);
@@ -80,9 +83,45 @@ static bool poll_deadline_remaining(const struct timespec *deadline, struct time
     return timespec_positive(*remaining);
 }
 
+// The hardcoded list below is the package-manager/download set the tracer was
+// originally written for. It is useless for the bug the tracer is most needed
+// on -- a daemon whose poll loop burns 100% CPU -- because chronyd, rsyslogd
+// and sshd-session are not in it, and adding a name meant editing this file
+// and rebuilding the app.
+//
+// ISH_TRACE_POLL_WAIT_COMM overrides the list at runtime: a comma-separated
+// set of comms, or "*" for every process. Prefix matching, so
+// "sshd" catches "sshd-session" and "in:imuxsock" can be reached as "in:".
+static bool poll_trace_comm_env(const char *comm) {
+    static const char *list = NULL;
+    static int looked_up = 0;
+    if (!looked_up) {
+        list = getenv("ISH_TRACE_POLL_WAIT_COMM");
+        looked_up = 1;
+    }
+    if (list == NULL || *list == '\0')
+        return false;
+    if (strcmp(list, "*") == 0)
+        return true;
+    size_t comm_len = strlen(comm);
+    const char *p = list;
+    while (*p != '\0') {
+        const char *end = strchr(p, ',');
+        size_t n = end != NULL ? (size_t) (end - p) : strlen(p);
+        if (n > 0 && n <= comm_len && strncmp(comm, p, n) == 0)
+            return true;
+        if (end == NULL)
+            break;
+        p = end + 1;
+    }
+    return false;
+}
+
 static bool poll_trace_comm(const char *comm) {
     if (comm == NULL)
         return false;
+    if (getenv("ISH_TRACE_POLL_WAIT_COMM") != NULL)
+        return poll_trace_comm_env(comm);
     return strcmp(comm, "apk") == 0 ||
         strcmp(comm, "apt") == 0 ||
         strcmp(comm, "apt-get") == 0 ||
@@ -185,7 +224,14 @@ static int poll_deliver_ready_locked(struct poll *poll_, struct poll_fd *poll_fd
                phase, current->pid, current->comm,
                fd != NULL ? fd->real_fd : -1, poll_types, handled);
     }
-    int res = handled == 1 ? 1 : 0;
+    // The callback returns how many *results* this readiness produced, not
+    // just whether it produced any: select counts an fd once per descriptor
+    // set it is ready in, and poll counts it once per pollfd entry naming it,
+    // so one fd can legitimately contribute more than one to the return value
+    // (measured on Linux 6.12: an fd ready for read and write in both sets
+    // makes select return 2, and the same fd in three pollfd entries makes
+    // poll return 3). Clamping to 1 here undercounted both.
+    int res = handled > 0 ? handled : 0;
 
     // The real poll does not actually get the FDs set as oneshot.
     // But this loop is done while holding the lock, so only one
@@ -653,11 +699,22 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
     struct timespec deadline_storage = {0};
     struct timespec *deadline = NULL;
     if (timeout != NULL) {
-        deadline_storage = timespec_add(timespec_now(CLOCK_MONOTONIC), *timeout);
+        // Resuming after a job-control stop: keep the deadline this wait
+        // already had. Restarting the relative timeout from zero would give
+        // the guest a longer wait than it asked for every time it is stopped.
+        if (current->poll_restart_valid) {
+            deadline_storage = current->poll_restart_deadline;
+            current->poll_restart_valid = false;
+        } else {
+            deadline_storage = timespec_add(timespec_now(CLOCK_MONOTONIC), *timeout);
+        }
         deadline = &deadline_storage;
+    } else {
+        current->poll_restart_valid = false;
     }
 
     int res = 0;
+    // Set by the two exits below; see poll_restart_deadline in kernel/task.h.
     while (true) {
         // check if any fds are ready
         struct poll_fd *poll_fd;
@@ -684,7 +741,9 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
         bool signal_pending = !!((current->pending | current->sighand->pending) & ~task_wake_blocked(current));
         unlock(&current->sighand->lock);
         if (signal_pending) {
-            res = _EINTR;
+            // ERESTARTNOHAND: a running handler still gives the guest its
+            // EINTR, but a job-control stop must resume transparently.
+            res = signal_restart_or_eintr_nohand(_EINTR);
             break;
         }
 
@@ -766,7 +825,7 @@ poll_wait_done:
                     struct poll_fd *candidate = rpe_data(&e[i]);
                     struct poll_fd *triggered_poll_fd = poll_find_ptr(poll_, candidate);
                     if (triggered_poll_fd != NULL)
-                        poll_wait_trace_fd(triggered_poll_fd, rpe_events(&e[i]), "host-event");
+                        poll_wait_trace_fd(triggered_poll_fd, rpe_events(&e[i], candidate), "host-event");
                     else {
                         poll_wait_trace_raw_event(poll_, &e[i], "raw-event");
                         poll_drop_unknown_event(poll_, &e[i]);
@@ -787,7 +846,10 @@ poll_wait_done:
             unlock(&current->sighand->lock);
             if (!signal_pending)
                 continue;
-            res = errno_map();
+            // The host wait was torn out and a guest signal is waiting. Same
+            // ERESTARTNOHAND rule as the other two exits: a handler about to
+            // run gives the guest its EINTR, a job-control stop does not.
+            res = signal_restart_or_eintr_nohand(errno_map());
             break;
         }
         if (err == 0) {
@@ -806,7 +868,7 @@ poll_wait_done:
                 bool signal_pending = !!((current->pending | current->sighand->pending) & ~task_wake_blocked(current));
                 unlock(&current->sighand->lock);
                 if (signal_pending)
-                    res = _EINTR;
+                    res = signal_restart_or_eintr_nohand(_EINTR);
             }
             break;
         }
@@ -845,7 +907,7 @@ poll_wait_done:
             struct poll_fd *triggered_poll_fd = poll_find_ptr(poll_, candidate);
             if (triggered_poll_fd == NULL || triggered_poll_fd->poll != poll_)
                 continue;
-            int host_events = rpe_events(&e[i]);
+            int host_events = rpe_events(&e[i], candidate);
             if (poll_epoll_trace_enabled()) {
                 struct fd *fd = triggered_poll_fd->fd;
                 char path[MAX_PATH];
@@ -925,6 +987,14 @@ poll_wait_done:
     }
 
     unlock(&poll_->lock);
+    // Restarting after a job-control stop: hand the deadline we already
+    // computed to the re-executed syscall, which cannot see the time this
+    // call spent waiting (it only gets the guest's original relative
+    // timeout). An untimed wait has nothing to carry.
+    if (res == _ERESTART_NOHAND && deadline != NULL) {
+        current->poll_restart_deadline = *deadline;
+        current->poll_restart_valid = true;
+    }
     return res;
 }
 
@@ -981,7 +1051,7 @@ static int real_poll_update(struct real_poll *real, int fd, int types, void *dat
 static void *rpe_data(struct real_poll_event *rpe) {
     return rpe->real.data.ptr;
 }
-static int rpe_events(struct real_poll_event *rpe) {
+static int rpe_events(struct real_poll_event *rpe, struct poll_fd *UNUSED(pfd)) {
     return rpe->real.events;
 }
 
@@ -1003,11 +1073,23 @@ static int real_poll_check_receipts(struct kevent *events, int count) {
         // Deleting a filter that was never installed is harmless.
         if (events[i].data == ENOENT)
             continue;
-        // EVFILT_EXCEPT is not supported for all Darwin fd types, including
-        // regular files. Treat that as "filter unavailable" rather than
-        // failing the whole poll registration.
-        if (events[i].filter == EVFILT_EXCEPT &&
-                (events[i].data == EINVAL || events[i].data == ENOTSUP || events[i].data == EPERM))
+        // Darwin's kqueue does not implement every filter for every fd type:
+        // EVFILT_EXCEPT is missing on regular files, and character devices
+        // other than ttys (/dev/null, /dev/zero, /dev/random) and directories
+        // support no filter at all. Treat that as "filter unavailable" rather
+        // than failing the whole registration -- returning EINVAL out of the
+        // guest's poll()/select()/epoll_ctl() is not something Linux ever does
+        // for a valid fd, and it made musl's AT_SECURE startup (which polls
+        // fds 0, 1 and 2 and a_crash()es if that fails) kill every setuid
+        // binary whose stdio was a host device node, e.g. `sudo ... >/dev/null`
+        // under the command-line build. Nothing is lost by not registering:
+        // realfs_poll reports exactly these objects as permanently ready, so
+        // poll_wait's readiness scan returns before it ever blocks, and no
+        // wakeup is needed to notice a readiness that is always there.
+        if ((events[i].data == EINVAL || events[i].data == ENOTSUP || events[i].data == EPERM) &&
+                (events[i].filter == EVFILT_EXCEPT ||
+                 events[i].filter == EVFILT_READ ||
+                 events[i].filter == EVFILT_WRITE))
             continue;
         errno = (int) events[i].data;
         return -1;
@@ -1016,15 +1098,48 @@ static int real_poll_check_receipts(struct kevent *events, int count) {
 }
 
 static int real_poll_update(struct real_poll *real, int fd, int types, void *data) {
+    // The write filter is registered for HUP and RDHUP as well as for WRITE:
+    // it is the only thing that distinguishes a half-close from a full one.
+    // kqueue sets EV_EOF on EVFILT_READ as soon as the peer stops writing, and
+    // on EVFILT_WRITE only once our own direction is down too, so the pair
+    // together says which happened. Measured on Darwin.
+    bool want_read = types & (POLL_READ | POLL_HUP | POLL_RDHUP);
+    bool want_write = types & (POLL_WRITE | POLL_HUP | POLL_RDHUP);
     struct kevent e[3] = {
-        {.filter = EVFILT_READ, .flags = types & (POLL_READ | POLL_HUP) ? EV_ADD : EV_DELETE},
-        {.filter = EVFILT_WRITE, .flags = types & POLL_WRITE ? EV_ADD : EV_DELETE},
+        {.filter = EVFILT_READ, .flags = want_read ? EV_ADD : EV_DELETE},
+        {.filter = EVFILT_WRITE, .flags = want_write ? EV_ADD : EV_DELETE},
         {.filter = EVFILT_EXCEPT, .flags = types & POLL_ERR ? EV_ADD : EV_DELETE},
     };
-    if (!(types & POLL_READ) && types & POLL_HUP) {
-        // Set the low water mark really high so we'll only get woken up on a hangup
+    // Set the low water mark really high so we'll only get woken up on a hangup.
+    //
+    // ...except Darwin does not honour it on every object. Measured with
+    // ISH_TRACE_POLL_WAIT on a plain AF_UNIX socketpair: a registration of
+    // READ|ERR|HUP|NVAL (a guest polling POLLIN, which implies HUP) arms
+    // EVFILT_WRITE for the hangup, NOTE_LOWAT and all, and kqueue then reports
+    // it writable immediately and forever. poll_wait wakes, masks the event
+    // against what the guest asked for, gets nothing, and sleeps again -- and
+    // is woken again at once, because EVFILT_WRITE is level-triggered and the
+    // send buffer is still empty. That is a 100%-CPU spin for the whole
+    // duration of an ordinary blocking poll() on a quiet socket, and it is why
+    // an idle chronyd, an idle rsyslogd and an idle sshd-session each pinned a
+    // core on device while sitting in a poll they were entirely right to make.
+    //
+    // EV_CLEAR is the fix that keeps the hangup: the filter fires on the
+    // transition rather than on the level, so "still writable" is reported
+    // once and then stays quiet, while an actual hangup is a new transition
+    // and still wakes us. Applied only to a filter registered SOLELY for the
+    // hangup -- a registration that genuinely wants POLL_READ or POLL_WRITE
+    // must stay level-triggered, or a guest that polls without draining would
+    // miss the readiness it never consumed.
+    if (!(types & POLL_READ) && want_read) {
         e[0].fflags = NOTE_LOWAT;
         e[0].data = INT_MAX;
+        e[0].flags |= EV_CLEAR;
+    }
+    if (!(types & POLL_WRITE) && want_write) {
+        e[1].fflags = NOTE_LOWAT;
+        e[1].data = INT_MAX;
+        e[1].flags |= EV_CLEAR;
     }
     for (int i = 0; i < 3; i++) {
         e[i].ident = fd;
@@ -1048,7 +1163,7 @@ static void *rpe_data(struct real_poll_event *rpe) {
     return rpe->real.udata;
 }
 
-static int rpe_events(struct real_poll_event *rpe) {
+static int rpe_events(struct real_poll_event *rpe, struct poll_fd *pfd) {
     if (rpe->real.flags & EV_ERROR) {
         int err = (int) rpe->real.data;
         if (err == 0)
@@ -1057,15 +1172,29 @@ static int rpe_events(struct real_poll_event *rpe) {
             return POLL_NVAL;
         return POLL_ERR;
     }
+    // Whether end-of-input is a HANGUP depends on what this is. For a pipe or
+    // a fifo the writer closing is the hangup, full stop. For a SOCKET it is
+    // only half of one: the peer may have shut down writing and still be
+    // reading, and Linux says EPOLLRDHUP for that and reserves EPOLLHUP for
+    // both directions being down. Reporting HUP for a half-close was provably
+    // wrong -- the same socket was still writable -- and EPOLLHUP is what a
+    // program treats as "connection over".
+    bool is_socket = pfd != NULL && pfd->fd != NULL && S_ISSOCK(pfd->fd->type);
     if (rpe->real.filter == EVFILT_READ) {
         int events = 0;
         if (rpe->real.data > 0)
             events |= POLL_READ;
         if (rpe->real.flags & EV_EOF)
-            events |= POLL_HUP;
+            events |= is_socket ? POLL_RDHUP : POLL_HUP;
         return events;
     }
-    if (rpe->real.filter == EVFILT_WRITE) return POLL_WRITE;
+    if (rpe->real.filter == EVFILT_WRITE) {
+        // EV_EOF here means our own direction is down too, so the connection
+        // really is finished: that is the HUP, and it implies the RDHUP.
+        if (is_socket && (rpe->real.flags & EV_EOF))
+            return POLL_WRITE | POLL_HUP | POLL_RDHUP;
+        return POLL_WRITE;
+    }
     if (rpe->real.filter == EVFILT_EXCEPT) {
         // Darwin's EVFILT_EXCEPT fires on ordinary, healthy TCP sockets under
         // normal traffic with no real error condition -- confirmed live
@@ -1082,6 +1211,21 @@ static int rpe_events(struct real_poll_event *rpe) {
         socklen_t so_error_len = sizeof(so_error);
         if (getsockopt((int) rpe->real.ident, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len) < 0 || so_error == 0)
             return 0;
+        // That getsockopt READ-AND-CLEARED the host's SO_ERROR, and this used
+        // to throw the value away -- so the error existed only long enough for
+        // the poll to report POLL_ERR, and the guest's recv() that followed
+        // found nothing. On a connected UDP socket that took an ICMP
+        // port-unreachable, the ECONNREFUSED simply vanished whenever a poll
+        // happened to run first, which is why it arrived only about two thirds
+        // of the time and always on the very first poll when it did.
+        //
+        // Stash it, exactly as socket_tcp_connect_write_ready() does for the
+        // stream case: fd.h's contract for host_connect_error is that AOK's own
+        // internal probes record what they consumed so the guest-facing call
+        // can still see it.
+        if (pfd != NULL && pfd->fd != NULL && pfd->fd->ops == &socket_fdops &&
+                pfd->fd->socket.host_connect_error == 0)
+            pfd->fd->socket.host_connect_error = so_error;
         return POLL_ERR;
     }
     return 0;

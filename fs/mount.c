@@ -6,6 +6,7 @@
 #include "fs/real.h"
 #include "kernel/binder.h"
 #include "fs/dev.h"
+#include "kernel/binfmt_misc.h"
 
 // Sized for the static set below plus the two the iOS app registers at
 // startup (iosfs and iosfs_unsafe) -- overflowing this asserts at boot rather
@@ -30,6 +31,7 @@ static const struct fs_ops *filesystems[MAX_FILESYSTEMS] = {
     &fakefs,
     &binderfs,
     &selinuxfs,
+    &fusefs,
 };
 
 static bool mount_trace_elogind(void) {
@@ -58,6 +60,8 @@ void fs_register(const struct fs_ops *fs) {
     assert(!"reached filesystem limit");
 }
 
+#define BINFMT_MISC_FS_LINE "nodev    binfmt_misc\n"
+
 char * get_filesystems(void) {
     unsigned int i;
     size_t total_len = 0;
@@ -68,6 +72,14 @@ char * get_filesystems(void) {
             total_len += strlen("nodev    ") + strlen(filesystems[i]->name) + 1; // +1 for newline
         }
     }
+    // binfmt_misc is a filesystem TYPE the kernel accepts but not an entry in
+    // filesystems[]: mounting it does not create a mount, it brings
+    // /proc/sys/fs/binfmt_misc's `register` and `status` into being (fs/proc/sys.c).
+    // It has to be listed here all the same, because mount(8) reads this file
+    // and refuses a type it does not find WITHOUT EVER CALLING mount(2) --
+    // which is exactly why the accept-the-mount branch further down was
+    // unreachable for years.
+    total_len += strlen(BINFMT_MISC_FS_LINE);
 
     // Pass 2: Allocate and populate the buffer
     char *fs_list = malloc(total_len + 1); // +1 for null terminator
@@ -85,6 +97,8 @@ char * get_filesystems(void) {
             *ptr++ = '\n';
         }
     }
+    memcpy(ptr, BINFMT_MISC_FS_LINE, strlen(BINFMT_MISC_FS_LINE));
+    ptr += strlen(BINFMT_MISC_FS_LINE);
     *ptr = '\0';
 
     return fs_list;
@@ -146,28 +160,40 @@ void mount_retain(struct mount *mount) {
     unlock(&mounts_lock);
 }
 
+static void mount_destroy(struct mount *mount);
+
 void mount_release(struct mount *mount) {
     lock(&mounts_lock, 0);
     mount->refcount--;
+    // The last user of a lazily-unmounted mount finishes the unmount. Nothing
+    // else can be about to take a reference: it has not been reachable through
+    // the mount table since the umount2 call.
+    if (mount->lazy_umount && mount->refcount == 0)
+        mount_destroy(mount);
     unlock(&mounts_lock);
 }
 
 // Mount ID as exposed in /proc/self/mountinfo and statx's stx_mnt_id:
 // 1-based position in the mounts list. The two consumers must agree --
 // systemd cross-checks statx STATX_MNT_ID against mountinfo.
-int mount_id(struct mount *target) {
-    lock(&mounts_lock, 0);
+// Caller holds mounts_lock. /proc/self/mountinfo asks for every entry's id
+// from inside its own walk of the list, so it cannot take the lock again.
+int mount_id_locked(struct mount *target) {
     int id = 1;
     struct mount *mount;
     list_for_each_entry(&mounts, mount, mounts) {
-        if (mount == target) {
-            unlock(&mounts_lock);
+        if (mount == target)
             return id;
-        }
         id++;
     }
-    unlock(&mounts_lock);
     return 1;
+}
+
+int mount_id(struct mount *target) {
+    lock(&mounts_lock, 0);
+    int id = mount_id_locked(target);
+    unlock(&mounts_lock);
+    return id;
 }
 
 // The device files on this mount report through stat(2)'s st_dev, which is
@@ -207,9 +233,18 @@ dev_t_ mount_dev(struct mount *mount) {
 }
 
 int do_mount(const struct fs_ops *fs, const char *source, const char *point, const char *info, int flags) {
-    struct mount *new_mount = malloc(sizeof(struct mount));
+    // calloc, not malloc: every field below is assigned by hand, and a field
+    // added to struct mount later that nobody remembers to add HERE is
+    // whatever the allocator left behind. That is not hypothetical -- adding
+    // `lazy_umount` did exactly this, and under MALLOC_PERTURB_ (which meson
+    // sets for the e2e suite) it read back as true on a brand-new mount, so
+    // the first mount_release tore down a mount that was still in use. Zero
+    // is the right default for every field here, so start from it.
+    struct mount *new_mount = calloc(1, sizeof(struct mount));
     if (new_mount == NULL)
         return _ENOMEM;
+    // Not a valid descriptor until the filesystem's own mount() opens one.
+    new_mount->root_fd = -1;
     new_mount->point = strdup(point);
     new_mount->point_len = strlen(point);
     new_mount->source = strdup(source);
@@ -265,8 +300,15 @@ int mount_snapshot(struct mount_info **out, size_t *count_out) {
     lock(&mounts_lock, 0);
     size_t count = 0;
     struct mount *mount;
+    // Detached fsmount()s are not part of any mount listing until move_mount
+    // places them -- the same rule /proc/mounts and mountinfo follow. This is
+    // the list a native `df` walks (kernel/native_libc.c's getmntinfo), and
+    // it was showing the private 0700 staging path: df then tried to statfs a
+    // directory an unprivileged guest cannot enter and printed
+    // "df: /.ish-fsmount/N: Permission denied" for a mount Linux never lists.
     list_for_each_entry(&mounts, mount, mounts)
-        count++;
+        if (!mount->detached)
+            count++;
     struct mount_info *info = calloc(count > 0 ? count : 1, sizeof(*info));
     if (info == NULL) {
         unlock(&mounts_lock);
@@ -276,6 +318,8 @@ int mount_snapshot(struct mount_info **out, size_t *count_out) {
     list_for_each_entry(&mounts, mount, mounts) {
         if (i >= count)
             break;
+        if (mount->detached)
+            continue;
         const char *from = mount->display_source != NULL ? mount->display_source
                                                          : mount->source;
         snprintf(info[i].source, sizeof(info[i].source), "%s",
@@ -330,10 +374,10 @@ int mount_set_display_source(const char *point, const char *display_source) {
     return _ENOENT;
 }
 
-int mount_remove(struct mount *mount) {
-    if (mount->refcount != 0)
-        return _EBUSY;
-
+// The teardown half of mount_remove, once nothing is using the mount. Caller
+// holds mounts_lock; list_remove on an already-removed, re-initialised node is
+// a no-op, so this is safe for both entry points below.
+static void mount_destroy(struct mount *mount) {
     if (mount->bind_origin != NULL) {
         // A bind owns one reference on its origin. We hold mounts_lock here
         // (do_umount / exit unmount), so drop it directly rather than via
@@ -349,10 +393,35 @@ int mount_remove(struct mount *mount) {
     free((void *) mount->display_source);
     free((void *) mount->point);
     free(mount);
+}
+
+int mount_remove(struct mount *mount) {
+    if (mount->refcount != 0)
+        return _EBUSY;
+    mount_destroy(mount);
     return 0;
 }
 
-int do_umount(const char *point) {
+// umount2(MNT_DETACH) -- `umount -l`. The point of a lazy unmount is that it
+// works on a BUSY mount: it comes out of the tree at once so nothing new can
+// reach it, and the filesystem is released when whoever is still holding it
+// lets go. Without it a busy mount can only be unmounted by finding and
+// stopping every user, which is exactly the situation `umount -l` exists for
+// -- and the flag was ignored, so it answered EBUSY like a plain umount.
+int mount_remove_lazy(struct mount *mount) {
+    if (mount->refcount == 0) {
+        mount_destroy(mount);
+        return 0;
+    }
+    // Out of the namespace now; re-initialising the node keeps the later
+    // list_remove in mount_destroy harmless.
+    list_remove(&mount->mounts);
+    list_init(&mount->mounts);
+    mount->lazy_umount = true;
+    return 0;
+}
+
+static int do_umount_flags(const char *point, bool lazy) {
     struct mount *mount;
     bool found = false;
     list_for_each_entry(&mounts, mount, mounts) {
@@ -363,8 +432,16 @@ int do_umount(const char *point) {
     }
     if (!found)
         return _EINVAL;
-    return mount_remove(mount);
+    return lazy ? mount_remove_lazy(mount) : mount_remove(mount);
 }
+
+#define MNT_DETACH_ 2
+
+int do_umount(const char *point) {
+    return do_umount_flags(point, false);
+}
+
+
 
 // Mount and unmount for callers outside fs/, where do_mount/do_umount's
 // "caller holds mounts_lock" contract is easy to miss. The app is exactly such
@@ -436,9 +513,15 @@ static bool devtmpfs_target_is_populated(const char *point) {
         if (snprintf(path, sizeof(path), "%s/%s", point, dev_standard_nodes[i].name) >= (int) sizeof(path))
             continue;
         struct statbuf stat;
-        // Deliberately S_ISCHR and not mere existence: the regular file a
+        // Deliberately a TYPE test and not mere existence: the regular file a
         // tarball leaves at /dev/null is exactly what this must not accept.
-        if (generic_statat(AT_PWD, path, &stat, false) == 0 && S_ISCHR(stat.mode))
+        // Compared against the entry's own type rather than S_ISCHR, now that
+        // the table can describe a block device -- otherwise a match on
+        // /dev/aokswap0 would be ignored (harmless today, since a char entry
+        // precedes it, and wrong the moment the table is reordered).
+        mode_t_ want = dev_standard_nodes[i].is_block ? S_IFBLK : S_IFCHR;
+        if (generic_statat(AT_PWD, path, &stat, false) == 0 &&
+            (stat.mode & S_IFMT) == want)
             return true;
     }
     return false;
@@ -454,15 +537,17 @@ static void devtmpfs_repair_nodes(const char *point) {
         if (snprintf(path, sizeof(path), "%s/%s", point, dev_standard_nodes[i].name) >= (int) sizeof(path))
             continue;
         dev_t_ dev = dev_make(dev_standard_nodes[i].major, dev_standard_nodes[i].minor);
+        // The entry's own type, since the table can describe a block device.
+        mode_t_ fmt = dev_standard_nodes[i].is_block ? S_IFBLK : S_IFCHR;
         struct statbuf stat;
         int err = generic_statat(AT_PWD, path, &stat, false);
-        if (err == 0 && S_ISCHR(stat.mode) && stat.rdev == dev)
+        if (err == 0 && (stat.mode & S_IFMT) == fmt && stat.rdev == dev)
             continue;
-        if (err == 0 && !S_ISCHR(stat.mode))
+        if (err == 0 && (stat.mode & S_IFMT) != fmt)
             generic_unlinkat(AT_PWD, path); // the regular-file stand-in case
         else if (err == 0)
-            continue; // a char device with some other rdev: leave it alone
-        generic_mknodat(AT_PWD, path, S_IFCHR | dev_standard_nodes[i].mode, dev);
+            continue; // right type, some other rdev: leave it alone
+        generic_mknodat(AT_PWD, path, fmt | dev_standard_nodes[i].mode, dev);
     }
 }
 
@@ -473,9 +558,11 @@ static void devtmpfs_repair_nodes(const char *point) {
 // does rather than acting as plain mount options.
 #define MS_PROPAGATION (MS_SHARED_|MS_PRIVATE_|MS_SLAVE_|MS_UNBINDABLE_)
 #define MS_OP (MS_REMOUNT_|MS_BIND_|MS_MOVE_|MS_PROPAGATION)
-// Flags iSH accepts but does not act on: durability/atime/symlink-resolution
-// niceties plus the recursive-bind modifier. Without mount namespaces these are
-// effectively no-ops, so we strip them rather than reject the whole mount.
+// Flags iSH-AOK accepts but does not act on: durability/atime/symlink-resolution
+// niceties. Without mount namespaces these are effectively no-ops, so we strip
+// them rather than reject the whole mount. MS_REC stays in this set so a
+// recursive propagation change (mount --make-rprivate) is still accepted as a
+// no-op, but the bind path does act on it (bind_replicate_submounts).
 #define MS_IGNORED (MS_SYNCHRONOUS_|MS_MANDLOCK_|MS_DIRSYNC_|MS_NOSYMFOLLOW_|MS_REC_|MS_POSIXACL_|MS_I_VERSION_|MS_KERNMOUNT_|MS_LAZYTIME_)
 
 // Create a bind mount at `point` aliasing the already-normalized guest path
@@ -496,7 +583,8 @@ static int do_bind_mount(const char *norm_source, const char *point, const char 
     if (origin == NULL)
         return _EINVAL;
 
-    struct mount *bind = malloc(sizeof(struct mount));
+    // calloc for the same reason as do_mount above.
+    struct mount *bind = calloc(1, sizeof(struct mount));
     if (bind == NULL) {
         mount_release(origin);
         return _ENOMEM;
@@ -539,7 +627,63 @@ static int do_bind_mount(const char *norm_source, const char *point, const char 
     return 0;
 }
 
+// mount --rbind: replicate every mount already sitting under the source
+// subtree at the corresponding path under the new bind. Linux clones the
+// subtree atomically; here each submount is re-bound one by one, best-effort
+// -- a submount that fails (ENOMEM, over-long path) is skipped rather than
+// unwinding the whole operation, matching this file's lenient treatment of
+// mount niceties. The snapshot is taken before any replica is created, so a
+// target inside the source subtree (mount --rbind / /mnt/x) terminates
+// instead of finding and copying its own copies. The one post-attach mount the
+// snapshot can still see is the parent bind itself, created just before this
+// runs -- when the target sits inside the source subtree it matches the scan
+// and would clone itself (/mnt/x/mnt/x), which Linux's clone-then-attach
+// order never produces, so it is excluded by exact point.
+static void bind_replicate_submounts(const char *norm_source, const char *point, const char *info, int flags) {
+    size_t src_len = strlen(norm_source);
+    // Collect the submount points under the lock, then bind with it dropped:
+    // do_bind_mount resolves paths and takes mounts_lock itself.
+    size_t count = 0, cap = 0;
+    char **subs = NULL;
+    lock(&mounts_lock, 0);
+    struct mount *mount;
+    list_for_each_entry(&mounts, mount, mounts) {
+        if (mount->point_len <= src_len || strncmp(mount->point, norm_source, src_len) != 0 ||
+                mount->point[src_len] != '/')
+            continue;
+        if (strcmp(mount->point, point) == 0)
+            continue;
+        if (count == cap) {
+            size_t new_cap = cap == 0 ? 8 : cap * 2;
+            char **grown = realloc(subs, new_cap * sizeof(*subs));
+            if (grown == NULL)
+                break;
+            subs = grown;
+            cap = new_cap;
+        }
+        subs[count] = strdup(mount->point);
+        if (subs[count] == NULL)
+            break;
+        count++;
+    }
+    unlock(&mounts_lock);
+
+    for (size_t i = 0; i < count; i++) {
+        char sub_point[MAX_PATH];
+        int n = snprintf(sub_point, sizeof(sub_point), "%s%s", point, subs[i] + src_len);
+        if (n > 0 && (size_t) n < sizeof(sub_point))
+            do_bind_mount(subs[i], sub_point, info, flags);
+        free(subs[i]);
+    }
+    free(subs);
+}
+
 dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest_addr_t type_addr, dword_t flags, guest_addr_t data_addr) {
+    // Linux requires CAP_SYS_ADMIN for every door into the mount table.
+    // The app's own boot-time mounts go through do_mount() directly and are
+    // unaffected; this gate is only on the guest syscall path.
+    if (!current_capable(CAP_SYS_ADMIN_))
+        return _EPERM;
     // source/data/type are copy_mount_string() args in Linux (strndup_user,
     // EINVAL when over-long), NOT getname() pathnames -- so they keep the plain
     // user_read_string path. Only the mount point below is a real getname path.
@@ -578,7 +722,11 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
     int err = generic_statat(AT_PWD, point_raw, &stat, 0);
     if (err < 0)
         return err;
-    if (!S_ISDIR(stat.mode))
+    // A bind is exempt from the directory requirement: Linux allows binding a
+    // single file over another file. Dir-onto-dir or non-dir-onto-non-dir;
+    // the mixed cases are rejected in the bind branch once the source has
+    // been stat'd too.
+    if (!S_ISDIR(stat.mode) && !(flags & MS_BIND_))
         return _ENOTDIR;
 
     char point[MAX_PATH];
@@ -590,7 +738,11 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
     // before taking mounts_lock (path_normalize / find_mount_and_trim_path
     // re-enter mount_find, which takes the lock).
     char op_source[MAX_PATH];
-    if (flags & (MS_MOVE_ | MS_BIND_)) {
+    // MS_REMOUNT names an existing mount by its POINT and ignores the source
+    // -- callers pass NULL for it -- so resolving one would be resolving
+    // nothing. MS_REMOUNT|MS_BIND is the common shape here: it means "change
+    // the flags on the bind mounted at this point", not "make a bind".
+    if ((flags & (MS_MOVE_ | MS_BIND_)) && !(flags & MS_REMOUNT_)) {
         err = path_normalize(AT_PWD, source, op_source, N_SYMLINK_FOLLOW);
         if (err < 0)
             return err;
@@ -598,10 +750,27 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
 
     // A bind shares the source mount's backing; do_bind_mount resolves the source
     // and takes mounts_lock itself, so dispatch it before we lock here.
-    if (flags & MS_BIND_) {
+    //
+    // Not when MS_REMOUNT is also set. `mount -o remount,bind,ro <point>` --
+    // how every caller makes an existing bind read-only, and what a container
+    // runtime does for each of its read-only bind mounts -- took this branch
+    // and tried to CREATE a bind from a source that was never given, so it
+    // failed and the mount stayed writable. It belongs to the MS_REMOUNT
+    // handling below, which changes the flags on the mount already at that
+    // point.
+    if ((flags & MS_BIND_) && !(flags & MS_REMOUNT_)) {
+        struct statbuf source_stat;
+        err = generic_statat(AT_PWD, source, &source_stat, 0);
+        if (err < 0)
+            return err;
+        if (S_ISDIR(source_stat.mode) != S_ISDIR(stat.mode))
+            return _ENOTDIR;
         err = do_bind_mount(op_source, point, data, flags & MS_FLAGS);
-        if (err >= 0)
+        if (err >= 0) {
+            if (flags & MS_REC_)
+                bind_replicate_submounts(op_source, point, data, flags & MS_FLAGS);
             proc_mountinfo_notify_changed();
+        }
         return err;
     }
 
@@ -672,12 +841,28 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
             break;
         }
     }
+    // libfuse mounts with a subtype ("fuse.sshfs", "fuse.rclone"); the part
+    // after the dot only names the daemon for mtab display.
+    if (fs == NULL && strncmp(type, "fuse.", 5) == 0)
+        fs = &fusefs;
+    // binfmt_misc is not a mount in AOK's table: the directory already exists
+    // in procfs and mounting it brings `register` and `status` into being, the
+    // way Linux does. So this accepts the mount and flips the flag procfs
+    // reads, rather than creating a mount.
+    //
+    // This used to accept the mount and do NOTHING, which was unreachable in
+    // practice -- mount(8) reads /proc/filesystems first and refused the type
+    // before ever calling mount(2) -- but would have handed a direct mount(2)
+    // caller (systemd does this) a successful mount of an empty directory, a
+    // state Linux cannot produce.
     if (fs == NULL &&
             strcmp(point, "/proc/sys/fs/binfmt_misc") == 0 &&
             (strcmp(type, "binfmt_misc") == 0 ||
              strcmp(source, "binfmt_misc") == 0 ||
              strcmp(source, "none") == 0)) {
+        binfmt_misc_set_mounted(true);
         unlock(&mounts_lock);
+        proc_mountinfo_notify_changed();
         return 0;
     }
     if (fs == NULL) {
@@ -702,6 +887,11 @@ dword_t sys_mount(addr_t source_addr, addr_t point_addr, addr_t type_addr, dword
 #define UMOUNT_NOFOLLOW_ 8
 
 dword_t sys_umount2_guest(guest_addr_t target_addr, dword_t flags) {
+    // Linux requires CAP_SYS_ADMIN for every door into the mount table.
+    // The app's own boot-time mounts go through do_mount() directly and are
+    // unaffected; this gate is only on the guest syscall path.
+    if (!current_capable(CAP_SYS_ADMIN_))
+        return _EPERM;
     char target_raw[MAX_PATH];
     int path_err = user_read_path(target_addr, target_raw, sizeof(target_raw));
     if (path_err)
@@ -713,7 +903,7 @@ dword_t sys_umount2_guest(guest_addr_t target_addr, dword_t flags) {
         return err;
 
     lock(&mounts_lock, 0);
-    err = do_umount(target);
+    err = do_umount_flags(target, (flags & MNT_DETACH_) != 0);
     unlock(&mounts_lock);
     if (err >= 0)
         proc_mountinfo_notify_changed();
@@ -749,10 +939,20 @@ lock_t mounts_lock = LOCK_INITIALIZER;
 // filesystem, immediately fsmount'd and then move_mount'd into place via
 // MOVE_MOUNT_F_EMPTY_PATH) -- not open_tree-sourced moves or in-place
 // (MOVE_MOUNT_T_EMPTY_PATH) placement, which remain unimplemented.
+static struct mount *mount_at_point_locked(const char *point);
+
 struct fscontext_data {
     const struct fs_ops *fs;
     bool created;
     bool readonly;
+    // binfmt_misc is not a mount in AOK's table -- the directory already exists
+    // in procfs and "mounting" it brings `register` and `status` into being
+    // (fs/proc/sys.c). It still has to be reachable through the NEW mount API,
+    // because util-linux 2.41's libmount tries fsopen FIRST and only falls back
+    // to mount(2) on ENOSYS: an ENODEV from fsopen made it report "unknown
+    // filesystem type" and never call mount(2) at all, so the working mount(2)
+    // path below was dead for every caller that used the tool.
+    bool binfmt_misc;
     char point[MAX_PATH];
 };
 
@@ -769,6 +969,11 @@ static struct fd_ops fscontext_ops = {
 #define FSOPEN_CLOEXEC_ 1
 
 fd_t sys_fsopen_guest(guest_addr_t fsname_addr, dword_t flags) {
+    // Linux requires CAP_SYS_ADMIN for every door into the mount table.
+    // The app's own boot-time mounts go through do_mount() directly and are
+    // unaffected; this gate is only on the guest syscall path.
+    if (!current_capable(CAP_SYS_ADMIN_))
+        return _EPERM;
     char fsname[100] = "";
     if (user_read_string(fsname_addr, fsname, sizeof(fsname)))
         return _EFAULT;
@@ -783,13 +988,14 @@ fd_t sys_fsopen_guest(guest_addr_t fsname_addr, dword_t flags) {
             break;
         }
     }
-    if (fs == NULL)
+    bool is_binfmt = fs == NULL && strcmp(fsname, "binfmt_misc") == 0;
+    if (fs == NULL && !is_binfmt)
         return _ENODEV;
 
     struct fscontext_data *data = malloc(sizeof(struct fscontext_data));
     if (data == NULL)
         return _ENOMEM;
-    *data = (struct fscontext_data) {.fs = fs};
+    *data = (struct fscontext_data) {.fs = fs, .binfmt_misc = is_binfmt};
     struct fd *fd = adhoc_fd_create(&fscontext_ops);
     if (fd == NULL) {
         free(data);
@@ -852,12 +1058,28 @@ dword_t sys_fsconfig_guest(fd_t f, dword_t cmd, guest_addr_t key_addr, guest_add
             // generic_mkdirat resolves its path via mount_find, which takes
             // mounts_lock itself -- must run before we take the lock below,
             // or this self-deadlocks (mounts_lock isn't recursive).
+            if (data->binfmt_misc) {
+                // Nothing to stage. This is where Linux's fs_context creates
+                // the superblock, and for binfmt_misc creating it IS the whole
+                // effect -- `register` and `status` come into being. move_mount
+                // then has nothing left to do but name where it already is.
+                binfmt_misc_set_mounted(true);
+                proc_mountinfo_notify_changed();
+                data->created = true;
+                return 0;
+            }
             int mkerr = generic_mkdirat(AT_PWD, "/.ish-fsmount", 0700);
             if (mkerr < 0 && mkerr != _EEXIST)
                 return mkerr;
             lock(&mounts_lock, 0);
             int err = do_mount(data->fs, "", data->point, "",
                     data->readonly ? MS_READONLY_ : 0);
+            if (err >= 0) {
+                // Detached until move_mount places it; see struct mount.
+                struct mount *staged = mount_at_point_locked(data->point);
+                if (staged != NULL)
+                    staged->detached = true;
+            }
             unlock(&mounts_lock);
             if (err < 0)
                 return err;
@@ -894,6 +1116,11 @@ dword_t sys_fsconfig(fd_t f, dword_t cmd, addr_t key_addr, addr_t value_addr, in
 }
 
 fd_t sys_fsmount_guest(fd_t f, dword_t flags, dword_t attr_flags) {
+    // Linux requires CAP_SYS_ADMIN for every door into the mount table.
+    // The app's own boot-time mounts go through do_mount() directly and are
+    // unaffected; this gate is only on the guest syscall path.
+    if (!current_capable(CAP_SYS_ADMIN_))
+        return _EPERM;
     STRACE("fsmount(%d, %#x, %#x)", f, flags, attr_flags);
     struct fd *fd = f_get(f);
     if (fd == NULL)
@@ -903,6 +1130,18 @@ fd_t sys_fsmount_guest(fd_t f, dword_t flags, dword_t attr_flags) {
     struct fscontext_data *data = fd->data;
     if (!data->created)
         return _EINVAL;
+
+    if (data->binfmt_misc) {
+        // There is no staged mount to hand back: fsconfig(CREATE) above already
+        // did the whole of what "mounting" binfmt_misc means. Return a
+        // directory fd on the real thing, which is what move_mount will be
+        // given and what /proc/self/fdinfo would show.
+        struct fd *dirfd = generic_open_realroot("/proc/sys/fs/binfmt_misc",
+                O_RDONLY_ | O_DIRECTORY_ | O_CLOEXEC_, 0);
+        if (IS_ERR(dirfd))
+            return PTR_ERR(dirfd);
+        return f_install(dirfd, O_CLOEXEC_);
+    }
 
     // data->point is a real-root staging path (/.ish-fsmount/<n>) that is
     // not visible inside a chroot; open it against the real root, or
@@ -919,6 +1158,26 @@ fd_t sys_fsmount(fd_t f, dword_t flags, dword_t attr_flags) {
 }
 
 // The filesystem backing the mount rooted exactly at `point`, or NULL.
+// Caller must hold mounts_lock.
+static struct mount *mount_at_point_locked(const char *point) {
+    struct mount *mount;
+    list_for_each_entry(&mounts, mount, mounts) {
+        if (strcmp(mount->point, point) == 0)
+            return mount;
+    }
+    return NULL;
+}
+
+// Clear the detached mark once a mount has a real mountpoint: from here on it
+// belongs in /proc/mounts and mountinfo like any other.
+static void mount_mark_attached(const char *point) {
+    lock(&mounts_lock, 0);
+    struct mount *mount = mount_at_point_locked(point);
+    if (mount != NULL)
+        mount->detached = false;
+    unlock(&mounts_lock);
+}
+
 static const struct fs_ops *mount_fs_at(const char *point) {
     lock(&mounts_lock, 0);
     struct mount *mount;
@@ -973,6 +1232,11 @@ static int mount_relocate(const char *from_point, const char *to_point) {
 
 dword_t sys_move_mount_guest(fd_t from_dfd, guest_addr_t from_path_addr, fd_t to_dfd,
         guest_addr_t to_path_addr, dword_t flags) {
+    // Linux requires CAP_SYS_ADMIN for every door into the mount table.
+    // The app's own boot-time mounts go through do_mount() directly and are
+    // unaffected; this gate is only on the guest syscall path.
+    if (!current_capable(CAP_SYS_ADMIN_))
+        return _EPERM;
     char from_path[MAX_PATH] = "";
     if (from_path_addr != 0 && user_read_string(from_path_addr, from_path, sizeof(from_path)))
         return _EFAULT;
@@ -1011,6 +1275,17 @@ dword_t sys_move_mount_guest(fd_t from_dfd, guest_addr_t from_path_addr, fd_t to
     if (err < 0)
         return err;
 
+    // binfmt_misc has already arrived: fsconfig(CMD_CREATE) brought `register`
+    // and `status` into being, and there is no mount object to relocate. The
+    // fd fsmount handed back is a plain directory fd on the target itself, so
+    // the move is a no-op -- succeed rather than failing after the effect has
+    // happened, which is what left mount(8) reporting "wrong fs type" over a
+    // directory that had in fact just been populated.
+    if (strcmp(from_point, "/proc/sys/fs/binfmt_misc") == 0 &&
+            strcmp(to_point, "/proc/sys/fs/binfmt_misc") == 0 &&
+            binfmt_misc_is_mounted())
+        return 0;
+
     // The same rule sys_mount_guest applies to devtmpfs, or this API would be
     // a way around it: a devtmpfs must not be moved on top of a /dev that is
     // already populated. Leave the mount detached and repair in place instead.
@@ -1035,8 +1310,10 @@ dword_t sys_move_mount_guest(fd_t from_dfd, guest_addr_t from_path_addr, fd_t to
     }
 
     err = mount_relocate(from_point, to_point);
-    if (err >= 0)
+    if (err >= 0) {
+        mount_mark_attached(to_point);
         proc_mountinfo_notify_changed();
+    }
     return err;
 }
 

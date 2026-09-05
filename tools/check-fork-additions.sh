@@ -257,14 +257,24 @@ need_in tests/manual/binder_ipc.c align4_client_handler \
 need_in fs/proc/ish.c   binder_show_state "state dump wired into /proc/ish"
 
 # --- writable /dev/kmsg ---------------------------------------------------
-# Upstream's kmsg_write is a bare `return _EPERM`, so a sync that touches
-# fs/mem.c can restore it in a clean merge and nothing will fail -- Android
-# would just go back to dying silently, which is precisely the symptom that
-# took a whole session to diagnose the first time.
+# The premise here has changed and the note is worth keeping. Upstream's
+# kmsg_write WAS a bare `return _EPERM`, which is why this fork implemented one
+# -- Android dying silently was the symptom, and it took a session to diagnose.
+# Upstream has since written its own, with a streaming reader and poll besides,
+# so fs/mem.c no longer routes through ish_log_write_record and asserting that
+# it does would fail on a tree that is strictly better.
+#
+# What still has to hold is the BEHAVIOUR, and tests/manual/kmsg.c is what
+# actually checks it (priority-prefix stripping included); it is in the manifest
+# and in the suite list below, so an EPERM regression fails a test rather than a
+# grep. ish_log_write_record itself stays asserted because kernel/logd_sink.c --
+# this fork's, and the only reason Android's logd output reaches dmesg at all --
+# is now its one caller.
 need_file tests/manual/kmsg.c
-need_in kernel/log.c ish_log_write_record "guest /dev/kmsg records reach the log"
+need_in kernel/log.c ish_log_write_record "the logd sink's path into the log"
 need_in kernel/log.h ish_log_write_record
-need_in fs/mem.c     ish_log_write_record "kmsg_write is not EPERM any more"
+need_in kernel/logd_sink.c ish_log_write_record \
+    "the sink still writes records rather than being cut adrift"
 
 # --- boot_id generated once ------------------------------------------------
 # Upstream generates it lazily with no lock. libbinder refuses to start on a
@@ -379,9 +389,9 @@ need_file kernel/ioctl_abi.h
 # --- iOS integration ------------------------------------------------------
 need_in app/AppGroup.m  NSDocumentDirectory \
     "app group fallback to Documents; without it sideloaded builds cannot hold a root"
-need_in app/AppGroup.m  ContainerIsAppGroup \
+need_in app/AppGroup.m  ContainerIsSharedAppGroup \
     "lets callers tell a real App Group from the fallback"
-need_in app/RootsTableViewController.m ContainerIsAppGroup \
+need_in app/RootsTableViewController.m ContainerIsSharedAppGroup \
     "Browse Files routes to Documents when there is no File Provider"
 need_in app/AppDelegate.m /mnt/iphone   "Documents mounted into the guest"
 need_in app/Info.plist  LSSupportsOpeningDocumentsInPlace

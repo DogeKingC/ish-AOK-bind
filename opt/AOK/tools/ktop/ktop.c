@@ -1,7 +1,9 @@
 /*
  * ktop -- a small, dependency-free htop-style process viewer with one extra
- * column: the guest CPU architecture (arm64 / x86_64 / x86 / riscv64) of each
- * process's binary, read straight from its ELF header via /proc/<pid>/exe.
+ * column: the CPU architecture (arm64 / x86_64 / x86 / riscv64) of each
+ * process's binary, read straight from its ELF header via /proc/<pid>/exe --
+ * or, for a natively-dispatched program, the host's architecture, since that
+ * is what it was compiled for.
  *
  * Built for iSH-AOK: a single guest can run i386, amd64, arm64 and riscv64
  * binaries side by side (e.g. a chroot into another installed root via
@@ -30,7 +32,12 @@
  *   k                           send a signal to the selected process
  *   q                           quit
  */
+// Guarded: AOK's own build defines this on the command line when it compiles
+// this file as a native program (meson.build), and an unguarded repeat of a
+// macro whose spelling differs is a warning.
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -47,6 +54,7 @@
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -84,6 +92,14 @@ static const char *C_RESET = "", *C_BAR_GREEN = "", *C_BAR_RED = "",
                   *C_HDR = "", *C_HDR_SORT = "", *C_SEL = "", *C_DIM = "",
                   *C_KEY = "", *C_KEYBAR = "";
 
+// The colourless defaults above are the state a run that does NOT want colour
+// expects to find. enable_colors is one-way, so restoring them is reset_state's
+// job rather than something any drawing path does.
+static void disable_colors(void) {
+    C_RESET = C_BAR_GREEN = C_BAR_RED = C_BAR_BLUE = C_BAR_YELLOW = "";
+    C_LABEL = C_HDR = C_HDR_SORT = C_SEL = C_DIM = C_KEY = C_KEYBAR = "";
+}
+
 static void enable_colors(void) {
     C_RESET = "\033[0m";
     C_BAR_GREEN = "\033[32m";
@@ -99,7 +115,7 @@ static void enable_colors(void) {
     C_KEYBAR = "\033[30;46m";   // key bar: label on cyan
 }
 
-// ---- ELF-header architecture detection -----------------------------------
+// ---- per-process architecture detection -----------------------------------
 
 static const char *arch_intern(const char *s) {
     // All callers pass one of these literals or "?"; returning the literal
@@ -108,32 +124,154 @@ static const char *arch_intern(const char *s) {
     return s;
 }
 
-static const char *detect_arch(pid_t pid) {
+// The vocabulary the ARCH column uses, from a machine name as uname(2) or
+// /proc/cpuinfo spells it. Shared by the guest and host lookups below: they
+// draw on different sources but have to land in the same alphabet.
+//
+// "arm64" is a prefix test rather than an equality one because
+// NXGetLocalArchInfo -- what the app build reports the host as -- says
+// "arm64e" on Apple Silicon, and the pointer-authentication ABI is not a
+// different CPU architecture as far as this column is concerned. It has to be
+// tried before the bare "arm" prefix below, which would otherwise swallow it.
+static const char *arch_from_machine(const char *machine) {
+    if (strcmp(machine, "aarch64") == 0 || strncmp(machine, "arm64", 5) == 0)
+        return arch_intern("arm64");
+    if (strcmp(machine, "x86_64") == 0 || strcmp(machine, "amd64") == 0)
+        return arch_intern("x86_64");
+    if (strcmp(machine, "riscv64") == 0)
+        return arch_intern("riscv64");
+    if (machine[0] == 'i' && strstr(machine, "86") != NULL)
+        return arch_intern("x86");
+    if (strncmp(machine, "arm", 3) == 0)
+        return arch_intern("arm");
+    return arch_intern("?");
+}
+
+// A kernel thread has no /proc/<pid>/exe -- on real Linux either -- so there is
+// no ELF header to read an architecture out of. Reporting "?" for AOK's
+// kthreadd is accurate but useless; a kernel thread belongs to the running
+// kernel, so the honest answer is the guest's own architecture. uname gives
+// that, and it is whatever the booted rootfs is.
+//
+// Cached: uname does not change under us.
+// File scope rather than function-local statics purely so reset_state() can
+// clear them -- see the note there. Neither value changes under a running
+// guest, but the process can outlive the guest: switching roots restarts the
+// guest inside the same app, and the answer to both questions can differ
+// across that.
+static const char *guest_arch_cached = NULL;
+static const char *host_arch_cached = NULL;
+
+static const char *guest_arch(void) {
+    if (guest_arch_cached != NULL)
+        return guest_arch_cached;
+    struct utsname u;
+    guest_arch_cached = uname(&u) == 0
+        ? arch_from_machine(u.machine) : arch_intern("?");
+    return guest_arch_cached;
+}
+
+// The architecture of the HOST iSH-AOK is running on, which is the one native
+// programs (below) were compiled for. iSH-AOK publishes it as a "host arch"
+// line in /proc/cpuinfo, printed for every guest ABI, so it does not depend on
+// which root is booted -- native bash in an i386 root is still arm64 code.
+// Nothing outside iSH-AOK publishes that line, and nothing outside iSH-AOK has
+// native programs to ask about, so "?" there is both honest and unreachable.
+//
+// The app build appends the chip in parentheses ("arm64(Apple M4)"), so the
+// value ends at the first '(' as well as at whitespace.
+static const char *host_arch(void) {
+    if (host_arch_cached != NULL)
+        return host_arch_cached;
+    host_arch_cached = arch_intern("?");
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    if (f == NULL)
+        return host_arch_cached;
+    char line[256];
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (strncmp(line, "host arch", 9) != 0)
+            continue;
+        char *value = strchr(line, ':');
+        if (value == NULL)
+            continue;
+        for (value++; *value == ' ' || *value == '\t'; value++)
+            ;
+        char *end = value;
+        while (*end != '\0' && *end != '(' && !isspace((unsigned char) *end))
+            end++;
+        *end = '\0';
+        if (*value != '\0')
+            host_arch_cached = arch_from_machine(value);
+        break;
+    }
+    fclose(f);
+    return host_arch_cached;
+}
+
+// Natively-dispatched programs -- bash, zsh, and SmallCLUE's applets, all
+// reached through /AOK/native -- are host code compiled into iSH-AOK rather
+// than guest binaries. Exec of one points /proc/<pid>/exe at the /AOK/native
+// entry, and what lives behind that path is a placeholder shell script, not an
+// ELF image (fs/aok.c), so the header read below finds nothing: every native
+// shell on the system showed "?" in the ARCH column. Recognise the path
+// instead and report the host's architecture, which is what that code actually
+// is.
+//
+// /AOK is where aokfs is mounted -- fixed by both entry points (main.c and
+// app/AppDelegate.m), regardless of the installed root -- so the prefix is a
+// reliable test. readlink rather than open: the link target is still readable
+// from inside a chroot that cannot open it (see ktop.md).
+static bool exe_is_native(pid_t pid) {
+    static const char prefix[] = "/AOK/native/";
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/exe", (int) pid);
-    int fd = open(path, O_RDONLY);
-    if (fd < 0)
-        return arch_intern("?");
+    char target[PATH_MAX];
+    ssize_t n = readlink(path, target, sizeof(target) - 1);
+    if (n < 0)
+        return false;
+    target[n] = '\0';
+    return strncmp(target, prefix, sizeof(prefix) - 1) == 0;
+}
 
+// `kernel_thread` comes from the caller, which has already read the state and
+// the command line: an empty /proc/<pid>/cmdline is how ps decides to bracket a
+// name, and excluding zombies keeps a reaped process from borrowing the label.
+static const char *detect_arch(pid_t pid, bool kernel_thread) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/exe", (int) pid);
     unsigned char hdr[20];
-    ssize_t n = read(fd, hdr, sizeof(hdr));
-    close(fd);
-    if (n < 20 || memcmp(hdr, "\x7f""ELF", 4) != 0)
-        return arch_intern("?");
-
-    bool little_endian = hdr[5] != 2; // EI_DATA: 1 = LSB, 2 = MSB
-    unsigned e_machine = little_endian
-        ? (unsigned) hdr[18] | ((unsigned) hdr[19] << 8)
-        : (unsigned) hdr[19] | ((unsigned) hdr[18] << 8);
-
-    switch (e_machine) {
-        case 3:   return arch_intern("x86");    // EM_386
-        case 62:  return arch_intern("x86_64"); // EM_X86_64
-        case 183: return arch_intern("arm64");  // EM_AARCH64
-        case 40:  return arch_intern("arm");    // EM_ARM (32-bit, just in case)
-        case 243: return arch_intern("riscv64"); // EM_RISCV
-        default:  return arch_intern("?");
+    ssize_t n = -1;
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        n = read(fd, hdr, sizeof(hdr));
+        close(fd);
     }
+
+    if (n >= 20 && memcmp(hdr, "\x7f""ELF", 4) == 0) {
+        bool little_endian = hdr[5] != 2; // EI_DATA: 1 = LSB, 2 = MSB
+        unsigned e_machine = little_endian
+            ? (unsigned) hdr[18] | ((unsigned) hdr[19] << 8)
+            : (unsigned) hdr[19] | ((unsigned) hdr[18] << 8);
+
+        switch (e_machine) {
+            case 3:   return arch_intern("x86");    // EM_386
+            case 62:  return arch_intern("x86_64"); // EM_X86_64
+            case 183: return arch_intern("arm64");  // EM_AARCH64
+            case 40:  return arch_intern("arm");    // EM_ARM (32-bit, just in case)
+            case 243: return arch_intern("riscv64"); // EM_RISCV
+            default:  return arch_intern("?");
+        }
+    }
+
+    // Nothing ELF-shaped behind the exe link. A native program is the one case
+    // with a real answer; a kernel thread has no exe at all and borrows the
+    // kernel's; anything else -- an exe outside this chroot, a process that
+    // exited mid-scan -- is genuinely unknown.
+    if (exe_is_native(pid))
+        return host_arch();
+    if (fd < 0 && kernel_thread)
+        return guest_arch();
+    return arch_intern("?");
 }
 
 // ---- /proc/<pid>/stat parsing ---------------------------------------------
@@ -423,8 +561,10 @@ static int collect(struct proc_sample *procs, int max) {
         if (!read_proc_stat(pid, &p))
             continue;
         p.uid = read_proc_uid(pid);
-        p.arch = detect_arch(pid);
+        // cmdline first: detect_arch needs it to tell a kernel thread (no exe,
+        // empty cmdline) from a process whose exe merely could not be opened.
         read_proc_cmdline(pid, p.cmdline, sizeof(p.cmdline));
+        p.arch = detect_arch(pid, p.cmdline[0] == '\0' && p.state != 'Z');
         procs[count++] = p;
     }
     closedir(d);
@@ -449,6 +589,31 @@ static void fill_cpu_deltas(struct proc_sample *cur, int cur_n,
             }
         }
     }
+}
+
+// %CPU is jiffies-used divided by jiffies-ELAPSED, and the elapsed part is the
+// wall time between the two samples -- NOT one second.
+//
+// This used to divide by clk_tck alone, i.e. it assumed the sample interval was
+// exactly 1s while the default delay is 3s. Everything on screen was therefore
+// multiplied by the delay: a process genuinely using one whole CPU was reported
+// at 301%, which is what it looked like on an 8-core iPad -- two processes each
+// pinning a core, each labelled 301%. The CPU burn was real; the number was
+// three times too big, and changing -d changed every reading.
+static double cpu_percent(unsigned long long cpu_delta, long clk_tck,
+                          double elapsed_sec) {
+    if (clk_tck <= 0 || elapsed_sec <= 0)
+        return 0;
+    return (double) cpu_delta * 100.0 / ((double) clk_tck * elapsed_sec);
+}
+
+// Seconds between two CLOCK_MONOTONIC readings.
+static double elapsed_since(const struct timespec *then) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double d = (double) (now.tv_sec - then->tv_sec)
+             + (double) (now.tv_nsec - then->tv_nsec) / 1e9;
+    return d > 0 ? d : 0;
 }
 
 // ---- sorting ----------------------------------------------------------------
@@ -527,13 +692,23 @@ static void format_kb(unsigned long kb, char *buf, size_t bufsize) {
 
 // Same, but always with an explicit K/M/G unit -- for meter bar text, where
 // a bare number would be ambiguous.
+//
+// Scales at 1 MiB, NOT at format_kb's six digits. That threshold exists so the
+// process table's VIRT/RES columns stay 7 wide, which meter text does not care
+// about, and inheriting it here meant anything under ~977 MB printed as raw
+// kilobytes: a 256 MB swap area read "262144K", and the Mem meter managed
+// "479629K/2098.0M" -- the same function scaling one number and not the other,
+// in one line. Reported from a device as the swap figure being wrong; the value
+// was right all along and only the unit was unreadable.
 static void format_kb_unit(unsigned long kb, char *buf, size_t bufsize) {
-    if (kb < 1000000UL)
+    if (kb < 1024UL)
         snprintf(buf, bufsize, "%luK", kb);
-    else if (kb < 10UL * 1024 * 1024)
+    else if (kb < 1024UL * 1024)
         snprintf(buf, bufsize, "%.1fM", (double) kb / 1024.0);
     else
-        snprintf(buf, bufsize, "%.1fG", (double) kb / (1024.0 * 1024.0));
+        // Two decimals at gigabyte scale: one turns a 2098 MB ceiling into a
+        // flat "2.0G" and hides the difference between devices.
+        snprintf(buf, bufsize, "%.2fG", (double) kb / (1024.0 * 1024.0));
 }
 
 // htop TIME+ format: mm:ss.cc, rolling to h:mm:ss past an hour.
@@ -566,11 +741,22 @@ static void term_size(int *rows, int *cols) {
 static struct termios orig_termios;
 static bool termios_saved = false;
 
+// The dispositions enable_raw_stdin displaced, so teardown_terminal can put
+// them back. ktop used to leave its own handlers installed and let process
+// exit clean them up; that is true of a program that owns its process and
+// false of one running as a native program (kernel/native.h), where the shell
+// this returns to would inherit them.
+static void (*prev_sigint)(int) = SIG_DFL;
+static void (*prev_sigterm)(int) = SIG_DFL;
+static void (*prev_sighup)(int) = SIG_DFL;
+static bool handlers_installed = false;
+
 // Undoes everything interactive mode did to the terminal: leave the
 // alternate screen (restoring whatever was on screen before ktop ran, like
-// htop), reset attributes, and restore canonical/echo mode. Runs via atexit
-// on normal quit and from the signal handler on SIGINT/SIGTERM/SIGHUP --
-// without the latter, a Ctrl-C would leave the tty raw with echo off.
+// htop), reset attributes, and restore canonical/echo mode. Reached from
+// teardown_terminal on normal quit and from the signal handler on
+// SIGINT/SIGTERM/SIGHUP -- without the latter, a Ctrl-C would leave the tty
+// raw with echo off.
 static void restore_terminal(void) {
     // write(2), not stdio: also called from a signal handler.
     static const char leave[] = "\033[0m\033[?1049l";
@@ -587,16 +773,37 @@ static void exit_signal_handler(int sig) {
     raise(sig);
 }
 
+// Everything enable_raw_stdin changed, put back: the screen and tty by
+// restore_terminal, and the three signal dispositions it displaced. Called on
+// the way out of interactive mode. Idempotent, so an exit path that is not
+// sure whether raw mode was ever entered can just call it.
+//
+// Deliberately not atexit(): a native program returns to a process that keeps
+// running, so an atexit handler would fire at the app's exit rather than this
+// program's -- writing escape bytes at a descriptor that has since become
+// something else -- and would stack up one more registration per run.
+static void teardown_terminal(void) {
+    if (termios_saved)
+        restore_terminal();
+    termios_saved = false;
+    if (handlers_installed) {
+        signal(SIGINT, prev_sigint);
+        signal(SIGTERM, prev_sigterm);
+        signal(SIGHUP, prev_sighup);
+        handlers_installed = false;
+    }
+}
+
 static void enable_raw_stdin(void) {
     if (!isatty(STDIN_FILENO))
         return;
     if (tcgetattr(STDIN_FILENO, &orig_termios) != 0)
         return;
     termios_saved = true;
-    atexit(restore_terminal);
-    signal(SIGINT, exit_signal_handler);
-    signal(SIGTERM, exit_signal_handler);
-    signal(SIGHUP, exit_signal_handler);
+    prev_sigint = signal(SIGINT, exit_signal_handler);
+    prev_sigterm = signal(SIGTERM, exit_signal_handler);
+    prev_sighup = signal(SIGHUP, exit_signal_handler);
+    handlers_installed = true;
     struct termios raw = orig_termios;
     raw.c_lflag &= (tcflag_t) ~(ICANON | ECHO);
     raw.c_cc[VMIN] = 0;
@@ -907,7 +1114,7 @@ static void draw_interactive(struct proc_sample *procs, int n,
                              int ncpu, const struct cpu_ticks *cur_cpu,
                              const struct cpu_ticks *prev_cpu,
                              const struct meminfo *mi,
-                             long clk_tck, long page_kb,
+                             long clk_tck, long page_kb, double elapsed_sec,
                              int selected, int *scroll_top) {
     int rows, cols;
     term_size(&rows, &cols);
@@ -949,9 +1156,7 @@ static void draw_interactive(struct proc_sample *procs, int n,
             putchar('\n');
             continue;
         }
-        double cpu_pct = 0;
-        if (clk_tck > 0)
-            cpu_pct = (double) procs[i].cpu_delta * 100.0 / (double) clk_tck;
+        double cpu_pct = cpu_percent(procs[i].cpu_delta, clk_tck, elapsed_sec);
         double mem_pct = mi->total_kb > 0
             ? (double) procs[i].rss_pages * (double) page_kb * 100.0 / (double) mi->total_kb
             : 0;
@@ -1049,7 +1254,7 @@ static void kill_prompt(pid_t pid, const char *comm, int rows, int cols) {
 
 static void print_batch(struct proc_sample *cur, int cur_n,
                         const struct meminfo *mi,
-                        long clk_tck, long page_kb) {
+                        long clk_tck, long page_kb, double elapsed_sec) {
     time_t now = time(NULL);
     struct tm tm_now;
     localtime_r(&now, &tm_now);
@@ -1084,9 +1289,7 @@ static void print_batch(struct proc_sample *cur, int cur_n,
            "PID", "USER", "PR", "NI", "VIRT(K)", "RES(K)", "ARCH", "%CPU", "%MEM", "COMMAND");
 
     for (int i = 0; i < cur_n; i++) {
-        double cpu_pct = 0;
-        if (clk_tck > 0)
-            cpu_pct = (double) cur[i].cpu_delta * 100.0 / (double) clk_tck;
+        double cpu_pct = cpu_percent(cur[i].cpu_delta, clk_tck, elapsed_sec);
         double mem_pct = mi->total_kb > 0
             ? (double) cur[i].rss_pages * (double) page_kb * 100.0 / (double) mi->total_kb
             : 0;
@@ -1117,7 +1320,44 @@ static void print_batch(struct proc_sample *cur, int cur_n,
 
 // ---- main --------------------------------------------------------------------
 
+// Every file-scope static this program keeps, put back to the value the C
+// runtime would have given it.
+//
+// ktop is built two ways from this one source: as an ordinary guest binary,
+// where a fresh process makes this a no-op, and compiled into iSH-AOK as a
+// native program (kernel/native.h), where `ktop` is a C function called on a
+// guest task's thread inside a process that may have run it before. There the
+// initialisers above ran once, at app start, and every later run inherits
+// whatever the previous one left.
+//
+// Both halves of this were measured, not assumed, by running one ktop under a
+// pty and looking at what the NEXT one did:
+//
+//  - sort_mode, show_cmdline and show_cpu_summary are the view. Sort by %MEM,
+//    quit, start ktop again: without the reset the second run came up sorted
+//    by %MEM, not the %CPU the manual documents.
+//  - enable_colors is one-way and only runs when stdout is a tty. A later run
+//    whose stdout is REDIRECTED therefore never turns colour on, but still
+//    found it on: 42 SGR sequences in the output file, 0 with the reset.
+//    (Batch mode is not affected either way -- print_batch references none of
+//    the colour variables.)
+static void reset_state(void) {
+    disable_colors();
+    guest_arch_cached = NULL;
+    host_arch_cached = NULL;
+    sort_mode = SORT_CPU;
+    show_cmdline = true;
+    show_cpu_summary = false;
+    status_msg[0] = '\0';
+    header_rows_drawn = 0;
+    memset(&orig_termios, 0, sizeof(orig_termios));
+    termios_saved = false;
+    prev_sigint = prev_sigterm = prev_sighup = SIG_DFL;
+    handlers_installed = false;
+}
+
 int main(int argc, char **argv) {
+    reset_state();
     bool batch = false;
     int iterations = -1; // -1 = unbounded (interactive default)
     double delay = 3.0;
@@ -1158,23 +1398,30 @@ int main(int argc, char **argv) {
 
     if (batch) {
         // ---- original plain-top behavior, unchanged for scripts ----
+        struct timespec sampled_at;
+        clock_gettime(CLOCK_MONOTONIC, &sampled_at);
         counts[cur_buf] = collect(bufs[cur_buf], MAX_PROCS);
         fill_cpu_deltas(bufs[cur_buf], counts[cur_buf], NULL, 0);
         sort_mode = SORT_CPU;
         qsort(bufs[cur_buf], (size_t) counts[cur_buf], sizeof(bufs[0][0]), cmp_procs);
         read_meminfo(&mi);
-        print_batch(bufs[cur_buf], counts[cur_buf], &mi, clk_tck, page_kb);
+        // First snapshot has no previous sample, so every delta is 0 and the
+        // elapsed value is irrelevant -- pass the delay so the column is 0.0
+        // rather than a division by zero.
+        print_batch(bufs[cur_buf], counts[cur_buf], &mi, clk_tck, page_kb, delay);
         for (int iter = 1; iterations < 0 || iter < iterations; iter++) {
             struct timespec ts = {(time_t) delay, (long) ((delay - (time_t) delay) * 1e9)};
             nanosleep(&ts, NULL);
             int prev_buf = cur_buf;
             cur_buf ^= 1;
+            double elapsed = elapsed_since(&sampled_at);
+            clock_gettime(CLOCK_MONOTONIC, &sampled_at);
             counts[cur_buf] = collect(bufs[cur_buf], MAX_PROCS);
             fill_cpu_deltas(bufs[cur_buf], counts[cur_buf],
                             bufs[prev_buf], counts[prev_buf]);
             qsort(bufs[cur_buf], (size_t) counts[cur_buf], sizeof(bufs[0][0]), cmp_procs);
             read_meminfo(&mi);
-            print_batch(bufs[cur_buf], counts[cur_buf], &mi, clk_tck, page_kb);
+            print_batch(bufs[cur_buf], counts[cur_buf], &mi, clk_tck, page_kb, elapsed);
         }
         return 0;
     }
@@ -1205,9 +1452,15 @@ int main(int argc, char **argv) {
     pid_t selected_pid = counts[cur_buf] > 0 ? bufs[cur_buf][0].pid : -1;
     int iter = 1;
 
+    // Wall time covered by the deltas currently on screen. The first draw has
+    // no previous sample (all deltas 0), so any positive value does.
+    double sample_elapsed = delay;
+    struct timespec sampled_at;
+    clock_gettime(CLOCK_MONOTONIC, &sampled_at);
+
     draw_interactive(bufs[cur_buf], counts[cur_buf], ncpu,
                      cpu_bufs[cur_cpu_buf], cpu_bufs[cur_cpu_buf ^ 1],
-                     &mi, clk_tck, page_kb, selected, &scroll_top);
+                     &mi, clk_tck, page_kb, sample_elapsed, selected, &scroll_top);
 
     struct timespec next_refresh;
     clock_gettime(CLOCK_MONOTONIC, &next_refresh);
@@ -1226,6 +1479,10 @@ int main(int argc, char **argv) {
                 break;
             int prev_buf = cur_buf;
             cur_buf ^= 1;
+            // Measured, not assumed: a redraw can be late (a slow /proc walk,
+            // a busy device), and the reading must stay honest when it is.
+            sample_elapsed = elapsed_since(&sampled_at);
+            clock_gettime(CLOCK_MONOTONIC, &sampled_at);
             counts[cur_buf] = collect(bufs[cur_buf], MAX_PROCS);
             fill_cpu_deltas(bufs[cur_buf], counts[cur_buf],
                             bufs[prev_buf], counts[prev_buf]);
@@ -1338,12 +1595,15 @@ int main(int argc, char **argv) {
         if (need_redraw) {
             draw_interactive(bufs[cur_buf], counts[cur_buf], ncpu,
                              cpu_bufs[cur_cpu_buf], cpu_bufs[cur_cpu_buf ^ 1],
-                             &mi, clk_tck, page_kb, selected, &scroll_top);
+                             &mi, clk_tck, page_kb, sample_elapsed,
+                             selected, &scroll_top);
         }
     }
 done:
-    // restore_terminal (via atexit) leaves the alternate screen and restores
-    // the tty; just make sure buffered output is flushed first.
+    // Flush before teardown_terminal, so anything still buffered is written
+    // while the alternate screen is still up rather than spilling onto the
+    // restored one.
     fflush(stdout);
+    teardown_terminal();
     return 0;
 }

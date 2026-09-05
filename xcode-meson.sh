@@ -161,6 +161,52 @@ configure_arch() {
 	needs_exe_wrapper = true
 EOF
 
+    # The Rust native program needs two things Xcode's environment does not
+    # supply: where rustup put cargo (it is not on PATH under xcodebuild), and
+    # the Rust target triple, which must be the iOS one rather than the host's
+    # -- a crate built for macOS links fine and targets the wrong platform.
+    # Both are empty-safe: without cargo the crate is simply not built, and
+    # everything else builds exactly as before.
+    # Both halves of the triple come from $arch, and BOTH are needed. The
+    # simulator's ARCHS is "arm64 x86_64" -- two slices, not one -- and this
+    # used to read `[[ "$arch" == arm64 ]] && rust_triple=...`, so the x86_64
+    # slice got no -Dnative_rust_target at all. An empty target is not inert:
+    # build-rust-native.sh then runs cargo with no --target, cargo builds the
+    # crate for the HOST, and macOS objects go into an iOS-Simulator link
+    # ("linking in object file built for macOS"). It stayed hidden only
+    # because the invalid simulator triple in that same script killed the
+    # build one step earlier; fixing that surfaced this.
+    #
+    # Rust also spells the architecture differently from Xcode -- aarch64
+    # where Xcode says arm64 -- which is why this is a mapping and not $arch.
+    local rust_arch=""
+    case "$arch" in
+        arm64)  rust_arch=aarch64 ;;
+        x86_64) rust_arch=x86_64 ;;
+    esac
+    local rust_triple=""
+    if [[ -n "$rust_arch" ]]; then
+        case "$sdk_name" in
+            iphoneos)          rust_triple="$rust_arch-apple-ios" ;;
+            iphonesimulator)   rust_triple="$rust_arch-apple-ios-sim" ;;
+            macosx)            rust_triple="$rust_arch-apple-darwin" ;;
+        esac
+    fi
+    local meson_extra_opts="-Dcargo_home=$HOME/.cargo"
+    [[ -n "$rust_triple" ]] && meson_extra_opts="$meson_extra_opts -Dnative_rust_target=$rust_triple"
+    # AOK_RUST_FEATURES comes from app/iSH.xcconfig, so the Rust program's
+    # cargo features are set where every other project-wide knob is set rather
+    # than on a command line. Empty for a normal build.
+    meson_extra_opts="$meson_extra_opts -Dnative_rust_features=${AOK_RUST_FEATURES:-}"
+    # AOK_NATIVE_HELIX likewise comes from app/iSH.xcconfig. Without this the
+    # meson default (disabled) won a build that had asked for an editor, and
+    # the only symptom was /AOK/native/hx not being there.
+    if [[ "${AOK_NATIVE_HELIX:-}" == YES ]]; then
+        meson_extra_opts="$meson_extra_opts -Dnative_helix=enabled"
+    else
+        meson_extra_opts="$meson_extra_opts -Dnative_helix=disabled"
+    fi
+
     if [[ ! -f "$crossfile" ]] || ! cmp -s "$crossfile_tmp" "$crossfile"; then
         mv "$crossfile_tmp" "$crossfile"
         meson_needs_setup=1
@@ -180,14 +226,54 @@ EOF
         if [[ "$current_c_args_json" != "$desired_c_args_json" ]] || [[ "$current_c_link_args_json" != "$desired_c_args_json" ]]; then
             meson_needs_wipe=1
         fi
+        # Options are read at setup time only, so a build directory made
+        # before one of these existed keeps its old answer and quietly leaves
+        # the Rust native program out.
+        #
+        # Teaching a build directory an option it has never heard of, and
+        # setting that option, are TWO steps and cannot be one. `meson setup
+        # --reconfigure` validates -D against the options the directory
+        # already knows, so passing -D for a new one is rejected outright --
+        # "ERROR: Unknown option" -- however current meson_options.txt is.
+        # A plain --reconfigure, with no -D at all, re-reads the option
+        # definitions and adds the newcomer at its default; only then will the
+        # -D be accepted. The declared-option loop further down has used that
+        # same trick since guest_archs, and this block ignored it and broke
+        # every Xcode build against an existing DerivedData tree.
+        #
+        # So: teach first, re-read, and let the ordinary value comparison
+        # below decide whether anything still has to be set. Anyone adding a
+        # fourth option here inherits the rule.
+        read_rust_opts() {
+            current_cargo_home=$(meson_option_json "$config" cargo_home 2>/dev/null || echo MISSING)
+            current_rust_target=$(meson_option_json "$config" native_rust_target 2>/dev/null || echo MISSING)
+            current_rust_features=$(meson_option_json "$config" native_rust_features 2>/dev/null || echo MISSING)
+        current_helix=$(meson_option_json "$config" native_helix 2>/dev/null || echo MISSING)
+        want_helix=$([[ "${AOK_NATIVE_HELIX:-}" == YES ]] && echo '"enabled"' || echo '"disabled"')
+        }
+        read_rust_opts
+        if [[ "$current_cargo_home" == MISSING ]] || \
+           [[ "$current_rust_target" == MISSING ]] || \
+           [[ "$current_rust_features" == MISSING ]] || \
+           [[ "$current_helix" == MISSING ]]; then
+            (set -x; meson setup --reconfigure "$meson_dir" "$SRCROOT" --cross-file "$crossfile") || exit $?
+            config=$(meson introspect --buildoptions "$meson_dir")
+            read_rust_opts
+        fi
+        if [[ "$current_cargo_home" != "\"$HOME/.cargo\"" ]] || \
+           [[ "$current_rust_target" != "\"$rust_triple\"" ]] || \
+           [[ "$current_rust_features" != "\"${AOK_RUST_FEATURES:-}\"" ]] || \
+           [[ "$current_helix" != "$want_helix" ]]; then
+            meson_needs_setup=1
+        fi
     fi
 
     if (( meson_needs_wipe )); then
-        (set -x; meson setup --wipe "$meson_dir" "$SRCROOT" --cross-file "$crossfile") || exit $?
+        (set -x; meson setup --wipe "$meson_dir" "$SRCROOT" --cross-file "$crossfile" $meson_extra_opts) || exit $?
     elif [[ ! -f "$meson_dir/meson-private/coredata.dat" ]]; then
-        (set -x; meson setup "$meson_dir" "$SRCROOT" --cross-file "$crossfile") || exit $?
+        (set -x; meson setup "$meson_dir" "$SRCROOT" --cross-file "$crossfile" $meson_extra_opts) || exit $?
     elif (( meson_needs_setup )); then
-        (set -x; meson setup --reconfigure "$meson_dir" "$SRCROOT" --cross-file "$crossfile") || exit $?
+        (set -x; meson setup --reconfigure "$meson_dir" "$SRCROOT" --cross-file "$crossfile" $meson_extra_opts) || exit $?
     fi
 
     cd "$meson_dir"
@@ -229,11 +315,6 @@ EOF
     fi
     log=${ISH_LOG:-}
     log_handler=${ISH_LOGGER:-}
-    kernel=ish
-    if [[ -n "${ISH_KERNEL:-}" ]]; then
-        kernel=$ISH_KERNEL
-    fi
-    kconfig=""
     # Guest architectures the app build supports; comma-separated subset of
     # i386,amd64,arm64. Set ISH_GUEST_ARCHS in iSH.xcconfig (or the scheme
     # environment) to trim the emulator; meson rejects an empty list.
@@ -263,7 +344,7 @@ EOF
         fi
     done
 
-    for var in buildtype log b_ndebug b_sanitize log_handler kernel kconfig guest_archs arm64_gret; do
+    for var in buildtype log b_ndebug b_sanitize log_handler guest_archs arm64_gret; do
         if ! old_value=$(python3 -c "import sys, json; v = next(x['value'] for x in json.load(sys.stdin) if x['name'] == '$var'); print(str(v).lower() if isinstance(v, bool) else ','.join(v) if isinstance(v, list) else v)" <<< "$config" 2>/dev/null); then
             # The option is missing from this build dir's cached
             # configuration: it was added to meson_options.txt after the

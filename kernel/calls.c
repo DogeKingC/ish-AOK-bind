@@ -13,6 +13,7 @@
 #include "fs/devices.h"
 #include "fs/tty.h"
 #include "util/sync.h"
+#include "kernel/swap.h"
 
 extern bool isGlibC;
 
@@ -984,6 +985,7 @@ static syscall_t i386_syscall_table[] = {
     [81]  = (syscall_t) sys_setgroups,
     [83]  = (syscall_t) sys_symlink,
     [85]  = (syscall_t) sys_readlink,
+    [87]  = (syscall_t) sys_swapon,
     [88]  = (syscall_t) sys_reboot,
     [90]  = (syscall_t) sys_mmap,
     [91]  = (syscall_t) sys_munmap,
@@ -1003,6 +1005,7 @@ static syscall_t i386_syscall_table[] = {
     [108] = (syscall_t) sys_fstat,
     [111] = (syscall_t) syscall_success_stub, // vhangup (tty-cleanup no-op)
     [114] = (syscall_t) sys_wait4,
+    [115] = (syscall_t) sys_swapoff,
     [116] = (syscall_t) sys_sysinfo,
     [117] = (syscall_t) sys_ipc,
     [118] = (syscall_t) sys_fsync,
@@ -1097,7 +1100,14 @@ static syscall_t i386_syscall_table[] = {
     [241] = (syscall_t) sys_sched_setaffinity,
     [242] = (syscall_t) sys_sched_getaffinity,
     [243] = (syscall_t) sys_set_thread_area,
-    [245] = (syscall_t) syscall_stub, // io_setup
+    // The io_* family. 246-249 were absent rather than stubbed, and absent is
+    // worse: a missing entry is a "missing syscall" SIGSYS kill instead of an
+    // errno, so a 32-bit guest touching AIO died without even a log line.
+    [245] = (syscall_t) sys_io_setup,
+    [246] = (syscall_t) sys_io_destroy,
+    [247] = (syscall_t) sys_io_getevents,
+    [248] = (syscall_t) sys_io_submit,
+    [249] = (syscall_t) sys_io_cancel,
     [252] = (syscall_t) sys_exit_group,
     [254] = (syscall_t) sys_epoll_create0,
     [255] = (syscall_t) sys_epoll_ctl,
@@ -1145,6 +1155,8 @@ static syscall_t i386_syscall_table[] = {
     [311] = (syscall_t) sys_set_robust_list,
     [312] = (syscall_t) sys_get_robust_list,
     [313] = (syscall_t) sys_splice,
+    [315] = (syscall_t) sys_tee,
+    [316] = (syscall_t) sys_vmsplice,
     [314] = (syscall_t) syscall_success_stub, // sync_file_range
     [318] = (syscall_t) syscall_success_stub, // getcpu
     [319] = (syscall_t) sys_epoll_pwait,
@@ -1529,6 +1541,8 @@ static syscall_t amd64_syscall_table[470] = {
     [164] = (syscall_t) sys_settimeofday,
     [165] = (syscall_t) sys_mount,
     [166] = (syscall_t) sys_umount2,
+    [167] = (syscall_t) sys_swapon,
+    [168] = (syscall_t) sys_swapoff,
     [169] = (syscall_t) sys_reboot,
     [170] = (syscall_t) sys_sethostname,
     [171] = (syscall_t) sys_setdomainname,
@@ -1540,6 +1554,14 @@ static syscall_t amd64_syscall_table[470] = {
     [202] = (syscall_t) sys_futex,
     [203] = (syscall_t) sys_sched_setaffinity,
     [204] = (syscall_t) sys_sched_getaffinity,
+    // The io_* family, which had NO amd64 entries at all -- so an amd64 guest
+    // touching AIO got a "missing syscall" SIGSYS kill rather than an errno,
+    // and none of the log line that made this diagnosable on arm64.
+    [206] = (syscall_t) sys_io_setup,
+    [207] = (syscall_t) sys_io_destroy,
+    [208] = (syscall_t) sys_io_getevents,
+    [209] = (syscall_t) sys_io_submit,
+    [210] = (syscall_t) sys_io_cancel,
     [213] = (syscall_t) sys_epoll_create0,
     [217] = (syscall_t) sys_getdents64,
     [218] = (syscall_t) sys_set_tid_address,
@@ -1589,6 +1611,8 @@ static syscall_t amd64_syscall_table[470] = {
     [273] = (syscall_t) sys_set_robust_list_amd64,
     [274] = (syscall_t) sys_get_robust_list_amd64,
     [275] = (syscall_t) sys_splice,
+    [276] = (syscall_t) sys_tee,
+    [278] = (syscall_t) sys_vmsplice,
     [277] = (syscall_t) syscall_success_stub, // sync_file_range
     [317] = (syscall_t) syscall_eopnotsupp_stub, // seccomp
     [280] = (syscall_t) sys_utimensat_amd64,
@@ -1735,7 +1759,7 @@ static dword_t sys_riscv_flush_icache(void) {
 
 static syscall_t arm64_syscall_table[470] = {
     // I/O
-    [2]   = (syscall_t) syscall_stub, // io_submit
+    [2] = (syscall_t) sys_io_submit,
     [5 ... 16] = (syscall_t) sys_xattr_stub,
     [17]  = (syscall_t) sys_getcwd,
     [19]  = (syscall_t) sys_eventfd2,
@@ -1788,7 +1812,9 @@ static syscall_t arm64_syscall_table[470] = {
     [71]  = (syscall_t) sys_sendfile64,
     [72]  = (syscall_t) sys_pselect_amd64,
     [73]  = (syscall_t) sys_ppoll_amd64,
+    [75]  = (syscall_t) sys_vmsplice,
     [76]  = (syscall_t) sys_splice,
+    [77]  = (syscall_t) sys_tee,
     [78]  = (syscall_t) sys_readlinkat,
     [79]  = (syscall_t) sys_newfstatat_amd64,
     [80]  = (syscall_t) sys_fstat_amd64,
@@ -1893,10 +1919,10 @@ static syscall_t arm64_syscall_table[470] = {
     // errno instead of a "missing syscall" SIGSYS kill. All of these
     // dispatch natively (full-width); the entries exist to pass the
     // NULL check. syscall_stub entries keep the "stub" log visible.
-    [0] = (syscall_t) syscall_stub, // io_setup
-    [1] = (syscall_t) syscall_stub, // io_destroy
-    [3] = (syscall_t) syscall_stub, // io_cancel
-    [4] = (syscall_t) syscall_stub, // io_getevents
+    [0] = (syscall_t) sys_io_setup,
+    [1] = (syscall_t) sys_io_destroy,
+    [3] = (syscall_t) sys_io_cancel,
+    [4] = (syscall_t) sys_io_getevents,
     [18] = (syscall_t) syscall_stub, // lookup_dcookie
     [41] = (syscall_t) syscall_stub, // pivot_root
     [42] = (syscall_t) syscall_stub, // nfsservctl
@@ -1946,8 +1972,10 @@ static syscall_t arm64_syscall_table[470] = {
     [217] = (syscall_t) syscall_stub_silent, // add_key
     [218] = (syscall_t) syscall_stub, // request_key
     [219] = (syscall_t) sys_keyctl, // keyctl -- matches i386 (288)/amd64 (250)
-    [224] = (syscall_t) syscall_stub, // swapon
-    [225] = (syscall_t) syscall_stub, // swapoff
+    // 224/225 (swapon/swapoff) are dispatched natively above with full-width
+    // args; entries kept so the NULL check passes, as munlock does.
+    [224] = (syscall_t) sys_swapon,
+    [225] = (syscall_t) sys_swapoff,
     [234] = (syscall_t) syscall_stub, // remap_file_pages
     [236] = (syscall_t) syscall_stub_silent, // get_mempolicy
     [237] = (syscall_t) syscall_stub_silent, // set_mempolicy
@@ -2187,7 +2215,48 @@ static bool syscall_result_is_errno(dword_t result) {
 }
 
 static bool syscall_result_should_restart(dword_t result) {
-    return (sdword_t) result == _ERESTART;
+    sdword_t r = (sdword_t) result;
+    if (r != _ERESTART && r != _ERESTART_NOHAND) {
+        if (current != NULL)
+            current->restart_nohand_pending = false;
+        return false;
+    }
+    // Remember which flavour, for the handler-setup path: an _ERESTART_NOHAND
+    // restart is cancelled by a handler running before the syscall re-executes
+    // (Linux's ERESTARTNOHAND), an _ERESTART one is not. Recorded here because
+    // this predicate is checked immediately before every PC rewind.
+    if (current != NULL)
+        current->restart_nohand_pending = (r == _ERESTART_NOHAND);
+    return true;
+}
+
+// Undo prepare_syscall_restart: step the PC forward over the syscall
+// instruction again and hand the guest EINTR instead. Linux does exactly this
+// in handle_signal() when the pending restart is an ERESTARTNOHAND one and a
+// handler is about to run.
+void cancel_syscall_restart(void) {
+    struct cpu_state *cpu = &current->cpu;
+    switch (current->abi) {
+        case GUEST_ABI_AMD64:
+            cpu->amd64_rip += 2;
+            cpu->eip = (dword_t) cpu->amd64_rip;
+            cpu->amd64_regs[amd64_rax] = (qword_t) (sqword_t) _EINTR;
+            cpu->eax = (dword_t) _EINTR;
+            break;
+        case GUEST_ABI_ARM64:
+            cpu->arm64_pc += 4;
+            cpu->arm64_regs[arm64_x0] = (qword_t) (sqword_t) _EINTR;
+            break;
+        case GUEST_ABI_RISCV64:
+            cpu->riscv64_pc += 4;
+            cpu->riscv64_regs[riscv64_a0] = (qword_t) (sqword_t) _EINTR;
+            break;
+        case GUEST_ABI_I386:
+        default:
+            cpu->eip += 2;
+            cpu->eax = (dword_t) _EINTR;
+            break;
+    }
 }
 
 static sdword_t syscall_result_errno(dword_t result) {
@@ -2476,6 +2545,24 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
     case 429: // move_mount(from_dfd, from_path, to_dfd, to_path, flags)
         result = (dword_t) sys_move_mount_guest((fd_t) raw_args[0], raw_args[1],
                 (fd_t) raw_args[2], raw_args[3], (dword_t) raw_args[4]); break;
+
+    // The io_* family. An aio_context_t is the address of the context's ring
+    // page, so arg 0 is a full 64-bit guest address on every call after
+    // io_setup -- the legacy marshalled path would have to truncate it, and
+    // refuses (SIGSYS). Results are counts or -errno, so the dword sign-
+    // extension at the bottom of this function is the right writeback.
+    case 0: // io_setup(nr_events, ctx_idp)
+        result = (dword_t) sys_io_setup_guest((uint_t) raw_args[0], raw_args[1]); break;
+    case 1: // io_destroy(ctx)
+        result = (dword_t) sys_io_destroy_guest(raw_args[0]); break;
+    case 2: // io_submit(ctx, nr, iocbpp)
+        result = (dword_t) sys_io_submit_guest(raw_args[0], (sqword_t) raw_args[1],
+                raw_args[2]); break;
+    case 3: // io_cancel(ctx, iocb, result)
+        result = (dword_t) sys_io_cancel_guest(raw_args[0], raw_args[1], raw_args[2]); break;
+    case 4: // io_getevents(ctx, min_nr, nr, events, timeout)
+        result = (dword_t) sys_io_getevents_guest(raw_args[0], (sqword_t) raw_args[1],
+                (sqword_t) raw_args[2], raw_args[3], raw_args[4]); break;
     case 25: { // fcntl — F_SETFL takes, and F_GETFL returns, open flags in the
                // aarch64 encoding; translate both directions at this boundary
                // (same four relocated O_ constants as openat's flags, above).
@@ -2584,6 +2671,12 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
         result = sys_clone_guest(raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4]);
         break;
     case 221: result = (dword_t) sys_execve_guest(raw_args[0], raw_args[1], raw_args[2]); break;
+    // swapon/swapoff take a PATH, so they must be handled here with full-width
+    // args and not left to the legacy-marshalled table: a 64-bit guest pointer
+    // does not survive the dword marshal, which refuses it and delivers SIGSYS
+    // ("Bad system call"), measured.
+    case 224: result = (dword_t) sys_swapon(raw_args[0], (dword_t) raw_args[1]); break;
+    case 225: result = (dword_t) sys_swapoff(raw_args[0]); break;
     case 226: result = (dword_t) sys_mprotect_guest(raw_args[0], raw_args[1], (int_t) raw_args[2]); break;
     case 233: result = sys_madvise_guest(raw_args[0], raw_args[1], (dword_t) raw_args[2]); break;
     case 260: result = sys_wait4_guest((pid_t_) raw_args[0], raw_args[1], (dword_t) raw_args[2], raw_args[3]); break;
@@ -2638,7 +2731,7 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
     case 107: result = (dword_t) sys_timer_create_amd64_guest( (dword_t) raw_args[0], raw_args[1], raw_args[2]); break; // timer_create
     case 108: result = (dword_t) sys_timer_gettime64_guest( (dword_t) raw_args[0], raw_args[1]); break; // timer_gettime
     case 110: result = (dword_t) sys_timer_settime64_guest( (dword_t) raw_args[0], (int_t) raw_args[1], raw_args[2], raw_args[3]); break; // timer_settime
-    case 112: result = (dword_t) sys_clock_settime( (dword_t) raw_args[0], 0); break; // clock_settime
+    case 112: result = (dword_t) sys_clock_settime( (dword_t) raw_args[0], raw_args[1]); break; // clock_settime
     case 114: result = (dword_t) sys_clock_getres_amd64_guest( (dword_t) raw_args[0], raw_args[1]); break; // clock_getres
     case 115: result = (dword_t) sys_clock_nanosleep_amd64_guest( (dword_t) raw_args[0], (int_t) raw_args[1], raw_args[2], raw_args[3]); break; // clock_nanosleep
     case 117: result = (dword_t) sys_ptrace_guest( (dword_t) raw_args[0], (dword_t) raw_args[1], raw_args[2], raw_args[3]); break; // ptrace
@@ -2675,10 +2768,21 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
     case 435: result = (dword_t) sys_clone3_guest( raw_args[0], (dword_t) raw_args[1]); break; // clone3
     case 437: result = (dword_t) sys_openat2_guest( (fd_t) raw_args[0], raw_args[1], raw_args[2], (dword_t) raw_args[3]); break; // openat2
     case 441: result = (dword_t) sys_epoll_pwait2_guest( (fd_t) raw_args[0], raw_args[1], (int_t) raw_args[2], raw_args[3], raw_args[4], (dword_t) raw_args[5]); break; // epoll_pwait2
-    // splice and settimeofday are argument-ignoring stubs (EINVAL/EPERM);
-    // dispatch natively with zeros so 64-bit pointers can't be rejected or
-    // truncated on the way to code that never reads them.
-    case 76: result = sys_splice(0, 0, 0, 0, 0, 0); break; // splice (stub)
+    // splice takes two 64-bit loff_t pointers and a 64-bit count, so it has to
+    // be dispatched natively rather than through the legacy marshaller -- and
+    // with the REAL arguments. It used to be called with zeros here because it
+    // was a stub that read none of them; leaving that in place after
+    // implementing it would have made every arm64 and riscv64 splice an EINVAL
+    // on a null pipe fd, with nothing to say why.
+    case 76: result = (dword_t) sys_splice_guest((fd_t) raw_args[0], raw_args[1],
+                 (fd_t) raw_args[2], raw_args[3], raw_args[4], (dword_t) raw_args[5]); break; // splice
+    case 75: result = (dword_t) sys_vmsplice_guest((fd_t) raw_args[0], raw_args[1],
+                 raw_args[2], (dword_t) raw_args[3]); break; // vmsplice
+    case 77: result = (dword_t) sys_tee((fd_t) raw_args[0], (fd_t) raw_args[1],
+                 (dword_t) raw_args[2], (dword_t) raw_args[3]); break; // tee
+    // settimeofday is an argument-ignoring stub (EPERM); dispatch natively
+    // with zeros so 64-bit pointers can't be rejected or truncated on the way
+    // to code that never reads them.
     case 170: result = sys_settimeofday(0, 0); break; // settimeofday (stub)
     case 148: result = (dword_t) sys_getresuid_guest(raw_args[0], raw_args[1], raw_args[2]); break; // getresuid
     case 150: result = (dword_t) sys_getresgid_guest(raw_args[0], raw_args[1], raw_args[2]); break; // getresgid
@@ -2743,13 +2847,20 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
                       (dword_t) raw_args[2], (dword_t) raw_args[3], (dword_t) raw_args[4]); break;
     // clean ENOSYS: known syscalls with no implementation; native so
     // 64-bit pointer args never trip the legacy-marshal validation
-    case 0: case 1: case 2: case 3: case 4: case 18: case 41: case 42:
-    case 60: case 75: case 77: case 89: case 104: case 105: case 106:
+    // (0-4 are the io_* family, implemented above -- they were on this
+    // ENOSYS list, which is why wiring arm64_syscall_table alone changed
+    // nothing: this native list runs first and answered for them.)
+    case 18: case 41: case 42:
+    case 60: case 89: case 104: case 105: case 106:
     case 128:
     case 180: case 181: case 182: case 183: case 184: case 185:
     // (186-193 are the real SysV msg/sem implementations above)
-    case 217: case 218: case 224:
-    case 225: case 234: case 238: case 239: case 241: case 262:
+    // 224/225 (swapon/swapoff) are gone from this list and implemented in
+    // arm64_syscall_table -- and the comment above is why that alone was not
+    // enough: this native list runs first and answered for them, so the table
+    // entry looked wired and did nothing.
+    case 217: case 218:
+    case 234: case 238: case 239: case 241: case 262:
     case 263: case 268: case 271: case 273:
     case 274: case 275: case 280: case 282: case 284:
     case 288: case 289: case 290: case 294:
@@ -2794,6 +2905,19 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
 static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t syscall_num,
         const qword_t raw_args[6]) {
     switch (syscall_num) {
+    // swapon/swapoff take a PATH. Like case 2 below they must be handled here
+    // with full-width args: through the legacy-marshalled table an amd64
+    // guest's 64-bit pointer is refused and the guest gets SIGSYS ("Bad system
+    // call"), measured -- while i386, whose pointers fit in a dword, worked
+    // from the table alone. Same reason arm64/riscv64 handle them in the
+    // asm-generic switch.
+    case 167:
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_swapon(
+                raw_args[0], (dword_t) raw_args[1]));
+        return true;
+    case 168:
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_swapoff(raw_args[0]));
+        return true;
     case 2:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_open_guest(
                 raw_args[0], (dword_t) raw_args[1], (mode_t_) raw_args[2]));
@@ -2841,10 +2965,25 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_rt_sigprocmask_guest(
                 (dword_t) raw_args[0], raw_args[1], raw_args[2], (dword_t) raw_args[3]));
         return true;
+    // Through the restart protocol, not straight into the result register.
+    // These are the ERESTARTNOHAND waits: interrupted by a job-control stop
+    // they return _ERESTART_NOHAND (-512), which is an INTERNAL code. The
+    // caller is meant to either rewind the PC and re-execute, or -- if a
+    // handler ran -- convert it to EINTR. Written directly to rax it was
+    // neither, so an amd64 guest Ctrl-Z'd inside poll() and resumed got
+    // errno 512 back out of poll(). Every one of these leaked it, with and
+    // without a handler. arm64 never did: its legacy switch routes them
+    // through this same predicate. read (case 0) above is the shape.
     case 7:
-        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_poll_guest(
-                raw_args[0], (dword_t) raw_args[1], (int_t) raw_args[2]));
+    {
+        dword_t result = sys_poll_guest(
+                    raw_args[0], (dword_t) raw_args[1], (int_t) raw_args[2]);
+        if (syscall_result_should_restart(result))
+            prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
+        else
+            amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
         return true;
+    }
     case 16:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_ioctl_guest(
                 (fd_t) raw_args[0], (dword_t) raw_args[1], raw_args[2]));
@@ -2896,9 +3035,15 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
                 raw_args[0]));
         return true;
     case 23:
-        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_select_amd64_guest(
-                (fd_t) raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4]));
+    {
+        dword_t result = sys_select_amd64_guest(
+                    (fd_t) raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4]);
+        if (syscall_result_should_restart(result))
+            prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
+        else
+            amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
         return true;
+    }
     case 293:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_pipe2(
                 raw_args[0], (int_t) raw_args[1]));
@@ -3212,15 +3357,19 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
                 (dword_t) raw_args[0], raw_args[1]));
         return true;
     case 227:
-        // clock_settime: iSH cannot set host clocks, so sys_clock_settime
-        // validates only the clock id and ignores the timespec. Handle it
-        // natively like clock_gettime(228) so the legacy 32-bit arg marshaller
-        // does not reject the 64-bit guest timespec pointer with "needs
-        // full-width args" and raise SIGSYS (observed: a process that calls
-        // clock_settime dies with "Bad system call" instead of returning the
-        // EINVAL/EPERM the clock id warrants).
+        // clock_settime: handled natively like clock_gettime(228) so the
+        // legacy 32-bit arg marshaller does not reject the 64-bit guest
+        // timespec pointer with "needs full-width args" and raise SIGSYS
+        // (observed: a process that calls clock_settime dies with "Bad system
+        // call" instead of returning the EINVAL/EPERM the clock id warrants).
+        //
+        // The pointer is passed through. It used to be hardcoded 0 here,
+        // because iSH cannot set a host clock and the implementation ignored
+        // the timespec entirely -- but it now reads and range-checks it before
+        // refusing, the way Linux orders EFAULT, EINVAL and EPERM, and a
+        // hardcoded 0 made every well-formed call report EFAULT.
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_clock_settime(
-                (dword_t) raw_args[0], 0));
+                (dword_t) raw_args[0], raw_args[1]));
         return true;
     case 228:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_clock_gettime_amd64_guest(
@@ -3251,9 +3400,15 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
                 raw_args[0], (dword_t) raw_args[1], (dword_t) raw_args[2]));
         return true;
     case 232:
-        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_epoll_wait_guest(
-                (fd_t) raw_args[0], raw_args[1], (int_t) raw_args[2], (int_t) raw_args[3]));
+    {
+        dword_t result = sys_epoll_wait_guest(
+                    (fd_t) raw_args[0], raw_args[1], (int_t) raw_args[2], (int_t) raw_args[3]);
+        if (syscall_result_should_restart(result))
+            prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
+        else
+            amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
         return true;
+    }
     case 233:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_epoll_ctl_guest(
                 (fd_t) raw_args[0], (int_t) raw_args[1], (fd_t) raw_args[2], raw_args[3]));
@@ -3328,13 +3483,25 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
                 (fd_t) raw_args[0], raw_args[1], (mode_t_) raw_args[2], (dword_t) raw_args[3]));
         return true;
     case 270:
-        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_pselect_amd64_guest(
-                (fd_t) raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5]));
+    {
+        dword_t result = sys_pselect_amd64_guest(
+                    (fd_t) raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5]);
+        if (syscall_result_should_restart(result))
+            prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
+        else
+            amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
         return true;
+    }
     case 271:
-        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_ppoll_amd64_guest(
-                raw_args[0], (dword_t) raw_args[1], raw_args[2], raw_args[3], (dword_t) raw_args[4]));
+    {
+        dword_t result = sys_ppoll_amd64_guest(
+                    raw_args[0], (dword_t) raw_args[1], raw_args[2], raw_args[3], (dword_t) raw_args[4]);
+        if (syscall_result_should_restart(result))
+            prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
+        else
+            amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
         return true;
+    }
     case 273:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_set_robust_list_amd64_guest(
                 raw_args[0], (dword_t) raw_args[1]));
@@ -3352,10 +3519,16 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
                 (int_t) raw_args[0], raw_args[1], (dword_t) raw_args[2]));
         return true;
     case 281:
-        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_epoll_pwait_guest(
-                (fd_t) raw_args[0], raw_args[1], (int_t) raw_args[2], (int_t) raw_args[3],
-                raw_args[4], (dword_t) raw_args[5]));
+    {
+        dword_t result = sys_epoll_pwait_guest(
+                    (fd_t) raw_args[0], raw_args[1], (int_t) raw_args[2], (int_t) raw_args[3],
+                    raw_args[4], (dword_t) raw_args[5]);
+        if (syscall_result_should_restart(result))
+            prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
+        else
+            amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
         return true;
+    }
     case 283:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_timerfd_create(
                 (int_t) raw_args[0], (int_t) raw_args[1]));
@@ -3634,10 +3807,16 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
                 (dword_t) raw_args[0], raw_args[1]));
         return true;
     case 441:
-        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_epoll_pwait2_guest(
-                (fd_t) raw_args[0], raw_args[1], (int_t) raw_args[2], raw_args[3], raw_args[4],
-                (dword_t) raw_args[5]));
+    {
+        dword_t result = sys_epoll_pwait2_guest(
+                    (fd_t) raw_args[0], raw_args[1], (int_t) raw_args[2], raw_args[3], raw_args[4],
+                    (dword_t) raw_args[5]);
+        if (syscall_result_should_restart(result))
+            prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
+        else
+            amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
         return true;
+    }
     case 452:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_fchmodat2_guest(
                 (fd_t) raw_args[0], raw_args[1], (dword_t) raw_args[2], (dword_t) raw_args[3]));
@@ -3677,6 +3856,23 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
                 (fd_t) raw_args[0], raw_args[1], (dword_t) raw_args[2],
                 (off_t_) (raw_args[3] | (raw_args[4] << 32)), (uint_t) raw_args[5]));
         return true;
+    // vmsplice(fd, iov, iovcnt, flags). The legacy table routed this to
+    // sys_vmsplice, which is the i386 entry point: it takes a 32-bit addr_t
+    // and, worse, hardcodes GUEST_ABI_I386 for the iovec layout. An amd64
+    // iovec is {void *64, size_t 64}; read as i386's {u32, u32}, the base and
+    // length of every entry come out of the wrong halves, so the call failed
+    // with EFAULT on addresses that were perfectly valid. The legacy dispatch's
+    // dword-fit check could never have caught it: a guest stack address does
+    // fit in 32 bits, and it was the STRUCT being misread, not the pointer.
+    //
+    // sys_vmsplice_guest takes the full-width address and uses current->abi,
+    // which is how arm64 has always reached it (case 75 of the arm64 legacy
+    // switch, which is why only amd64 failed). readv/writev above are the
+    // same shape.
+    case 278:
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_vmsplice_guest(
+                (fd_t) raw_args[0], raw_args[1], raw_args[2], (dword_t) raw_args[3]));
+        return true;
     // fsopen/fsconfig/move_mount (new mount API, fs/mount.c) carry real
     // 64-bit guest pointer args (fsname/key/value/from_path/to_path) that
     // would trip the legacy marshalled dispatch's dword-fit check on a
@@ -3697,6 +3893,34 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
                 (fd_t) raw_args[0], raw_args[1], (fd_t) raw_args[2], raw_args[3],
                 (dword_t) raw_args[4]));
         return true;
+
+    // The io_* family, for the same reason again, and here it is unavoidable
+    // rather than merely typical: an aio_context_t IS the address of the
+    // context's ring page, so EVERY call after io_setup carries a 64-bit
+    // address in arg 0. The legacy path refused to truncate it and SIGSYS'd
+    // io_submit -- correctly; truncating an opaque handle would have been the
+    // worse outcome. min_nr/nr are longs, hence the sqword casts.
+    case 206: // io_setup(nr_events, ctx_idp)
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_io_setup_guest(
+                (uint_t) raw_args[0], raw_args[1]));
+        return true;
+    case 207: // io_destroy(ctx)
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_io_destroy_guest(
+                raw_args[0]));
+        return true;
+    case 208: // io_getevents(ctx, min_nr, nr, events, timeout)
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_io_getevents_guest(
+                raw_args[0], (sqword_t) raw_args[1], (sqword_t) raw_args[2],
+                raw_args[3], raw_args[4]));
+        return true;
+    case 209: // io_submit(ctx, nr, iocbpp)
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_io_submit_guest(
+                raw_args[0], (sqword_t) raw_args[1], raw_args[2]));
+        return true;
+    case 210: // io_cancel(ctx, iocb, result)
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_io_cancel_guest(
+                raw_args[0], raw_args[1], raw_args[2]));
+        return true;
     default:
         return false;
     }
@@ -3715,6 +3939,12 @@ static unsigned amd64_syscall_legacy_arg_count(qword_t syscall_num) {
               // sys_membarrier ignores flags+cpuid anyway. Over-counting to 3 made the
               // marshaller validate the garbage rdx and SIGSYS syslog-ng.
         return 2;
+    // The io_* family (206-210) is absent on purpose: it is dispatched
+    // natively in handle_amd64_native_memory_syscall and never reaches this
+    // classifier. It cannot -- an aio_context_t is the ring page's address,
+    // so arg 0 is a real 64-bit pointer and no arity would make it fit a
+    // dword. Narrowing the count here was the first attempt and it did not
+    // help; the marshaller was right to refuse.
     case 145: // sched_getscheduler(pid)
     case 146: // sched_get_priority_max(policy)
     case 147: // sched_get_priority_min(policy)
@@ -4693,9 +4923,20 @@ void handle_syscall_interrupt(struct cpu_state *cpu) {
         return;
     }
     if (syscall_num >= dispatch->num_syscalls) {
+        // ENOSYS, not SIGSYS. Linux answers an unknown syscall number with
+        // -ENOSYS and nothing else -- SIGSYS is seccomp's, and a kernel does
+        // not raise it on its own. Killing the caller instead breaks the
+        // ordinary way a program finds out whether a syscall exists: glibc,
+        // libseccomp's own tests and every "call it and see" feature probe do
+        // exactly this, and here they died mid-probe with no way to catch it.
+        // A caller that has genuinely gone off the rails still learns so from
+        // the errno.
+        //
+        // Left as a printk because a guest reaching this is usually a real
+        // gap worth seeing in the log, just not worth a signal.
         printk("ERROR: %d(%s) missing %s syscall %d\n",
                current->pid, current->comm, dispatch->name, (int) syscall_num);
-        deliver_signal(current, SIGSYS_, SIGINFO_NIL);
+        dispatch->syscall_result(cpu, _ENOSYS);
         return;
     }
 
@@ -4735,6 +4976,47 @@ void handle_syscall_interrupt(struct cpu_state *cpu) {
     if (dispatch->abi == GUEST_ABI_AMD64 &&
             handle_amd64_native_memory_syscall(cpu, syscall_num, raw_args)) {
         qword_t result = dispatch->abi == GUEST_ABI_AMD64 ? cpu->amd64_regs[amd64_rax] : cpu->eax;
+        // A restart code must never survive as the syscall's answer. Of the
+        // ~220 cases in the handler above, only a handful run the result
+        // through syscall_result_should_restart themselves; every other one
+        // writes it straight to RAX, so an _ERESTART came back to the guest as
+        // errno 85 and an _ERESTART_NOHAND as errno 512. Measured: on an amd64
+        // guest, ^Z a program writing to a pipe and its write(2) fails with
+        // "errno 85 (No error information)" -- because realfs_write returns
+        // EINTR the moment a signal is pending, sys_write_common turns that
+        // into _ERESTART meaning "restart transparently", and nothing ever
+        // did. i386/arm64/riscv64 route the same calls through the legacy
+        // path, which has always checked, which is why this was amd64-only.
+        //
+        // Catching it here rather than in each case: one place cannot be
+        // forgotten by the next syscall someone adds to that switch. The
+        // cases that DO handle it already leave a normal value in RAX, so
+        // they fall straight through.
+        //
+        // Compared at FULL WIDTH, not truncated to 32 bits. A 64-bit return --
+        // an mmap address, a large lseek offset -- can perfectly well have low
+        // bits of 0xffffffab, and truncating would turn one of those into a
+        // spurious restart.
+        // Only ever SET the flag here, never clear it. The cases that handle
+        // their own restart call syscall_result_should_restart inside the
+        // handler -- which sets it -- and then leave a normal value in RAX;
+        // clearing it on the way past destroyed it before the handler-setup
+        // path could read it, turning every handler-cancelled ERESTARTNOHAND
+        // back into a restart. That regressed all five of the poll-family
+        // cases this backstop was not even meant to touch.
+        bool restart_pending =
+            (sqword_t) result == (sqword_t) (sdword_t) _ERESTART ||
+            (sqword_t) result == (sqword_t) (sdword_t) _ERESTART_NOHAND;
+        if (restart_pending) {
+            if (current != NULL)
+                current->restart_nohand_pending =
+                    (sqword_t) result == (sqword_t) (sdword_t) _ERESTART_NOHAND;
+            prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
+            if (current->ptrace.traced && current->ptrace.stop_at_syscall &&
+                    current->ptrace.syscall_stopped)
+                ptrace_syscall_stop(cpu);
+            return;
+        }
         amd64_trace_track_child(syscall_num, result);
         amd64_tty_process_trace(syscall_num, raw_args, result);
         amd64_tracked_enoent_path_trace(syscall_num, raw_args, result);
@@ -5104,6 +5386,25 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
                         : mem_ptr_fault(current->mem, fault_addr,
                                         cpu->segfault_was_write ? MEM_WRITE : MEM_READ);
 
+    if (ptr == NULL && task_take_swap_io_fault()) {
+        // The mapping is fine; its CONTENTS could not be read back from the
+        // swap file. Linux answers that with SIGBUS/BUS_ADRERR, the same as a
+        // truncated file mapping (handle_bus_interrupt below), not with
+        // SIGSEGV -- the address is valid, the hardware could not deliver it.
+        printk("ERROR: %d(%s) [%s] SIGBUS on %#llx at %#llx (swap read failed)\n",
+               current->pid, current->comm, guest_abi_desc(current->abi).name,
+               (unsigned long long) cpu->segfault_addr,
+               (unsigned long long) current_fault_ip(cpu));
+        record_guest_fault_event("swap-io-error", cpu, cpu->segfault_addr,
+                                 cpu->segfault_was_write);
+        struct siginfo_ bus_info = {
+            .code = BUS_ADRERR_,
+            .fault.addr = cpu->segfault_addr,
+        };
+        deliver_signal(current, SIGBUS_, bus_info);
+        return;
+    }
+
     if (ptr == NULL) {
         printk("ERROR: %d(%s) [%s] page fault on %#llx at %#llx%s\n",
                current->pid, current->comm, guest_abi_desc(current->abi).name,
@@ -5285,6 +5586,9 @@ static void dump_fault_pt_state(guest_addr_t addr) {
         return;
     fault_pt_log_count++;
 
+    // Bare read_lock, not the quiesce-aware pair dump_addr_backing uses: this
+    // site, i386_gpf_addr_needs_page_fault and handle_i386_stack_store_gpf are
+    // docs/simulated_swap_plan.md item 11, deliberately untouched here.
     read_lock(&current->mem->lock);
     page_t center = PAGE(addr);
     page_t start = center > 1 ? center - 1 : center;
@@ -5726,21 +6030,80 @@ static bool amd64_verbose_fault_trace_enabled(void) {
 // whether a faulting PC lives in a mapped file (libc/node .text) vs an
 // anonymous region (V8's own JIT-generated code), and the file offset so the
 // exact instruction can be disassembled from the on-disk binary.
+//
+// The page-table read has to be under the mem lock. A leaf is immortal once
+// allocated, but the `struct data` it points at is not: a sibling thread's
+// munmap drops the last refcount and free()s it in pt_unmap_always_unlocked
+// (emu/memory.c), so the lockless pt->data->{name,fd,file_offset} reads this
+// used to do were a use-after-free on a path any guest can reach by faulting.
+// A fault in one thread says nothing about what its siblings are doing to the
+// address space at that instant; a dull single-threaded guest was measured
+// freeing 267-457 of these per second.
+//
+// The path lookup must NOT be under that lock. generic_getpath on a fakefs
+// root takes the fakefs metadata lock and runs a SQLite query (fs/fake.c,
+// fakefs_getpath), and holding an address-space lock across filesystem work
+// that can block on another guest thread is a shape this codebase has already
+// been bitten by. So take a counted reference to the fd while the lock is
+// held and resolve the path after dropping it. Plain fd_retain, not
+// fd_retain_if_live: the data struct owns a reference of its own (kernel/mmap.c
+// stores `fd_retain(fd)`) and the read lock keeps the data struct alive, so
+// the refcount cannot already have reached zero here.
+//
+// Dropping that reference again at the end can be the LAST one: a sibling that
+// unmapped the region while we were printing has already handed the data
+// struct's own reference to mem->deferred_fds (pt_unmap_always_unlocked, in
+// emu/memory.c) and mem_write_unlock_with_pokes has drained it. So ->close can
+// run from inside a fatal fault report, and for a FUSE-backed mapping that is
+// a cache writeback plus a FLUSH the daemon has to answer (fusefs_close in
+// fs/fuse.c) -- a round trip to another guest process, in the middle of
+// printing a crash. That is acceptable here only because no lock is held at
+// that point: the mem read lock is released above, and the whole report runs
+// from handle_interrupt, which task_run_current (kernel/task.c) calls after
+// read_unlocking the address space. Holding nothing is exactly the condition
+// mem_defer_fd_close exists to buy for the munmap path, where the write lock
+// IS held (see sys_munmap_guest in kernel/mmap.c).
 static void dump_addr_backing(const char *label, guest_addr_t addr) {
     struct mem *mem = current != NULL ? current->mem : NULL;
     if (mem == NULL)
         return;
+
+    char path[MAX_PATH] = "";
+    struct fd *path_fd = NULL;
+    bool mapped = false;
+    bool anonymous = false;
+    unsigned flags = 0;
+    size_t data_off = 0;
+    size_t file_off = 0;
+
+    mem_read_lock_quiesce_aware(mem);
     struct pt_entry *pt = mem_pt(mem, PAGE(addr));
-    if (pt == NULL || pt->data == NULL) {
+    if (pt != NULL && pt->data != NULL) {
+        struct data *data = pt->data;
+        mapped = true;
+        anonymous = data->fd == NULL && data->name == NULL;
+        flags = pt->flags;
+        data_off = pt->offset;
+        file_off = data->file_offset;
+        if (data->name != NULL) {
+            // The characters outlive the struct (data->name is only ever set
+            // to a literal -- kernel/exec.c's "[vdso]" and "[vvar]"), but the
+            // pointer to them lives in the struct, so it is read here.
+            strncpy(path, data->name, sizeof(path) - 1);
+        } else if (data->fd != NULL) {
+            path_fd = fd_retain(data->fd);
+        }
+    }
+    mem_read_unlock_quiesce_aware(mem);
+
+    if (!mapped) {
         printk("%s %#llx: unmapped\n", label, (unsigned long long) addr);
         return;
     }
-    struct data *data = pt->data;
-    char path[MAX_PATH] = "";
-    if (data->name != NULL)
-        strncpy(path, data->name, sizeof(path) - 1);
-    else if (data->fd != NULL)
-        generic_getpath(data->fd, path);
+    if (path_fd != NULL) {
+        generic_getpath(path_fd, path);
+        fd_close(path_fd);
+    }
     // file_offset is the region's offset at its first page; add the address's
     // distance into this page's mapping via pt->offset (offset within data).
     //
@@ -5755,16 +6118,19 @@ static void dump_addr_backing(const char *label, guest_addr_t addr) {
     // against a process that is dying, and ASLR makes a capture from any other
     // run worthless. That race was tried twice and lost twice; this line is
     // what it was trying to reconstruct.
-    size_t file_off = (size_t) data->file_offset + (size_t) pt->offset
-                    + (size_t) (addr & (PAGE_SIZE - 1));
-    bool anon = data->fd == NULL && data->name == NULL;
+    //
+    // Computed from the values captured under the lock above, NOT by
+    // dereferencing pt/data again: upstream moved that capture inside
+    // mem_read_lock for a reason, and this fork's version of these lines read
+    // both pointers after the unlock.
+    size_t backing_off = file_off + data_off + (size_t) (addr & (PAGE_SIZE - 1));
     printk("%s %#llx: %s%s flags=%#x data_off=%zu file_off=%zu",
            label, (unsigned long long) addr,
            path[0] ? path : "[anon]",
-           anon ? " (anonymous/JIT)" : "",
-           pt->flags, (size_t) pt->offset, (size_t) data->file_offset);
-    if (!anon && path[0])
-        printk(" -> %s+%#zx", path, file_off);
+           anonymous ? " (anonymous/JIT)" : "",
+           flags, data_off, file_off);
+    if (!anonymous && path[0])
+        printk(" -> %s+%#zx", path, backing_off);
     printk("\n");
 }
 
@@ -6462,8 +6828,12 @@ static void handle_privileged_instruction_interrupt(struct cpu_state *cpu) {
 }
 
 void handle_timer_interrupt(__attribute__((unused)) struct cpu_state *cpu) {
-    // For now we just return.
-    return;
+    // task_run_current released mem->lock at kernel/task.c:918 before calling
+    // handle_interrupt at :921, so this is the one point during guest execution
+    // where the thread holds no mem lock and may reclaim or block. A guest
+    // committing memory faster than the pager can reclaim it gets poked from
+    // tlb_handle_miss and lands here to pay for it.
+    mem_fault_backpressure();
 }
 
 // Bumped on every syscall this thread makes. The re-fault guard below uses it
@@ -6557,39 +6927,12 @@ void handle_interrupt(int interrupt) {
     bool has_saved_mask = __atomic_load_n(&current->has_saved_mask, __ATOMIC_ACQUIRE);
     if (has_saved_mask || ((pending | group_pending) & ~blocked) != 0)
         receive_signals();
-    // Fast path: group->stopped is almost always false. Read it locklessly
-    // (it is _Atomic) and only take group->lock to actually wait when stopped.
-    // Missing a just-set transition here is harmless: a SIGSTOP'd thread is
-    // poked and re-enters handle_interrupt, catching the stop on the next pass.
-    struct tgroup *group = current->group;
-    if (group->stopped) {
-        if (current->ptrace.traced) {
-            // A traced task reports its group-stop to the tracer and blocks
-            // there until PTRACE_CONT (which lifts group->stopped). Without
-            // this the stop is invisible to the tracer's wait4 and the tracee
-            // hangs -- see ptrace_group_stop(). Re-check traced each pass in
-            // case the tracer detaches us while stopped.
-            while (group->stopped && current->ptrace.traced)
-                ptrace_group_stop();
-        }
-        lock(&group->lock, 0);
-        while (group->stopped)
-            wait_for_ignore_signals(&group->stopped_cond, &group->lock, NULL);
-        unlock(&group->lock);
-
-        // We were stopped and have just been resumed. If SIGCONT flagged a
-        // reportable continue, wake a parent blocked in wait4/waitid(WCONTINUED)
-        // (the flag itself is consumed by the parent's notify_if_continued).
-        // Done from our own context — never the signal sender's — so taking
-        // pids_lock here respects the pids_lock -> group->lock ordering.
-        if (group->continued) {
-            complex_lockt(&pids_lock, 0);
-            struct task *parent = current->group->leader->parent;
-            if (parent != NULL)
-                notify(&parent->group->child_exit);
-            unlock(&pids_lock);
-        }
-    }
+    // A job-control group-stop parks the task until SIGCONT (or, for a traced
+    // task, until the tracer resumes it). Shared with native_checkpoint --
+    // kernel/signal.c -- because a native program needs exactly the same
+    // handling and the second copy this used to be lacked all of the ptrace
+    // half of it.
+    group_stop_wait();
 }
 
 

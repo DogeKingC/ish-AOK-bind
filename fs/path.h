@@ -12,6 +12,31 @@
 // chroot-aware anchor again would double-apply it -- inside a chroot that
 // meant ENOENT/EACCES for perfectly valid paths.
 #define N_REALROOT 8
+// Paired with N_PARENT_DIR_WRITE by the operations that CREATE a new name
+// (mkdir, symlink, link, mknod). Linux looks the final component up before
+// checking whether the parent may be written -- filename_create() returns
+// -EEXIST for a name already there, and only vfs_mkdir/vfs_link then ask
+// may_create() for permission -- so an existing target reports EEXIST, not
+// EACCES. Not for unlink/rmdir/rename: there an existing target is the point
+// of the call, so the permission check is what governs and must come first.
+// Linux's MAXSYMLINKS: how many symlinks one path resolution may follow.
+#define MAX_SYMLINKS 40
+
+#define N_CREATE_EEXIST_FIRST 16
+// The mirror image, for the operations that REMOVE a name (unlink, rmdir, and
+// rename's SOURCE). Linux looks the final component up before asking
+// may_delete() for permission, so a name that is not there reports ENOENT even
+// when the parent is unwritable -- do_unlinkat() and do_rmdir() both bail on a
+// negative dentry first. Without this, `rm -f /unwritable/nonexistent` answered
+// EACCES where Linux answers success, because rm -f suppresses ENOENT and
+// nothing else. Not for rename's DESTINATION: a missing destination is the
+// ordinary case there, and the permission error is the right answer.
+#define N_REMOVE_ENOENT_FIRST 64
+// Refuse to traverse a symlink anywhere in the path, final component
+// included, answering ELOOP instead of following it. openat2's
+// RESOLVE_NO_SYMLINKS, which exists so a caller can open a path it does not
+// control without a symlink in it redirecting the open somewhere else.
+#define N_NO_SYMLINKS 32
 // Require write+execute permission on the resolved parent directory of the
 // final path component. Only correct for callers where the operation always
 // creates or removes a directory entry regardless of whether the final

@@ -27,6 +27,9 @@ enum aokfs_node_kind {
     aokfs_fixes_devuan_readme,
     aokfs_fixes_devuan_pkcsslotd_init,
     aokfs_fixes_debian_link,
+    aokfs_fixes_arch_dir,
+    aokfs_fixes_arch_readme,
+    aokfs_fixes_arch_script,
     aokfs_tests_dir,
     // Individual /tests/* files are no longer enumerated here -- they come from
     // the build-time generator (tools/gen-aokfs.py + fs/aok-tests.manifest) and
@@ -96,6 +99,8 @@ static void *aokfs_encode_node(enum aokfs_node_kind node) {
 #include "aok_generated_tests.inc"
 #include "aok_generated_tools.inc"
 #include "aok_generated_docs.inc"
+#include "aok_generated_book.inc"
+#include "aok_generated_libs.inc"
 // Native programs are addressed like the generated files above: a base plus an
 // index into kernel/native.c's registry, rather than one enum constant per
 // program. The registry is already the thing exec dispatches on, so serving
@@ -113,6 +118,22 @@ static const struct native_program *aokfs_node_native(enum aokfs_node_kind node)
 #define AOKFS_GEN_BASE 0x10000
 #define AOKFS_GEN_TOOLS_BASE 0x20000
 #define AOKFS_GEN_DOCS_BASE 0x30000
+// /native/libs: support files a native program reads -- helix's tree-sitter
+// queries and themes are the first, and the reason it exists.
+//
+// Unlike the three tables above, this one is NESTED arbitrarily deep, so its
+// directories cannot be enum constants the way /tools/ktop and the arch test
+// dirs are. Adding one of those means an enum entry plus edits in four other
+// places, which does not scale to a tree with a directory per language. So
+// gen-aokfs.py derives the directory list from the file paths and it gets a
+// base of its own; a directory here is an index into that table and nothing
+// else in this file has to learn about it.
+#define AOKFS_GEN_LIBS_BASE 0x50000
+#define AOKFS_GEN_LIBSDIR_BASE 0x60000
+// The book, at /docs/book. Nested (appendices/), so it needs a directory table
+// of its own the way /native/libs does -- a flat table cannot name /docs/book.
+#define AOKFS_GEN_BOOK_BASE 0x70000
+#define AOKFS_GEN_BOOKDIR_BASE 0x80000
 static bool aokfs_node_is_gen_tools(enum aokfs_node_kind node) {
     return (unsigned) node >= AOKFS_GEN_TOOLS_BASE &&
         (unsigned) node < AOKFS_GEN_TOOLS_BASE + AOKFS_GEN_FILE_COUNT_tools;
@@ -121,26 +142,60 @@ static bool aokfs_node_is_gen_docs(enum aokfs_node_kind node) {
     return (unsigned) node >= AOKFS_GEN_DOCS_BASE &&
         (unsigned) node < AOKFS_GEN_DOCS_BASE + AOKFS_GEN_FILE_COUNT_docs;
 }
+static bool aokfs_node_is_gen_libs(enum aokfs_node_kind node) {
+    return (unsigned) node >= AOKFS_GEN_LIBS_BASE &&
+        (unsigned) node < AOKFS_GEN_LIBS_BASE + AOKFS_GEN_FILE_COUNT_libs;
+}
+static bool aokfs_node_is_gen_book(enum aokfs_node_kind node) {
+    return (unsigned) node >= AOKFS_GEN_BOOK_BASE &&
+        (unsigned) node < AOKFS_GEN_BOOK_BASE + AOKFS_GEN_FILE_COUNT_book;
+}
+static bool aokfs_node_is_gen_bookdir(enum aokfs_node_kind node) {
+    return (unsigned) node >= AOKFS_GEN_BOOKDIR_BASE &&
+        (unsigned) node < AOKFS_GEN_BOOKDIR_BASE + AOKFS_GEN_DIR_COUNT_book;
+}
+static bool aokfs_node_is_gen_libsdir(enum aokfs_node_kind node) {
+    return (unsigned) node >= AOKFS_GEN_LIBSDIR_BASE &&
+        (unsigned) node < AOKFS_GEN_LIBSDIR_BASE + AOKFS_GEN_DIR_COUNT_libs;
+}
 static bool aokfs_node_is_gen(enum aokfs_node_kind node) {
     return ((unsigned) node >= AOKFS_GEN_BASE &&
             (unsigned) node < AOKFS_GEN_BASE + AOKFS_GEN_FILE_COUNT) ||
-        aokfs_node_is_gen_tools(node) || aokfs_node_is_gen_docs(node);
+        aokfs_node_is_gen_tools(node) || aokfs_node_is_gen_docs(node) ||
+        aokfs_node_is_gen_libs(node) || aokfs_node_is_gen_book(node);
 }
 static const struct aokfs_gen_file *aokfs_gen_entry(enum aokfs_node_kind node) {
     if (aokfs_node_is_gen_tools(node))
         return &aokfs_gen_files_tools[(unsigned) node - AOKFS_GEN_TOOLS_BASE];
     if (aokfs_node_is_gen_docs(node))
         return &aokfs_gen_files_docs[(unsigned) node - AOKFS_GEN_DOCS_BASE];
+    if (aokfs_node_is_gen_libs(node))
+        return &aokfs_gen_files_libs[(unsigned) node - AOKFS_GEN_LIBS_BASE];
+    if (aokfs_node_is_gen_book(node))
+        return &aokfs_gen_files_book[(unsigned) node - AOKFS_GEN_BOOK_BASE];
     return &aokfs_gen_files[(unsigned) node - AOKFS_GEN_BASE];
 }
 
+// The path of a derived /native/libs directory.
+static const char *aokfs_gen_libsdir_path(enum aokfs_node_kind node) {
+    return aokfs_gen_dirs_libs[(unsigned) node - AOKFS_GEN_LIBSDIR_BASE];
+}
+
+// ...and of a derived /docs/book directory.
+static const char *aokfs_gen_bookdir_path(enum aokfs_node_kind node) {
+    return aokfs_gen_dirs_book[(unsigned) node - AOKFS_GEN_BOOKDIR_BASE];
+}
+
 static bool aokfs_node_is_dir(enum aokfs_node_kind node) {
+    if (aokfs_node_is_gen_libsdir(node) || aokfs_node_is_gen_bookdir(node))
+        return true;
     return node == aokfs_root ||
         node == aokfs_fixes_dir ||
         node == aokfs_persist_dir ||
         node == aokfs_roots_dir ||
         node == aokfs_fakefs_dir ||
         node == aokfs_fixes_devuan_dir ||
+        node == aokfs_fixes_arch_dir ||
         node == aokfs_tools_dir ||
         node == aokfs_tests_dir ||
         node == aokfs_tests_audio_dir ||
@@ -186,6 +241,10 @@ static qword_t aokfs_node_inode(enum aokfs_node_kind node) {
 static const char *aokfs_node_path(enum aokfs_node_kind node) {
     if (aokfs_node_is_gen(node))
         return aokfs_gen_entry(node)->path;
+    if (aokfs_node_is_gen_libsdir(node))
+        return aokfs_gen_libsdir_path(node);
+    if (aokfs_node_is_gen_bookdir(node))
+        return aokfs_gen_bookdir_path(node);
     switch (node) {
         case aokfs_root:
             return "";
@@ -209,6 +268,12 @@ static const char *aokfs_node_path(enum aokfs_node_kind node) {
             return "/fixes/devuan/fix-pkcsslotd-init.sh";
         case aokfs_fixes_debian_link:
             return "/fixes/debian";
+        case aokfs_fixes_arch_dir:
+            return "/fixes/arch";
+        case aokfs_fixes_arch_readme:
+            return "/fixes/arch/README.txt";
+        case aokfs_fixes_arch_script:
+            return "/fixes/arch/fix-pacman.sh";
         case aokfs_tests_dir:
             return "/tests";
         case aokfs_tests_x86_dir:
@@ -271,6 +336,9 @@ static bool aokfs_lookup_node(const char *path, enum aokfs_node_kind *node_out) 
         aokfs_fixes_devuan_readme,
         aokfs_fixes_devuan_pkcsslotd_init,
         aokfs_fixes_debian_link,
+        aokfs_fixes_arch_dir,
+        aokfs_fixes_arch_readme,
+        aokfs_fixes_arch_script,
         aokfs_tests_dir,
         aokfs_tests_x86_dir,
         aokfs_tests_arm64_dir,
@@ -317,6 +385,33 @@ static bool aokfs_lookup_node(const char *path, enum aokfs_node_kind *node_out) 
     for (size_t i = 0; i < AOKFS_GEN_FILE_COUNT_tools; i++) {
         if (strcmp(path, aokfs_gen_files_tools[i].path) == 0) {
             *node_out = (enum aokfs_node_kind) (AOKFS_GEN_TOOLS_BASE + i);
+            return true;
+        }
+    }
+    // Generated /native/libs/* files, and the directories derived from their
+    // paths. Files first: a name cannot be both, and the file table is the
+    // one with the data.
+    for (size_t i = 0; i < AOKFS_GEN_FILE_COUNT_libs; i++) {
+        if (strcmp(path, aokfs_gen_files_libs[i].path) == 0) {
+            *node_out = (enum aokfs_node_kind) (AOKFS_GEN_LIBS_BASE + i);
+            return true;
+        }
+    }
+    for (size_t i = 0; i < AOKFS_GEN_FILE_COUNT_book; i++) {
+        if (strcmp(path, aokfs_gen_files_book[i].path) == 0) {
+            *node_out = (enum aokfs_node_kind) (AOKFS_GEN_BOOK_BASE + i);
+            return true;
+        }
+    }
+    for (size_t i = 0; i < AOKFS_GEN_DIR_COUNT_book; i++) {
+        if (strcmp(path, aokfs_gen_dirs_book[i]) == 0) {
+            *node_out = (enum aokfs_node_kind) (AOKFS_GEN_BOOKDIR_BASE + i);
+            return true;
+        }
+    }
+    for (size_t i = 0; i < AOKFS_GEN_DIR_COUNT_libs; i++) {
+        if (strcmp(path, aokfs_gen_dirs_libs[i]) == 0) {
+            *node_out = (enum aokfs_node_kind) (AOKFS_GEN_LIBSDIR_BASE + i);
             return true;
         }
     }
@@ -383,6 +478,114 @@ static const char *aokfs_inline_file_data(enum aokfs_node_kind node, size_t *siz
     // Filled once into a static buffer: this function hands back a pointer and
     // a length, and stat and read have to agree on that length.
     static pthread_once_t version_once = PTHREAD_ONCE_INIT;
+    static const char fixes_arch_readme[] =
+        "Arch Linux ARM under iSH-AOK\n"
+        "\n"
+        "Three things stop a stock Arch root from installing packages here. None of\n"
+        "them is an emulator bug; all three are the root expecting a system service or\n"
+        "kernel feature that an AOK guest does not have.\n"
+        "\n"
+        "1. pacman's sandbox needs Landlock.\n"
+        "\n"
+        "   pacman 7 confines its download and extraction work with Landlock, the Linux\n"
+        "   LSM. AOK's kernel does not implement it and reports ENOSYS, and pacman\n"
+        "   treats that as fatal rather than degrading:\n"
+        "\n"
+        "       error: restricting filesystem access failed because Landlock is not\n"
+        "              supported by the kernel!\n"
+        "       error: switching to sandbox user 'alpm' failed!\n"
+        "\n"
+        "   AOK will not pretend to support it. A syscall that claims to have\n"
+        "   sandboxed something it did not is worse than one that says it cannot,\n"
+        "   because the caller then trusts a confinement that is not there. So the\n"
+        "   sandbox is switched off explicitly in pacman.conf, which is what every\n"
+        "   kernel without Landlock gets.\n"
+        "\n"
+        "2. /etc/resolv.conf is a dangling symlink.\n"
+        "\n"
+        "   The image ships it pointing at /run/systemd/resolve/resolv.conf, which\n"
+        "   systemd-resolved would create. Nothing under AOK runs systemd, so the link\n"
+        "   never resolves and every mirror lookup fails with \"Could not resolve host\".\n"
+        "\n"
+        "3. The keyring is empty.\n"
+        "\n"
+        "   A fresh root has no populated pacman keyring, so signed packages are\n"
+        "   refused with \"required key missing from keyring\".\n"
+        "\n"
+        "Apply all three with:\n"
+        "\n"
+        "  sh /AOK/fixes/arch/fix-pacman.sh\n"
+        "\n"
+        "It is safe to re-run: each step checks whether it is already done. The keyring\n"
+        "step takes a few minutes and needs no network.\n"
+        "\n";
+
+    static const char fixes_arch_script[] =
+        "#!/bin/sh\n"
+        "# Make a stock Arch Linux ARM root able to install packages under iSH-AOK.\n"
+        "# See /AOK/fixes/arch/README.txt for why each step is needed.\n"
+        "set -e\n"
+        "\n"
+        "if [ ! -f /etc/pacman.conf ]; then\n"
+        "    echo \"ERROR: /etc/pacman.conf is missing -- this does not look like an Arch root\"\n"
+        "    exit 1\n"
+        "fi\n"
+        "\n"
+        "changed=0\n"
+        "\n"
+        "# 1. Landlock is not implemented by AOK's kernel, and pacman treats its\n"
+        "#    absence as fatal rather than degrading. Turn the sandbox off explicitly.\n"
+        "for opt in DisableSandboxFilesystem DisableSandboxSyscalls; do\n"
+        "    if grep -q \"^${opt}\" /etc/pacman.conf; then\n"
+        "        echo \"ok: ${opt} already set\"\n"
+        "    else\n"
+        "        if grep -q \"^#${opt}\" /etc/pacman.conf; then\n"
+        "            sed -i \"s/^#${opt}/${opt}/\" /etc/pacman.conf\n"
+        "        else\n"
+        "            sed -i \"s/^\\\\[options\\\\]/[options]\\\\n${opt}/\" /etc/pacman.conf\n"
+        "        fi\n"
+        "        echo \"set: ${opt}\"\n"
+        "        changed=1\n"
+        "    fi\n"
+        "done\n"
+        "\n"
+        "# 2. The shipped /etc/resolv.conf points at a file systemd-resolved would\n"
+        "#    create. Nothing runs systemd here, so it never exists.\n"
+        "if [ -e /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then\n"
+        "    echo \"ok: /etc/resolv.conf is a real file\"\n"
+        "elif [ -L /etc/resolv.conf ] && [ -e /etc/resolv.conf ]; then\n"
+        "    echo \"ok: /etc/resolv.conf symlink resolves\"\n"
+        "else\n"
+        "    rm -f /etc/resolv.conf\n"
+        "    printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n' > /etc/resolv.conf\n"
+        "    echo \"set: /etc/resolv.conf replaced (was a dangling symlink)\"\n"
+        "    changed=1\n"
+        "fi\n"
+        "\n"
+        "# 3. A fresh root has no populated keyring, so signed packages are refused.\n"
+        "if [ -s /etc/pacman.d/gnupg/trustdb.gpg ]; then\n"
+        "    echo \"ok: pacman keyring already initialised\"\n"
+        "else\n"
+        "    echo \"initialising the pacman keyring (a few minutes, no network needed)...\"\n"
+        "    pacman-key --init\n"
+        "    if pacman-key --populate archlinuxarm 2>/dev/null; then\n"
+        "        echo \"set: keyring populated from archlinuxarm\"\n"
+        "    else\n"
+        "        pacman-key --populate\n"
+        "        echo \"set: keyring populated\"\n"
+        "    fi\n"
+        "    changed=1\n"
+        "fi\n"
+        "\n"
+        "if [ \"$changed\" = \"0\" ]; then\n"
+        "    echo\n"
+        "    echo \"Nothing to do -- this root is already set up.\"\n"
+        "else\n"
+        "    echo\n"
+        "    echo \"Done. Try:  pacman -Sy\"\n"
+        "fi\n"
+        "\n";
+
     static const char fixes_devuan_readme[] =
         "pkcsslotd init fix\n"
         "\n"
@@ -501,6 +704,11 @@ static const char *aokfs_inline_file_data(enum aokfs_node_kind node, size_t *siz
         "\n"
         "Extract /AOK/tools/iSH_benchmark.tgz into /tmp and compile its benchmarks.\n"
         "\n"
+        "The same two workloads are also built in and need no compiler:\n"
+        "  /AOK/native/bmm [iterations]   /AOK/native/bmt [threads]\n"
+        "Running one against the guest-built binary of the same workload is the\n"
+        "emulated-vs-native comparison; see /AOK/docs/benchmarks.md.\n"
+        "\n"
         "Environment:\n"
         "  ISH_AOK_BENCHMARK_ARCHIVE  Archive path. Default: /AOK/tools/iSH_benchmark.tgz\n"
         "  ISH_AOK_BENCHMARK_DIR      Work directory. Default: /tmp/iSH_benchmark\n"
@@ -592,6 +800,12 @@ static const char *aokfs_inline_file_data(enum aokfs_node_kind node, size_t *siz
         case aokfs_fixes_devuan_pkcsslotd_init:
             *size_out = sizeof(fixes_devuan_pkcsslotd_init) - 1;
             return fixes_devuan_pkcsslotd_init;
+        case aokfs_fixes_arch_readme:
+            *size_out = sizeof(fixes_arch_readme) - 1;
+            return fixes_arch_readme;
+        case aokfs_fixes_arch_script:
+            *size_out = sizeof(fixes_arch_script) - 1;
+            return fixes_arch_script;
         case aokfs_tools_setup_ish_benchmark:
             *size_out = sizeof(setup_ish_benchmark) - 1;
             return setup_ish_benchmark;
@@ -827,6 +1041,72 @@ static int aokfs_readdir(struct fd *fd, struct dir_entry *entry) {
     enum aokfs_node_kind node = aokfs_decode_node(fd->fs_data);
     enum aokfs_node_kind child;
 
+    // A derived /native/libs directory, handled before the switch because the
+    // node is an index into a generated table rather than an enum constant a
+    // case label could name. One routine for every depth: list the immediate
+    // subdirectories, then the files that sit directly in this directory.
+    // Both tables are sorted, so the order is stable between calls and a
+    // reader part way through does not see an entry twice.
+    if (aokfs_node_is_gen_bookdir(node)) {
+        const char *base = aokfs_node_path(node);
+        size_t blen = strlen(base);
+        size_t want = (size_t) fd->offset++;
+        size_t seen = 0;
+        for (size_t i = 0; i < AOKFS_GEN_DIR_COUNT_book; i++) {
+            const char *d = aokfs_gen_dirs_book[i];
+            if (strncmp(d, base, blen) != 0 || d[blen] != '/')
+                continue;
+            if (strchr(d + blen + 1, '/') != NULL)
+                continue;                       // a grandchild, not a child
+            if (seen++ == want) {
+                child = (enum aokfs_node_kind) (AOKFS_GEN_BOOKDIR_BASE + i);
+                goto emit;
+            }
+        }
+        for (size_t i = 0; i < AOKFS_GEN_FILE_COUNT_book; i++) {
+            const char *f = aokfs_gen_files_book[i].path;
+            if (strncmp(f, base, blen) != 0 || f[blen] != '/')
+                continue;
+            if (strchr(f + blen + 1, '/') != NULL)
+                continue;
+            if (seen++ == want) {
+                child = (enum aokfs_node_kind) (AOKFS_GEN_BOOK_BASE + i);
+                goto emit;
+            }
+        }
+        return 0;
+    }
+
+    if (aokfs_node_is_gen_libsdir(node)) {
+        const char *base = aokfs_node_path(node);
+        size_t blen = strlen(base);
+        size_t want = (size_t) fd->offset++;
+        size_t seen = 0;
+        for (size_t i = 0; i < AOKFS_GEN_DIR_COUNT_libs; i++) {
+            const char *d = aokfs_gen_dirs_libs[i];
+            if (strncmp(d, base, blen) != 0 || d[blen] != '/')
+                continue;
+            if (strchr(d + blen + 1, '/') != NULL)
+                continue;                       // a grandchild, not a child
+            if (seen++ == want) {
+                child = (enum aokfs_node_kind) (AOKFS_GEN_LIBSDIR_BASE + i);
+                goto emit;
+            }
+        }
+        for (size_t i = 0; i < AOKFS_GEN_FILE_COUNT_libs; i++) {
+            const char *f = aokfs_gen_files_libs[i].path;
+            if (strncmp(f, base, blen) != 0 || f[blen] != '/')
+                continue;
+            if (strchr(f + blen + 1, '/') != NULL)
+                continue;
+            if (seen++ == want) {
+                child = (enum aokfs_node_kind) (AOKFS_GEN_LIBS_BASE + i);
+                goto emit;
+            }
+        }
+        return 0;
+    }
+
     switch (node) {
         case aokfs_root:
             switch (fd->offset++) {
@@ -844,16 +1124,35 @@ static int aokfs_readdir(struct fd *fd, struct dir_entry *entry) {
             }
             break;
         case aokfs_native_dir: {
+            // The registry, then `libs` last -- so that adding a native
+            // program does not renumber an offset a reader is part way
+            // through.
             size_t i = (size_t) fd->offset++;
-            if (i >= native_program_count())
-                return 0;
-            child = (enum aokfs_node_kind) (AOKFS_NATIVE_BASE + i);
-            break;
+            if (i < native_program_count()) {
+                child = (enum aokfs_node_kind) (AOKFS_NATIVE_BASE + i);
+                break;
+            }
+            if (i == native_program_count() && AOKFS_GEN_DIR_COUNT_libs > 0) {
+                enum aokfs_node_kind libs;
+                if (!aokfs_lookup_node("/native/libs", &libs))
+                    return 0;
+                child = libs;
+                break;
+            }
+            return 0;
         }
         case aokfs_fixes_dir:
             switch (fd->offset++) {
                 case 0: child = aokfs_fixes_devuan_dir; break;
                 case 1: child = aokfs_fixes_debian_link; break;
+                case 2: child = aokfs_fixes_arch_dir; break;
+                default: return 0;
+            }
+            break;
+        case aokfs_fixes_arch_dir:
+            switch (fd->offset++) {
+                case 0: child = aokfs_fixes_arch_readme; break;
+                case 1: child = aokfs_fixes_arch_script; break;
                 default: return 0;
             }
             break;
@@ -931,13 +1230,22 @@ static int aokfs_readdir(struct fd *fd, struct dir_entry *entry) {
             break;
         }
         case aokfs_docs_dir: {
-            // Flat: no subdirectories under /docs, so this is just the
-            // generated-table scan, no prefix-skipping ktop-style logic.
+            // The doc files themselves, which are flat, and then `book` --
+            // the one subdirectory, whose node comes from the book table's own
+            // derived-directory list rather than from an enum constant.
             size_t want = (size_t) fd->offset++;
-            if (want >= AOKFS_GEN_FILE_COUNT_docs)
-                return 0;
-            child = (enum aokfs_node_kind) (AOKFS_GEN_DOCS_BASE + want);
-            break;
+            if (want < AOKFS_GEN_FILE_COUNT_docs) {
+                child = (enum aokfs_node_kind) (AOKFS_GEN_DOCS_BASE + want);
+                break;
+            }
+            if (want == AOKFS_GEN_FILE_COUNT_docs && AOKFS_GEN_DIR_COUNT_book > 0) {
+                enum aokfs_node_kind book;
+                if (!aokfs_lookup_node("/docs/book", &book))
+                    return 0;
+                child = book;
+                break;
+            }
+            return 0;
         }
         case aokfs_tests_dir:
         case aokfs_tests_x86_dir:
@@ -988,6 +1296,7 @@ static int aokfs_readdir(struct fd *fd, struct dir_entry *entry) {
             return _ENOTDIR;
     }
 
+emit:
     entry->inode = aokfs_node_inode(child);
     entry->type = dir_entry_type_for_mode(aokfs_node_mode(child));
     strncpy(entry->name, aokfs_node_basename(child), sizeof(entry->name) - 1);

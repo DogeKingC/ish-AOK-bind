@@ -6,6 +6,8 @@
 #include <errno.h>
 #include "fs/poll.h"
 #include "kernel/calls.h"
+#include "kernel/futex.h"
+#include <stdio.h>
 #include "kernel/signal.h"
 #include "kernel/time.h"
 #include "kernel/task.h"
@@ -337,8 +339,25 @@ static bool wake_waiting_task(struct task *task) {
     bool *waiting_interrupt_flag = task->waiting_interrupt_flag;
     bool interrupted_wait = waiting_interrupt_flag != NULL ||
         (waiting_cond != NULL && waiting_lock != NULL);
-    if (waiting_interrupt_flag != NULL)
+    if (waiting_interrupt_flag != NULL) {
+        // Counts the bug in docs/TODO.md's pread_stack_thread_race entry
+        // directly, instead of waiting for its ~1% fatal outcome: a stale
+        // pointer here means this store lands in a frame that has already
+        // returned, and one of those eventually lands on libpthread's live
+        // cleanup record. With the wait_for fix in place this is never hit;
+        // with ISH_WAITFLAG_LEAK=1 it fires constantly. It only counts -- the
+        // store still happens, so the A/B's two arms differ in exactly one
+        // thing.
+        if (!futex_wait_flag_is_live(waiting_interrupt_flag)) {
+            static _Atomic long stale;
+            long n = atomic_fetch_add_explicit(&stale, 1, memory_order_relaxed);
+            if (n < 3 || (n % 500) == 0)
+                fprintf(stderr, "URGENT: wake_waiting_task storing through a STALE "
+                        "waiting_interrupt_flag=%p (occurrence %ld)\n",
+                        (void *) waiting_interrupt_flag, n + 1);
+        }
         __atomic_store_n(waiting_interrupt_flag, true, __ATOMIC_RELEASE);
+    }
     if (waiting_cond != NULL && waiting_lock != NULL) {
         bool have_wait_lock = false;
         bool acquired_wait_lock = false;
@@ -472,8 +491,15 @@ int signal_action(struct sighand *sighand, int sig) {
     switch (sig) {
         // Linux defaults SIGURG to ignore; it arrives with out-of-band TCP
         // data, so defaulting it to kill terminates innocent network users.
+        // Linux's default-ignore set is exactly SIGCHLD, SIGCONT, SIGURG and
+        // SIGWINCH. SIGURG is here for the reason below; SIGIO is NOT --
+        // Linux terminates on it, and treating it as ignored meant a process
+        // that had asked for async I/O notification and then failed to handle
+        // it kept running as if nothing had happened, where every Linux would
+        // have killed it. Nothing in this kernel raises SIGIO on its own; it
+        // only arrives when the guest set it up with F_SETOWN/FASYNC.
         case SIGCONT_: case SIGCHLD_: case SIGURG_:
-        case SIGIO_: case SIGWINCH_:
+        case SIGWINCH_:
             return SIGNAL_IGNORE;
 
         case SIGSTOP_: case SIGTSTP_: case SIGTTIN_: case SIGTTOU_:
@@ -619,9 +645,27 @@ static bool signal_wake_task(struct task *task, struct sighand *sighand, int sig
 static void signal_note_interrupted(struct task *task, struct sighand *sighand, int sig, bool interrupted_wait) {
     if (!interrupted_wait)
         return;
-    bool restart = signal_action(sighand, sig) == SIGNAL_CALL_HANDLER &&
-        !!(sighand->action[sig].flags & SA_RESTART_);
+    // A job-control stop is not an interruption. Linux parks the task inside
+    // the wait and resumes it on SIGCONT, so the syscall never returns EINTR
+    // to the guest -- and because no handler runs, that holds even for the
+    // interfaces SA_RESTART cannot rescue (poll, select, epoll_wait). Only a
+    // handler actually running can turn a wait into a guest-visible EINTR.
+    //
+    // sighand->action is not the truth for a signal the native shim is holding
+    // a handler for -- what sits there is the SIG_DFL placeholder
+    // nlibc_set_disposition left behind, so a native program's own SIGTSTP
+    // handler would read as SIGNAL_STOP here and park a poll() that Linux
+    // interrupts. For those the shim's recorded flags are the answer, and a
+    // handler is always what runs, so `stops` is false by construction.
+    bool held = sigset_has(__atomic_load_n(&task->native_held, __ATOMIC_ACQUIRE), sig);
+    int action = held ? SIGNAL_CALL_HANDLER : signal_action(sighand, sig);
+    bool stops = action == SIGNAL_STOP;
+    bool restart = held
+        ? sigset_has(__atomic_load_n(&task->native_restart, __ATOMIC_ACQUIRE), sig)
+        : (stops || (action == SIGNAL_CALL_HANDLER &&
+            !!(sighand->action[sig].flags & SA_RESTART_)));
     __atomic_store_n(&task->restart_interrupted_syscall, restart, __ATOMIC_RELEASE);
+    __atomic_store_n(&task->restart_interrupted_syscall_nohand, stops, __ATOMIC_RELEASE);
     __atomic_store_n(&task->wait_interrupted, true, __ATOMIC_RELEASE);
 }
 
@@ -1055,24 +1099,58 @@ int siginfo_to_user(struct task *task, guest_addr_t user_addr, const struct sigi
     return 0;
 }
 
+// siginfo is a UNION: only the arm matching the signal's layout holds anything
+// real, and reading the others back out hands the caller whatever bytes that
+// arm happened to store. Every member was copied for every signal, so a
+// sigqueue'd SIGUSR1 arrived with ssi_status, ssi_addr and ssi_tid carrying
+// pieces of its own sigval, and ssi_fd was the constant -1 -- a value Linux
+// only ever produces for a real SIGPOLL fd, and never a negative one.
+//
+// Linux's signalfd_copyinfo switches on siginfo_layout(sig, si_code) and
+// leaves everything else at the memset zero. Same here.
 static void signalfd_info_from_siginfo(struct signalfd_siginfo_ *out, struct siginfo_ *info) {
     memset(out, 0, sizeof(*out));
     out->signo = info->sig;
     out->sig_errno = info->sig_errno;
     out->code = info->code;
-    out->pid = info->code == SI_QUEUE_ ? info->rt.pid : info->kill.pid;
-    out->uid = info->code == SI_QUEUE_ ? info->rt.uid : info->kill.uid;
-    out->status = info->child.status;
-    out->sig_int = info->code == SI_QUEUE_ ? info->rt.value.sv_int : info->timer.value.sv_int;
-    out->sig_ptr = info->code == SI_QUEUE_ ? info->rt.value.sv_ptr : info->timer.value.sv_ptr;
-    out->utime = info->child.utime;
-    out->stime = info->child.stime;
-    out->addr = info->fault.addr;
-    out->overrun = info->timer.overrun;
-    out->tid = info->timer.timer;
-    out->fd = -1;
-    out->syscall = info->sigsys.syscall;
-    out->call_addr = info->sigsys.addr;
+
+    // A negative code below SI_TKILL_ is one of the kernel's own queued
+    // sources (SI_ASYNCIO, SI_MESGQ, ...); Linux gives them the same RT layout
+    // as SI_QUEUE.
+    bool rt_layout = info->code == SI_QUEUE_ || info->code <= SI_TKILL_;
+
+    if (info->code == SI_TIMER_) {
+        out->tid = info->timer.timer;
+        out->overrun = info->timer.overrun;
+        out->sig_int = info->timer.value.sv_int;
+        out->sig_ptr = info->timer.value.sv_ptr;
+    } else if (info->sig == SIGCHLD_ && info->code > 0) {
+        out->pid = info->child.pid;
+        out->uid = info->child.uid;
+        out->status = info->child.status;
+        out->utime = info->child.utime;
+        out->stime = info->child.stime;
+    } else if (info->sig == SIGSYS_ && info->code > 0) {
+        out->call_addr = info->sigsys.addr;
+        out->syscall = info->sigsys.syscall;
+    } else if (info->code > 0 &&
+               (info->sig == SIGILL_ || info->sig == SIGFPE_ ||
+                info->sig == SIGSEGV_ || info->sig == SIGBUS_ ||
+                info->sig == SIGTRAP_)) {
+        // A fault code (SEGV_MAPERR and friends) is the only thing that makes
+        // ssi_addr meaningful; a SIGSEGV someone merely kill()ed you with has
+        // no address.
+        out->addr = info->fault.addr;
+    } else if (rt_layout) {
+        out->pid = info->rt.pid;
+        out->uid = info->rt.uid;
+        out->sig_int = info->rt.value.sv_int;
+        out->sig_ptr = info->rt.value.sv_ptr;
+    } else {
+        // SI_USER, SI_KERNEL and the rest: sender identity only.
+        out->pid = info->kill.pid;
+        out->uid = info->kill.uid;
+    }
 }
 
 static struct fdtable *signalfd_task_files_retain(struct task *task) {
@@ -1134,30 +1212,36 @@ static void signalfd_wakeup_task(struct task *task, int sig) {
     fdtable_release(files);
 }
 
+// Is anything this signalfd watches already queued? Both queues: a
+// process-directed signal (e.g. SIGCHLD via send_signal_to_group) lives in the
+// shared one, not this thread's own, and a signalfd on any sibling thread must
+// still see it. Caller must NOT hold sighand->lock.
+static bool signalfd_has_pending(sigset_t_ mask) {
+    bool found = false;
+    struct sigqueue *sigqueue;
+    lock(&current->sighand->lock, 0);
+    list_for_each_entry(&current->queue, sigqueue, queue) {
+        if (sigset_has(mask, sigqueue->info.sig)) {
+            found = true;
+            goto out;
+        }
+    }
+    list_for_each_entry(&current->sighand->queue, sigqueue, queue) {
+        if (sigset_has(mask, sigqueue->info.sig)) {
+            found = true;
+            goto out;
+        }
+    }
+out:
+    unlock(&current->sighand->lock);
+    return found;
+}
+
 static int signalfd_poll(struct fd *fd) {
     struct signalfd_state *state = fd->data;
     if (state == NULL)
         return POLL_ERR;
-
-    lock(&current->sighand->lock, 0);
-    struct sigqueue *sigqueue;
-    list_for_each_entry(&current->queue, sigqueue, queue) {
-        if (sigset_has(state->mask, sigqueue->info.sig)) {
-            unlock(&current->sighand->lock);
-            return POLL_READ;
-        }
-    }
-    // A process-directed signal (e.g. SIGCHLD delivered via
-    // send_signal_to_group) lives in the shared queue, not this thread's own
-    // -- a signalfd on any sibling thread must still see it.
-    list_for_each_entry(&current->sighand->queue, sigqueue, queue) {
-        if (sigset_has(state->mask, sigqueue->info.sig)) {
-            unlock(&current->sighand->lock);
-            return POLL_READ;
-        }
-    }
-    unlock(&current->sighand->lock);
-    return 0;
+    return signalfd_has_pending(state->mask) ? POLL_READ : 0;
 }
 
 static ssize_t signalfd_read(struct fd *fd, void *buf, size_t bufsize) {
@@ -1188,8 +1272,19 @@ static ssize_t signalfd_read(struct fd *fd, void *buf, size_t bufsize) {
         }
         int err = wait_for(&fd->cond, &fd->lock, NULL);
         if (err != 0) {
-            unlock(&fd->lock);
-            return err;
+            // A signal this fd watches is BLOCKED in the caller -- that is what
+            // makes signalfd work at all -- so its arrival is the event being
+            // waited for, not an interruption. wait_for reports ANY pending
+            // signal as _EINTR without asking which, so a read that was
+            // already blocking when the signal landed came back EINTR and the
+            // record stayed queued: the ordinary signal-driven event loop
+            // (block, signalfd, read) failed exactly when it was doing its job,
+            // and only a read issued after the signal had already arrived
+            // worked. Re-check before believing the interruption.
+            if (!signalfd_has_pending(state->mask)) {
+                unlock(&fd->lock);
+                return err;
+            }
         }
     }
     unlock(&fd->lock);
@@ -1253,6 +1348,48 @@ int_t sys_signalfd_guest(int_t fd, guest_addr_t mask_addr, dword_t sigsetsize) {
     return sys_signalfd4_guest(fd, mask_addr, sigsetsize, 0);
 }
 
+// A POSIX timer never has more than one signal outstanding. When it expires
+// again while its last signal is still queued, Linux does not queue a second
+// one -- it counts the missed expiration on the queued siginfo's si_overrun,
+// which is the whole reason that field exists: a periodic timer whose signal
+// is blocked, or whose handler is slow, tells the program how many periods it
+// missed rather than burying it in a signal storm.
+//
+// AOK queued one signal per expiration. A 5ms timer left blocked for a second
+// queued two hundred, and si_overrun was hardcoded 0, so a program could
+// neither find out how far behind it was nor survive catching up.
+//
+// Returns the new overrun count if an entry for this timer was found and
+// counted, or -1 if there was none and the caller should queue a signal.
+int signal_timer_count_overrun(struct task *task, int sig, int timer_id) {
+    struct sighand *sighand = task->sighand;
+    if (sighand == NULL)
+        return -1;
+    int overrun = -1;
+    lock(&sighand->lock, 0);
+    struct sigqueue *sigqueue;
+    // Thread-directed (send_signal) first, then the shared process queue:
+    // a timer's signal goes to one or the other depending on how it was set
+    // up, and either way there is at most one.
+    list_for_each_entry(&task->queue, sigqueue, queue) {
+        if (sigqueue->info.sig == sig && sigqueue->info.code == SI_TIMER_ &&
+                sigqueue->info.timer.timer == timer_id) {
+            overrun = ++sigqueue->info.timer.overrun;
+            goto out;
+        }
+    }
+    list_for_each_entry(&sighand->queue, sigqueue, queue) {
+        if (sigqueue->info.sig == sig && sigqueue->info.code == SI_TIMER_ &&
+                sigqueue->info.timer.timer == timer_id) {
+            overrun = ++sigqueue->info.timer.overrun;
+            goto out;
+        }
+    }
+out:
+    unlock(&sighand->lock);
+    return overrun;
+}
+
 void send_signal(struct task *task, int sig, struct siginfo_ info) {
     struct sighand *sighand = task->sighand;
     if (sighand == NULL)
@@ -1300,11 +1437,90 @@ static void send_signal_with_sighand(struct task *task, struct sighand *sighand,
     }
 }
 
+// Both predicates consume both flags: a syscall asks exactly one of them, and
+// leaving the other set would leak this interruption's answer into the next
+// syscall's decision.
+static bool restart_flags_take(bool nohand_only) {
+    bool restart = __atomic_exchange_n(&current->restart_interrupted_syscall, false, __ATOMIC_ACQ_REL);
+    bool nohand = __atomic_exchange_n(&current->restart_interrupted_syscall_nohand, false, __ATOMIC_ACQ_REL);
+    return nohand_only ? nohand : restart;
+}
+
+// The signal that is about to be delivered, or NULL. Selection mirrors
+// signal_take_next_locked: both queues, lowest number wins, the thread's own
+// queue first on a tie. Call with sighand->lock held.
+//
+// "Deliverable" is task_wake_blocked() rather than plain ->blocked, which is
+// the same question every other pending-signal predicate in the kernel asks
+// (fs/real.c, fs/poll.c, fs/sock.c, kernel/futex.c). Using the raw blocked set
+// here made the two halves disagree for a native program: the shim blocks
+// every signal it has a handler for and runs the handler at a checkpoint
+// instead, so the wait side counted it as pending and cut the syscall short
+// while this side counted it as blocked, found nothing, and refused to
+// restart. Native SA_RESTART was dead on arrival, and the interruption
+// surfaced as a guest-visible EINTR -- "echo: write error: Interrupted system
+// call" out of a native bash. For a translated guest native_held is 0 and this
+// is the blocked set exactly as before.
+static struct sigqueue *signal_next_deliverable_locked(struct sighand *sighand) {
+    sigset_t_ blocked = task_wake_blocked(current);
+    struct sigqueue *sigqueue;
+    struct sigqueue *best = NULL;
+    list_for_each_entry(&current->queue, sigqueue, queue) {
+        if (sigset_has(blocked, sigqueue->info.sig))
+            continue;
+        if (best == NULL || sigqueue->info.sig < best->info.sig)
+            best = sigqueue;
+    }
+    list_for_each_entry(&sighand->queue, sigqueue, queue) {
+        if (sigset_has(blocked, sigqueue->info.sig))
+            continue;
+        if (best == NULL || sigqueue->info.sig < best->info.sig)
+            best = sigqueue;
+    }
+    return best;
+}
+
+// Is SIG one the shim is holding a native handler for? Its entry in
+// sighand->action is then the SIG_DFL placeholder nlibc_set_disposition left,
+// so nothing about the program's real disposition can be read from there --
+// ask struct task's native_restart instead.
+static bool signal_native_held(int sig) {
+    return sigset_has(__atomic_load_n(&current->native_held, __ATOMIC_ACQUIRE), sig);
+}
+
+static bool signal_native_restarts(int sig) {
+    return sigset_has(__atomic_load_n(&current->native_restart, __ATOMIC_ACQUIRE), sig);
+}
+
+// ERESTARTNOHAND: restart only if the interrupting signal ran no handler. This
+// is what poll/select/epoll_wait get -- SA_RESTART never rescues them, but a
+// job-control stop still must not surface as EINTR.
+bool signal_should_restart_syscall_nohand(void) {
+    if (current == NULL)
+        return false;
+
+    if (restart_flags_take(true))
+        return true;
+
+    struct sighand *sighand = current->sighand;
+    lock(&sighand->lock, 0);
+    struct sigqueue *best = signal_next_deliverable_locked(sighand);
+    // A shim-held signal always runs a handler, whatever the kernel's
+    // placeholder disposition claims -- and ERESTARTNOHAND is cancelled by a
+    // handler running. Without this the placeholder for, say, a native
+    // program's own SIGTSTP handler would read as SIGNAL_STOP and restart a
+    // poll() that Linux would have interrupted.
+    bool stops = best != NULL && !signal_native_held(best->info.sig) &&
+        signal_action(sighand, best->info.sig) == SIGNAL_STOP;
+    unlock(&sighand->lock);
+    return stops;
+}
+
 bool signal_should_restart_syscall(void) {
     if (current == NULL)
         return false;
 
-    if (__atomic_exchange_n(&current->restart_interrupted_syscall, false, __ATOMIC_ACQ_REL))
+    if (restart_flags_take(false))
         return true;
 
     struct sighand *sighand = current->sighand;
@@ -1318,48 +1534,47 @@ bool signal_should_restart_syscall(void) {
     // fell through to the "no restart" default even when its handler had
     // SA_RESTART_ set -- turning what should be a transparent kernel-level
     // restart into a real EINTR surfacing all the way into the guest.
-    // Mirrors signal_take_next_locked's selection (both queues, lowest
-    // signal number wins, ties favor the thread's own queue since it's
-    // scanned first).
-    struct sigqueue *sigqueue;
-    struct sigqueue *best = NULL;
-    list_for_each_entry(&current->queue, sigqueue, queue) {
-        if (sigset_has(current->blocked, sigqueue->info.sig))
-            continue;
-        if (best == NULL || sigqueue->info.sig < best->info.sig)
-            best = sigqueue;
-    }
-    list_for_each_entry(&sighand->queue, sigqueue, queue) {
-        if (sigset_has(current->blocked, sigqueue->info.sig))
-            continue;
-        if (best == NULL || sigqueue->info.sig < best->info.sig)
-            best = sigqueue;
-    }
+    struct sigqueue *best = signal_next_deliverable_locked(sighand);
     if (best == NULL) {
         unlock(&sighand->lock);
         return false;
     }
     int sig = best->info.sig;
-    if (signal_action(sighand, sig) != SIGNAL_CALL_HANDLER) {
+    // A native program's handler, which the kernel is only holding a
+    // placeholder for. The shim recorded the real sa_flags.
+    if (signal_native_held(sig)) {
         unlock(&sighand->lock);
-        return false;
+        return signal_native_restarts(sig);
+    }
+    int action = signal_action(sighand, sig);
+    if (action != SIGNAL_CALL_HANDLER) {
+        // A stop resumes the syscall transparently; anything else with no
+        // handler either kills the task or should not have woken it.
+        bool stops = action == SIGNAL_STOP;
+        unlock(&sighand->lock);
+        return stops;
     }
     bool restart = !!(sighand->action[sig].flags & SA_RESTART_);
     unlock(&sighand->lock);
     return restart;
 }
 
-bool try_self_signal(int sig) {
-    assert(sig == SIGTTIN_ || sig == SIGTTOU_);
-
+// Whether a signal would go nowhere if sent to us right now. The terminal
+// job-control checks need to know this WITHOUT sending anything: Linux treats
+// an ignored or blocked SIGTTOU as permission to proceed, and only turns an
+// ignored SIGTTIN into EIO.
+//
+// This replaced a try_self_signal() that decided and delivered in one step,
+// and delivered only to the calling task. Linux signals the whole process
+// group (kill_pgrp), so a background job stops entirely rather than losing one
+// thread -- the caller now does that, once it is holding no locks.
+bool signal_is_ignored_or_blocked(int sig) {
     struct sighand *sighand = current->sighand;
     lock(&sighand->lock, 0);
-    bool can_send = signal_action(sighand, sig) != SIGNAL_IGNORE &&
-        !sigset_has(current->blocked, sig);
-    if (can_send)
-        deliver_signal_unlocked_locked(current, current->sighand, sig, SIGINFO_NIL);
+    bool ignored = signal_action(sighand, sig) == SIGNAL_IGNORE ||
+        sigset_has(current->blocked, sig);
     unlock(&sighand->lock);
-    return can_send;
+    return ignored;
 }
 
 int send_group_signal(dword_t pgid, int sig, struct siginfo_ info) {
@@ -1760,7 +1975,24 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
 
         case SIGNAL_KILL:
             unlock(&sighand->lock); // do_exit must be called without this lock
+            // execve asked for THIS thread to go, not the whole group -- see
+            // exit_requested in kernel/task.h. do_exit takes a non-leader
+            // thread off the group list and destroys it without touching the
+            // other threads or notifying the parent.
+            if (__atomic_load_n(&current->exit_requested, __ATOMIC_ACQUIRE))
+                do_exit(current, sig);
             do_exit_group(sig);
+    }
+
+    // A handler is about to run. If the syscall it interrupted asked for an
+    // ERESTARTNOHAND restart -- poll/select/epoll_wait, which resume across a
+    // job-control stop but not across a handler -- the restart is cancelled
+    // here and the guest gets EINTR, exactly as Linux's handle_signal does.
+    if (current->restart_nohand_pending) {
+        current->restart_nohand_pending = false;
+        current->poll_restart_valid = false;
+        current->sleep_restart_valid = false;
+        cancel_syscall_restart();
     }
 
     struct sigaction_ *action = &sighand->action[info->sig];
@@ -1973,6 +2205,103 @@ void signal_delivery_stop(int sig, struct siginfo_ *info) {
     lock(&current->sighand->lock, 0);
 }
 
+// Park here for the duration of a job-control group-stop (^Z, SIGSTOP,
+// SIGTTIN, SIGTTOU), and report it to a tracer if there is one.
+//
+// Both execution models need this and they used to have separate copies:
+// handle_interrupt (kernel/calls.c) for translated guest code, and
+// native_checkpoint (kernel/native.c) for a native program, which runs as host
+// code on the guest task's thread and so is never dispatched an instruction at
+// all. The copies drifted -- the native one had no ptrace handling whatsoever,
+// so `strace` on a native program that got ^Z'd hung the tracer's wait4
+// forever. One function, called from both, is what stops that recurring.
+//
+// Call it with no lock held, from the task's OWN context.
+//
+// `traced` is re-checked on every pass, not just on entry, and that is
+// load-bearing in BOTH directions: the tracer may detach us while we are
+// stopped, and it may also ATTACH to us while we are stopped. PTRACE_SEIZE of
+// an already-group-stopped tracee sets `traced` from the tracer's own thread
+// and notifies stopped_cond to bring us back around here (kernel/ptrace.c).
+// Testing it once, outside the wait, is what a tracee that raise(SIGSTOP)'d
+// before its tracer seized it used to do: it parked in the plain job-control
+// wait below, never noticed it had become traced, never reported the stop, and
+// the tracer's wait4 hung forever. Linux handles the same race from the other
+// side -- ptrace_attach() wakes a __TASK_STOPPED tracee so it can re-enter the
+// trap and report.
+//
+// ptrace_group_stop() takes group->lock itself, so it must NOT be called with
+// that lock held -- hence the branch above the lock rather than inside it.
+void group_stop_wait(void) {
+    struct tgroup *group = current->group;
+    // Fast path: group->stopped is almost always false. Read it locklessly
+    // (it is _Atomic) and only take group->lock to actually wait when stopped.
+    // Missing a just-set transition here is harmless: a SIGSTOP'd thread is
+    // poked and comes back through its caller, catching the stop on the next
+    // pass.
+    if (!group->stopped)
+        return;
+
+    while (group->stopped) {
+        if (current->ptrace.traced) {
+            ptrace_group_stop();
+            continue;
+        }
+        lock(&group->lock, 0);
+        if (group->stopped && !current->ptrace.traced)
+            wait_for_ignore_signals(&group->stopped_cond, &group->lock, NULL);
+        unlock(&group->lock);
+    }
+
+    // We were stopped and have just been resumed. If SIGCONT flagged a
+    // reportable continue, wake a parent blocked in wait4/waitid(WCONTINUED)
+    // (the flag itself is consumed by the parent's notify_if_continued).
+    // Done from our own context -- never the signal sender's -- so taking
+    // pids_lock here respects the pids_lock -> group->lock ordering.
+    if (group->continued) {
+        struct task *parent = NULL;
+        int signal_no = 0;
+        complex_lockt(&pids_lock, 0);
+        parent = current->group->leader->parent;
+        if (parent != NULL) {
+            task_ref_cnt_mod(parent, 1);
+            signal_no = current->group->leader->exit_signal;
+            notify(&parent->group->child_exit);
+        }
+        unlock(&pids_lock);
+        // A resume is a reportable event in its own right, and the SIGCHLD
+        // that carries it is how a shell learns a job it backgrounded is
+        // running again -- without it the parent's handler never fires and
+        // only a WCONTINUED wait ever notices. The stop side of this already
+        // existed (see receive_signals); the continue side did not, so
+        // si_code was never CLD_CONTINUED.
+        //
+        // SA_NOCLDSTOP suppresses it, exactly as it does the stop: the flag
+        // is about stop AND continue notifications, not stops alone.
+        if (parent != NULL) {
+            if (signal_no == SIGCHLD_) {
+                struct sighand *psighand = parent->sighand;
+                if (psighand != NULL) {
+                    lock(&psighand->lock, 0);
+                    if (psighand->action[SIGCHLD_].flags & SA_NOCLDSTOP_)
+                        signal_no = 0;
+                    unlock(&psighand->lock);
+                }
+            }
+            if (signal_no != 0) {
+                struct siginfo_ info = {
+                    .code = CLD_CONTINUED_,
+                    .child.pid = current->group->leader->pid,
+                    .child.uid = current->uid,
+                    .child.status = SIGCONT_,
+                };
+                send_signal(parent, signal_no, info);
+            }
+            task_ref_cnt_mod(parent, -1);
+        }
+    }
+}
+
 void receive_signals(void) {  
     lock(&current->group->lock, 0);
     bool was_stopped = current->group->stopped;
@@ -2073,6 +2402,20 @@ void receive_signals(void) {
                 notify(&parent->group->child_exit);
             }
             unlock(&pids_lock);
+            // SA_NOCLDSTOP: the parent asked NOT to be told when a child
+            // merely stops or continues. Only the stop notification is
+            // suppressed -- the child's eventual exit still raises SIGCHLD --
+            // and wait(WUNTRACED) still reports the stop, because the flag is
+            // about the signal, not about waitability.
+            if (parent != NULL && signal_no == SIGCHLD_) {
+                struct sighand *psighand = parent->sighand;
+                if (psighand != NULL) {
+                    lock(&psighand->lock, 0);
+                    if (psighand->action[SIGCHLD_].flags & SA_NOCLDSTOP_)
+                        signal_no = 0;
+                    unlock(&psighand->lock);
+                }
+            }
             if (parent != NULL) {
                 // The stop SIGCHLD must carry CLD_STOPPED + the stop signal and
                 // the child's pid/uid, not SIGINFO_NIL (which a SA_SIGINFO
@@ -2286,6 +2629,12 @@ dword_t sys_rt_sigaction(dword_t signum, addr_t action_addr, addr_t oldaction_ad
 
 dword_t sys_rt_sigaction_guest(dword_t signum, guest_addr_t action_addr, guest_addr_t oldaction_addr, dword_t sigset_size) {
     if (sigset_size != sizeof(sigset_t_))
+        return _EINVAL;
+    // Signal 0 is the "does this process exist" probe for kill(2); it has no
+    // disposition to set or read. Accepting it here reported success for a
+    // call that did nothing, so a caller checking whether a signal number is
+    // usable by round-tripping it through sigaction was told 0 was.
+    if (signum == 0)
         return _EINVAL;
     struct sigaction_ action = {};
     struct sigaction_ oldaction = {};
@@ -2539,6 +2888,13 @@ dword_t sys_sigaltstack(guest_addr_t ss_addr, guest_addr_t old_ss_addr) {
             unlock(&sighand->lock);
             return err;
         }
+        // Only SS_DISABLE and SS_ONSTACK are defined; anything else is a
+        // caller that got the struct wrong, and Linux says so rather than
+        // installing a stack from a request it did not understand.
+        if (flags & ~(dword_t) (SS_DISABLE_ | SS_ONSTACK_)) {
+            unlock(&sighand->lock);
+            return _EINVAL;
+        }
         if (flags & SS_DISABLE_) {
             current->altstack = 0;
             current->altstack_size = 0;
@@ -2676,15 +3032,39 @@ int_t sys_rt_sigtimedwait_time64_guest(guest_addr_t set_addr, guest_addr_t info_
     return sys_rt_sigtimedwait_common(set_addr, info_addr, timeout_addr, set_size, true);
 }
 
+// Linux's check_kill_permission. The credential rule is the obvious part; the
+// exception is not, and it was missing entirely: SIGCONT may be sent to ANY
+// process in the same SESSION whatever its credentials.
+//
+// That exception is what job control is built on. A shell that started a
+// privileged job -- `sudo something`, or any setuid program -- keeps the
+// stopped process in its own session but not under its own uid, so without it
+// `fg` could not resume anything privileged, and kill_group inherited the same
+// refusal for the whole process group.
+static bool may_signal_task(struct task *task, dword_t sig) {
+    if (superuser())
+        return true;
+    // A thread signalling its own process never needs a credential check.
+    if (task->tgid == current->tgid)
+        return true;
+    if (current->uid == task->uid || current->uid == task->suid ||
+            current->euid == task->uid || current->euid == task->suid)
+        return true;
+    if (sig == SIGCONT_) {
+        lock(&task->group->lock, 0);
+        pid_t_ target_sid = task->group->sid;
+        unlock(&task->group->lock);
+        // A target with no session is reachable too, as in Linux.
+        if (target_sid == 0 || target_sid == current->group->sid)
+            return true;
+    }
+    return false;
+}
+
 int signal_kill_task(struct task *task, dword_t sig, int si_code) {
     // FIXME: Need to check references to kernel here to be sure they are zero
-    if (!superuser() &&
-            current->uid != task->uid &&
-            current->uid != task->suid &&
-            current->euid != task->uid &&
-            current->euid != task->suid) {
+    if (!may_signal_task(task, sig))
         return _EPERM;
-    }
     // kill(2) reports SI_USER; tkill/tgkill(2) report SI_TKILL. A handler that
     // inspects si_code (or si_pid, which is meaningless for SI_TKILL) must see
     // the right one — glibc raise() routes through tgkill, so this is common.
@@ -2699,13 +3079,8 @@ int signal_kill_task(struct task *task, dword_t sig, int si_code) {
 }
 
 static int queue_signal_task(struct task *task, dword_t sig, struct siginfo_ info) {
-    if (!superuser() &&
-            current->uid != task->uid &&
-            current->uid != task->suid &&
-            current->euid != task->uid &&
-            current->euid != task->suid) {
+    if (!may_signal_task(task, sig))
         return _EPERM;
-    }
 
     send_signal(task, sig, info);
     return 0;
@@ -2759,7 +3134,21 @@ retry:
     size_t skipped = 0;
     list_for_each_entry(&pid->pgroup, tgroup, pgroup) {
         struct task *task = tgroup->leader;
-        if (task == NULL || task->zombie || task->exiting) {
+        if (task != NULL && (task->zombie || task->exiting || task->sighand == NULL)) {
+            // The leader is a corpse but the process may well still be alive:
+            // its other threads keep running, and the leader stays registered
+            // until the last of them exits. Signalling the group must reach
+            // those threads rather than counting the whole process as gone.
+            struct task *live = NULL, *thread;
+            list_for_each_entry(&tgroup->threads, thread, group_links) {
+                if (!thread->exiting && !thread->zombie && thread->sighand != NULL) {
+                    live = thread;
+                    break;
+                }
+            }
+            task = live;
+        }
+        if (task == NULL) {
             skipped++;
             continue;
         }
@@ -2825,33 +3214,115 @@ retry:
     }
     unlock(&pids_lock);
 
-    int err = _EPERM;
+    // Linux never reports EPERM for the broadcast form: kill(-1) returns 0
+    // whenever at least one process was CONSIDERED -- even if every send was
+    // denied -- and ESRCH only when nothing matched at all. Starting from
+    // EPERM meant a caller with nothing to signal was told it lacked
+    // permission, and one that legitimately could not signal a privileged
+    // process was told the same thing about a broadcast that had worked.
     for (size_t i = 0; i < target_count; i++) {
-        int kill_err = signal_kill_task(targets[i].task, sig, si_code);
+        (void) signal_kill_task(targets[i].task, sig, si_code);
         task_ref_cnt_mod(targets[i].task, -1);
-        if (err == _EPERM)
-            err = kill_err;
     }
     if (targets != stack_targets)
         free(targets);
-    return err;
+    return target_count > 0 ? 0 : _ESRCH;
 }
 
 // si_code distinguishes the sender: SI_USER for kill(2), SI_TKILL for
 // tkill/tgkill(2). Linux forces this on the receiving side, so we thread it
 // down from the syscall entry point rather than letting kill_task assume SI_USER.
-static int do_kill(pid_t_ pid, dword_t sig, pid_t_ tgid, int si_code) {
+// kill(2) is PROCESS-directed: Linux puts it in the shared queue and
+// complete_signal() hands it to a thread that can actually take it. AOK
+// delivers into one task's private queue, which is right for tkill/tgkill and
+// wrong for kill -- under the standard daemon shape (block these signals in
+// every thread, one dedicated thread sigwait()s them) the signal lands on a
+// thread that blocks it and that nobody will ever dequeue from, while the
+// sigwait-ing thread sees nothing. mariadbd hit this trying to make its own
+// signal thread exit and could not die; a hung mariadbd then wedged an entire
+// Devuan boot. See tests/manual/sigwait_kill.c.
+//
+// Choosing the thread rather than re-routing kill through the group path is
+// deliberate: the group path does not carry the stop/cont and default-ignore
+// handling that send_signal() does, and using it for kill hung signal_restart,
+// signal_stop_cont and process_conformance. This changes only the case that
+// was already broken -- every target that could already receive the signal
+// still receives it, on the same task as before.
+//
+// Caller holds pids_lock (the group thread list needs it).
+static struct task *pick_process_directed_target(struct task *task, dword_t sig) {
+    // kill(pid, 0) is the "does this process exist" probe and carries no
+    // signal at all -- sig_mask(0) is out of range and asserts. It has no
+    // target to choose, so it never gets here. (apt does this constantly; the
+    // first version of this function skipped the check and killed apt on the
+    // spot.)
+    if (sig == 0)
+        return task;
+    // A task that has begun exiting cannot take anything: do_exit clears
+    // sighand and sets exiting BEFORE the group is dead, and a thread-group
+    // leader stays registered in the pid table until every sibling has gone.
+    // So kill(pid) on a process whose leader exited first addressed a corpse,
+    // and send_signal dropped the signal on the sighand==NULL and exiting
+    // checks -- kill() returned 0 and nothing whatsoever happened, forever.
+    bool addressed_usable = !task->exiting && !task->zombie && task->sighand != NULL;
+    // The addressed task can take it: nothing to do. This is every
+    // single-threaded case, and the common multithreaded one.
+    if (addressed_usable &&
+            (!sigset_has(__atomic_load_n(&task->blocked, __ATOMIC_ACQUIRE), sig) ||
+             sigset_has(__atomic_load_n(&task->waiting, __ATOMIC_ACQUIRE), sig)))
+        return task;
+    if (task->group == NULL)
+        return task;
+
+    struct task *candidate = NULL;
+    struct task *live = NULL;   // any live sibling, blocked or not
+    struct task *thread;
+    list_for_each_entry(&task->group->threads, thread, group_links) {
+        if (thread->exiting || thread->zombie || thread->sighand == NULL)
+            continue;
+        if (live == NULL)
+            live = thread;
+        // A thread parked in sigwait() for this signal is the best target
+        // there is -- it is asking for it by name.
+        if (sigset_has(__atomic_load_n(&thread->waiting, __ATOMIC_ACQUIRE), sig))
+            return thread;
+        if (candidate == NULL &&
+                !sigset_has(__atomic_load_n(&thread->blocked, __ATOMIC_ACQUIRE), sig))
+            candidate = thread;
+    }
+    if (candidate != NULL)
+        return candidate;
+    // Every live thread has it blocked. Leave it pending on the addressed task
+    // so it fires when that thread unblocks -- unless the addressed task is a
+    // corpse, in which case parking it there means dropping it. Any live
+    // sibling will do; the signal waits on its mask instead.
+    if (!addressed_usable && live != NULL)
+        return live;
+    return task;
+}
+
+// thread_directed distinguishes tkill/tgkill (deliver to THIS thread's private
+// queue, which is their entire purpose) from kill (deliver to the process).
+static int do_kill_common(pid_t_ pid, dword_t sig, pid_t_ tgid, int si_code,
+                          bool thread_directed) {
     STRACE("kill(%d, %d)", pid, sig);
     if (sig >= NUM_SIGS)
         return _EINVAL;
-    if (pid == 0) {
-        lock(&current->group->lock, 0);
-        pid = -current->group->pgid;
-        unlock(&current->group->lock);
-    }
-
     int err;
-    if (pid == -1) {
+    if (pid == 0) {
+        // "Every process in MY process group." Encoding that as a negative pid
+        // and re-dispatching collided with the pid == -1 broadcast whenever the
+        // caller's pgid was 1 -- the default for the top-level shell and
+        // everything started under it -- so an ordinary kill(0, sig) signalled
+        // every task in the guest, across every session and process group.
+        // Dispatch the group directly so the broadcast stays reachable only
+        // from a literal -1.
+        lock(&current->group->lock, 0);
+        pid_t_ pgid = current->group->pgid;
+        unlock(&current->group->lock);
+        complex_lockt(&pids_lock, 0);
+        err = kill_group(pgid, sig, si_code);
+    } else if (pid == -1) {
         complex_lockt(&pids_lock, 0);
         err = kill_everything(sig, si_code);
     } else if (pid < 0) {
@@ -2880,6 +3351,8 @@ static int do_kill(pid_t_ pid, dword_t sig, pid_t_ tgid, int si_code) {
             return 0;
         }
 
+        if (!thread_directed)
+            task = pick_process_directed_target(task, sig);
         task_ref_cnt_mod(task, 1);
         unlock(&pids_lock);
         err = signal_kill_task(task, sig, si_code);
@@ -2889,17 +3362,17 @@ static int do_kill(pid_t_ pid, dword_t sig, pid_t_ tgid, int si_code) {
 }
 
 dword_t sys_kill(pid_t_ pid, dword_t sig) {
-    return do_kill(pid, sig, 0, SI_USER_);
+    return do_kill_common(pid, sig, 0, SI_USER_, false);
 }
 dword_t sys_tgkill(pid_t_ tgid, pid_t_ tid, dword_t sig) {
     if (tid <= 0 || tgid <= 0)
         return _EINVAL;
-    return do_kill(tid, sig, tgid, SI_TKILL_);
+    return do_kill_common(tid, sig, tgid, SI_TKILL_, true);
 }
 dword_t sys_tkill(pid_t_ tid, dword_t sig) {
     if (tid <= 0)
         return _EINVAL;
-    return do_kill(tid, sig, 0, SI_TKILL_);
+    return do_kill_common(tid, sig, 0, SI_TKILL_, true);
 }
 
 dword_t sys_rt_sigqueueinfo(pid_t_ pid, dword_t sig, addr_t uinfo_addr) {
@@ -2921,10 +3394,21 @@ dword_t sys_rt_sigqueueinfo_guest(pid_t_ pid, dword_t sig, guest_addr_t uinfo_ad
     info.rt.pid = current->pid;
     info.rt.uid = current->uid;
 
-    struct task *task = pid_get_task_ref(pid);
+    // Process-directed, exactly as kill(2) is: Linux routes rt_sigqueueinfo
+    // through kill_proc_info/group_send_sig_info, so any thread of the target
+    // that can take the signal is a legitimate destination. Queueing straight
+    // into the resolved task's private queue meant a sibling already parked in
+    // sigwait()/sigtimedwait() -- the whole reason a program uses sigqueue --
+    // waited out its timeout while the signal sat undeliverable beside it.
+    complex_lockt(&pids_lock, 0);
+    struct task *task = pid_get_task(pid);
     if (task == NULL) {
+        unlock(&pids_lock);
         return _ESRCH;
     }
+    task = pick_process_directed_target(task, sig);
+    task_ref_cnt_mod(task, 1);
+    unlock(&pids_lock);
 
     err = queue_signal_task(task, sig, info);
     task_ref_cnt_mod(task, -1);

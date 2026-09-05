@@ -9,6 +9,13 @@
 #include "kernel/binder.h"
 #include "kernel/property_area.h"
 #include "kernel/logd_sink.h"
+// For the Phase 1 gate prototype's swap_evict control: pid_get_task and
+// pids_lock come from kernel/calls.h, the address space itself from emu/memory.h.
+#include "kernel/calls.h"
+#include "emu/memory.h"
+#include "kernel/swap.h"
+#include "platform/platform.h"
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +43,8 @@ bool (*remove_user_default)(const char *name);
 char *(*get_documents_directory)(void);
 char *(*ish_roots_status)(void);
 int (*ish_roots_command)(const char *command);
+char *(*ish_workspace_status)(void);
+int (*ish_workspace_open)(const char *request);
 
 #include "kernel/hostinfo.h"
 
@@ -131,6 +140,225 @@ static int proc_ish_show_roots(struct proc_entry *UNUSED(entry), struct proc_dat
     return 0;
 }
 
+// ---- Phase 1 gate prototype: drive eviction by hand ------------------------
+//
+// docs/simulated_swap_plan.md section 7 gives the gate a "/proc/ish control
+// that evicts every eligible frame of a pid", so the prototype can be measured
+// without an aging clock or a kswapd deciding for it. Writing a pid evicts;
+// reading reports what has happened. Nothing here runs on its own, which is
+// also the shipping default: swap is opt-in from Settings.
+// Residency of the address space of the LAST pid written here. Only a
+// diagnostic, so a plain pair of longs written under no lock is enough: the
+// write handler is the only writer and it has already released the mm.
+static size_t swap_last_mapped_pages, swap_last_resident_pages;
+static size_t swap_last_pre_mapped_pages, swap_last_pre_resident_pages;
+
+// /proc/ish/swap -- the backing store, from kernel/swap.c.
+//
+// Writable only on a launch that offered guest control, which means the CLI or
+// an Xcode scheme with ISH_GUEST_SWAP_MB set, and never an installed app: on a
+// device, turning swap on is a Settings decision (section 3.13) and not
+// something a guest process can do to the user's flash. What the write is for
+// is testing swapoff, which nothing else in the tree can reach.
+static int proc_ish_show_swap(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    // 1536, not 1024: the status text passed 890 bytes once the ledger line was
+    // added, and every count in it is a %llu that can widen (a 16 GB area, a
+    // 24h write window). snprintf would truncate in silence, which for a
+    // diagnostic file is the worst possible failure.
+    char text[1536];
+    swap_status_text(text, sizeof(text));
+    proc_printf(buf, "%s", text);
+    // Braces, because there are three of them. Without them only the first
+    // line was conditional and the other two printed always -- so an installed
+    // app, where guest control is off by design, advertised two commands that
+    // could only ever answer EPERM. Caught on the M4 iPad within a minute of
+    // looking at the real file.
+    if (swap_guest_control_allowed()) {
+        proc_printf(buf, "\n  echo <MB> > /proc/ish/swap       # 0 turns it off\n");
+        proc_printf(buf, "  echo quiesce > /proc/ish/swap   # hold the suspension gate\n");
+        proc_printf(buf, "  echo resume > /proc/ish/swap    # lift it\n");
+    }
+    return 0;
+}
+
+static int proc_ish_update_swap(struct proc_entry *UNUSED(entry), struct proc_data *data) {
+    if (!swap_guest_control_allowed())
+        return _EPERM;
+    if (!superuser())
+        return _EPERM;
+    if (data->size == 0 || data->size > 32)
+        return _EINVAL;
+    char text[33];
+    memcpy(text, data->data, data->size);
+    text[data->size] = '\0';
+    // Same embedded-NUL rule as the other writable entries here: refuse rather
+    // than act on half a value.
+    if (strlen(text) != data->size)
+        return _EINVAL;
+    // Two word commands beside the size, so the suspension gate can be driven
+    // from a test. On a device that gate is engaged by the app's
+    // background-task expiry handler, which a test cannot schedule against --
+    // the window opens on a timer and eviction finishes in milliseconds, so
+    // trying to catch one inside the other proves nothing either way.
+    char *nl = strchr(text, '\n');
+    if (nl != NULL)
+        *nl = '\0';
+    if (strcmp(text, "quiesce") == 0)
+        return swap_quiesce_begin(2000) ? 0 : _EBUSY;
+    if (strcmp(text, "resume") == 0) {
+        swap_quiesce_end();
+        return 0;
+    }
+    char *end = NULL;
+    long mb = strtol(text, &end, 10);
+    while (end != NULL && (*end == '\n' || *end == ' '))
+        end++;
+    if (end == NULL || *end != '\0' || mb < 0)
+        return _EINVAL;
+    if (mb == 0) {
+        swap_disable();
+        return 0;
+    }
+    int err = swap_enable((uint64_t) mb * 1024 * 1024);
+    return err < 0 ? err : 0;
+}
+
+static int proc_ish_show_swap_evict(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    unsigned long frames_out, frames_in, bytes_out, bytes_in;
+    swap_prototype_stats(&frames_out, &frames_in, &bytes_out, &bytes_in);
+    proc_printf(buf, "Phase 1 gate prototype -- docs/simulated_swap_plan.md section 7\n");
+    proc_printf(buf, "This is not the pager: no aging, no kswapd, no guest-visible swap.\n");
+    proc_printf(buf, "\n  echo <pid> > /proc/ish/swap_evict   # evict every eligible frame of that process\n\n");
+    proc_printf(buf, "frames_evicted  %lu\n", frames_out);
+    proc_printf(buf, "frames_faulted  %lu\n", frames_in);
+    proc_printf(buf, "frames_cancelled %lu  (fault found the frame already back)\n",
+                swap_prototype_cancelled());
+    proc_printf(buf, "last_target_pre  %zu mapped pages, %zu resident, %zu out\n",
+                swap_last_pre_mapped_pages, swap_last_pre_resident_pages,
+                swap_last_pre_mapped_pages - swap_last_pre_resident_pages);
+    proc_printf(buf, "last_target      %zu mapped pages, %zu resident, %zu out\n",
+                swap_last_mapped_pages, swap_last_resident_pages,
+                swap_last_mapped_pages - swap_last_resident_pages);
+    proc_printf(buf, "bytes_out       %lu\n", bytes_out);
+    proc_printf(buf, "bytes_in        %lu\n", bytes_in);
+    unsigned long adv_fail, prot_fail; int adv_e, prot_e;
+    swap_prototype_failures(&adv_fail, &prot_fail, &adv_e, &prot_e);
+    proc_printf(buf, "madvise_fail    %lu (first errno %d)\n", adv_fail, adv_e);
+    proc_printf(buf, "mprotect_fail   %lu (first errno %d)\n", prot_fail, prot_e);
+    unsigned long long fp_b, fp_a, fp_p;
+    swap_prototype_ledger(&fp_b, &fp_a, &fp_p);
+    proc_printf(buf, "footprint_before %llu\n", fp_b);
+    proc_printf(buf, "footprint_after  %llu\n", fp_a);
+    proc_printf(buf, "ledger_delta     %lld  (inside the barrier)\n", (long long)(fp_a - fp_b));
+    proc_printf(buf, "ledger_post      %lld  (after the barrier released)\n", (long long)(fp_p - fp_b));
+    // Sampled NOW, at read time, not stored at eviction time: this is what says
+    // whether the drop actually persists, measured the same way both times.
+    unsigned long long live = swap_footprint_live();
+    proc_printf(buf, "footprint_live   %llu  (delta vs before %lld)\n",
+                live, (long long)(live - fp_b));
+    unsigned long long in_, res_, reu_, comp_;
+    swap_footprint_detail(&in_, &res_, &reu_, &comp_);
+    proc_printf(buf, "  internal %llu  resident %llu  reusable %llu  compressed %llu\n",
+                in_, res_, reu_, comp_);
+    proc_printf(buf, "host_pid         %d  (the process these numbers describe)\n", (int) getpid());
+    proc_printf(buf, "ledger_refused   %lu  (evictions where the ledger did not move)\n",
+                swap_prototype_ledger_refused());
+    return 0;
+}
+
+static int proc_ish_update_swap_evict(struct proc_entry *UNUSED(entry), struct proc_data *data) {
+    // Gated exactly like /proc/ish/swap, and for a reason a reviewer had to
+    // point out: this forces another process's memory out to storage, so on a
+    // device with swap enabled in Settings it would let any guest root process
+    // spend the user's flash write budget on any pid it liked. It is a
+    // development control -- the shipping trigger is the pager's own -- so it
+    // belongs on the same launch-time gate rather than being reachable from an
+    // installed app.
+    if (!swap_guest_control_allowed())
+        return _EPERM;
+    if (!superuser())
+        return _EPERM;
+    if (data->size == 0 || data->size > 32)
+        return _EINVAL;
+    char text[33];
+    memcpy(text, data->data, data->size);
+    text[data->size] = '\0';
+    // Same embedded-NUL rule as proc_ish_update_roots: refuse rather than act
+    // on half a value.
+    if (strlen(text) != data->size)
+        return _EINVAL;
+    char *end = NULL;
+    long want = strtol(text, &end, 10);
+    while (end != NULL && (*end == '\n' || *end == ' '))
+        end++;
+    if (end == NULL || *end != '\0' || want <= 0)
+        return _EINVAL;
+
+    // Pin the address space the way every other mm_retain site in the tree
+    // does: under the TASK's general_lock, with pids_lock not held.
+    //
+    // pids_lock does not protect task->mm and never did. do_exit does
+    // `mm_release(task->mm); task->mm = NULL;` with neither lock held
+    // (kernel/exit.c), and mm_release's refcount can reach zero and enter
+    // mem_destroy -- a full pt_unmap over the address space, then freeing
+    // every chunk and leaf -- while task->mm still points at the dying mm the
+    // whole time. Retaining it there hands this function an mm that is being
+    // torn down: mem_destroy NULLs pgdir_root and pgdir_root_bitmap, and the
+    // first mem_pt() of the eviction sweep then dereferences NULL.
+    //
+    // MEASURED, 3 for 3, with three host crash reports whose stacks are
+    // identical: mem_pgdir_chunk_get <- mem_pt_leaf_get <- mem_pt_raw <-
+    // mem_pt <- swap_frame_eligible <- swap_evict_mem <-
+    // proc_ish_update_swap_evict. A guest write to a /proc file killed the
+    // whole emulator and every guest process in it. Once the freed mm's
+    // allocation is recycled instead of still reading NULL, the sweep would
+    // pwrite from, madvise and mprotect a host address derived from garbage,
+    // which is worse than the crash.
+    //
+    // trylock, not lock, and the reason is the one fs/proc/root.c's
+    // collect_mem_page_stats gives for the same pattern: do_exit spins in
+    // exit_wait_backoff() while holding general_lock, and the reference we
+    // hold here can keep that loop alive. A task mid-exit has nothing worth
+    // evicting, so failing is the right answer. Blocking here instead would
+    // also be an ABBA inversion -- do_exit takes general_lock before
+    // pids_lock, and pid_get_task_ref takes pids_lock internally.
+    struct task *task = pid_get_task_ref((dword_t) want);
+    if (task == NULL)
+        return _ESRCH;
+    struct mm *mm = NULL;
+    if (trylock(&task->general_lock) == 0) {
+        if (task->mm != NULL) {
+            mm = task->mm;
+            mm_retain(mm);
+        }
+        unlock(&task->general_lock);
+    }
+    task_ref_cnt_mod(task, -1);
+    if (mm == NULL)
+        return _ESRCH;
+
+    // Sampled BOTH SIDES of the sweep, from the same walk every residency
+    // figure will come from once the pager has a guest-visible surface.
+    //
+    // The before-sample is the one that can be read on its own: writing a pid
+    // whose frames are all resident evicts them and then reports them out, so
+    // an after-sample alone can never show a process whose memory came BACK.
+    // That is exactly the state the fork case produces -- a forked sibling
+    // faults a frame in and publishes only its own entries, leaving this
+    // address space's saying SWAPPED over resident memory -- and it is what
+    // mem_resident_page_count has to get right by asking the frame rather than
+    // the entry.
+    size_t before_mapped = mem_mapped_page_count(&mm->mem);
+    size_t before_resident = mem_resident_page_count(&mm->mem);
+    long released = swap_evict_mem(&mm->mem);
+    swap_last_pre_mapped_pages = before_mapped;
+    swap_last_pre_resident_pages = before_resident;
+    swap_last_mapped_pages = mem_mapped_page_count(&mm->mem);
+    swap_last_resident_pages = mem_resident_page_count(&mm->mem);
+    mm_release(mm);
+    return released < 0 ? (int) released : 0;
+}
+
 static int proc_ish_update_roots(struct proc_entry *UNUSED(entry), struct proc_data *data) {
     if (ish_roots_command == NULL)
         return _EOPNOTSUPP;
@@ -147,6 +375,212 @@ static int proc_ish_update_roots(struct proc_entry *UNUSED(entry), struct proc_d
     int err = strlen(command) == data->size ? ish_roots_command(command) : _EINVAL;
     free(command);
     return err;
+}
+
+// /proc/ish/workspace -- read it to learn whether this session is hosted by
+// Workspace and which tools it can open, write to it to ask for one.
+//
+// Read format is key=value lines, the same shape as roots, so a shell can
+// parse it with `. /dev/stdin`-free case matching:
+//
+//     hosted=1
+//     tools=motepad,filemanager,markdown,imageviewer,videoplayer,audio,llm,...
+//
+// `hosted` answers "is there a Workspace that can receive a request", not "is
+// THIS session inside one" -- and that is the useful question. An ssh login has
+// no Workspace of its own but can still perfectly well ask the app on screen to
+// open a file, which is exactly what someone typing ws-markdown over ssh wants.
+//
+// hosted=0 is a complete and useful answer, not an error: it is what a plain
+// terminal session on a build with no Workspace, and the whole command-line
+// build, honestly are. A launcher reads this first and falls back rather than
+// writing a request nobody will answer.
+//
+// The entry is 0666 rather than roots' 0644: managing roots is administrative,
+// opening a window is not, and every AOK session is uid 1000.
+static int proc_ish_show_workspace(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    // NULL in the command-line build and in any app build without Workspace.
+    // Saying so beats calling through a NULL pointer -- stress-ng --procfs
+    // reads every file under here, which is how /proc/ish/documents once took
+    // the whole emulator down.
+    if (ish_workspace_status == NULL) {
+        proc_printf(buf, "hosted=0\n");
+        proc_printf(buf, "reason=this build has no Workspace\n");
+        return 0;
+    }
+    char *status = ish_workspace_status();
+    if (status == NULL) {
+        proc_printf(buf, "hosted=0\n");
+        proc_printf(buf, "reason=Workspace did not answer\n");
+        return 0;
+    }
+    proc_printf(buf, "%s", status);
+    free(status);
+    return 0;
+}
+
+// One verb today: `open <tool> [path]`. A verb set rather than a bare path is
+// the point -- this is a guest asking the app to put something on screen, so
+// what it may ask for has to be enumerable, and the app validates both the
+// tool name and the path before acting on either.
+static int proc_ish_update_workspace(struct proc_entry *UNUSED(entry), struct proc_data *data) {
+    if (ish_workspace_open == NULL)
+        return _EOPNOTSUPP;
+    if (data->size == 0 || data->size > 4096)
+        return _EINVAL;
+    char *request = malloc(data->size + 1);
+    if (request == NULL)
+        return _ENOMEM;
+    memcpy(request, data->data, data->size);
+    request[data->size] = '\0';
+    // An embedded NUL would end the request early on the app side while the
+    // parser here saw the rest, so a request that should be rejected could
+    // arrive as a different, accepted one. Refuse rather than guess which half
+    // was meant. (Same reasoning as proc_ish_update_roots.)
+    int err = strlen(request) == data->size ? ish_workspace_open(request) : _EINVAL;
+    free(request);
+    return err;
+}
+
+// /proc/ish/mem_release_probe -- the day-1 device probe of
+// docs/simulated_swap_plan.md section 7, run inside the app process because
+// that is the process whose footprint the answer is about.
+//
+//   cat /proc/ish/mem_release_probe                    # the last result
+//   echo run > /proc/ish/mem_release_probe             # run it, 16 MiB
+//   echo 'run mb=64' > /proc/ish/mem_release_probe     # run it, 64 MiB
+//   cat /proc/ish/mem_release_probe                    # and read what it found
+//
+// It answers one question -- does releasing a 16 KiB host page actually reduce
+// the footprint iOS decides to kill this app on? -- and the whole simulated-swap
+// design is downstream of the answer. The measurement itself is in
+// platform/darwin.c; this is just the trigger and the mailbox.
+//
+// A READ NEVER RUNS IT. That is the shape and not a convenience: the probe
+// allocates and dirties tens of megabytes inside a process that iOS kills for
+// using memory, and stress-ng --procfs reads every file under /proc/ish (which
+// is how /proc/ish/documents once took the whole emulator down). So reading
+// reports the last result, or the instructions if nothing has been run, and
+// only a write with the word `run` in it starts anything.
+//
+// The size is a parameter with a small default and a hard cap for the same
+// reason. Section 7 sketched a 2 GiB touch; on someone's iPad that is a way to
+// be jetsammed in the middle of the measurement, and the answer is qualitative
+// anyway. Anything above HOST_RELEASE_PROBE_MAX_MB is refused here rather than
+// silently clamped, because a probe that measured something other than what was
+// asked for is a probe whose output has to be re-read carefully.
+//
+// 0644, like `roots` next door: this is administrative, an AOK session is
+// uid 1000, and `sudo sh -c 'echo run > /proc/ish/mem_release_probe'` is the
+// spelling from a normal session.
+#ifdef __APPLE__
+#define PROC_ISH_RELEASE_PROBE_MAX 16384
+
+static lock_t proc_ish_release_probe_lock = LOCK_INITIALIZER;
+static char *proc_ish_release_probe_report;      // last result; NULL until one runs
+// Exclusion for the RUN, held across the whole measurement, which the report
+// lock is not: two concurrent probes would each allocate their region, doubling
+// the peak footprint the guard above them was told to expect.
+static atomic_bool proc_ish_release_probe_running;
+
+static const char proc_ish_release_probe_usage[] =
+    "iSH-AOK host page release probe -- docs/simulated_swap_plan.md section 7, day 1\n"
+    "Nothing has been run yet in this session. Reading this file never runs it.\n"
+    "\n"
+    "  echo run > /proc/ish/mem_release_probe             # default 16 MiB\n"
+    "  echo 'run mb=64' > /proc/ish/mem_release_probe     # 64 MiB, cap 256\n"
+    "  cat /proc/ish/mem_release_probe                    # read the result\n"
+    "\n"
+    "Run it with NO debugger and NO Instruments attached: a live mach_vm_read of\n"
+    "a region leaves its VM object copy-on-write shared, and MADV_FREE_REUSABLE on\n"
+    "a shared object returns 0 and moves no ledger, so an attached tool makes the\n"
+    "probe report the design dead when it is not.\n";
+#else
+static const char proc_ish_release_probe_unsupported[] =
+    "iSH-AOK host page release probe -- docs/simulated_swap_plan.md section 7, day 1\n"
+    "Not available on this host. The probe measures XNU primitives that exist\n"
+    "nowhere else -- MADV_FREE_REUSABLE, the phys_footprint ledger jetsam kills\n"
+    "on, and task_vm_info.region_count -- so there is nothing here for it to say.\n"
+    "Run it in the iOS app, or in the macOS build, which is the reference host.\n";
+#endif
+
+// proc_buf_append, NOT proc_printf("%s"). proc_printf formats through a 4096
+// byte stack buffer and then appends vsnprintf's RETURN value, which is the
+// length the output would have had -- so a string longer than 4096 bytes makes
+// it copy off the end of that stack buffer, and the guest reads whatever was
+// below it. A probe report is several kilobytes of text, so this entry hits
+// that at once; the first dry run on this Mac printed a page of heap garbage
+// after "d3 mp". The bug is in fs/proc.c and is worth fixing there, but nothing
+// here needs the formatting anyway.
+static int proc_ish_show_mem_release_probe(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+#ifdef __APPLE__
+    lock(&proc_ish_release_probe_lock, 0);
+    const char *text = proc_ish_release_probe_report != NULL ?
+        proc_ish_release_probe_report : proc_ish_release_probe_usage;
+    proc_buf_append(buf, text, strlen(text));
+    unlock(&proc_ish_release_probe_lock);
+#else
+    proc_buf_append(buf, proc_ish_release_probe_unsupported,
+                    strlen(proc_ish_release_probe_unsupported));
+#endif
+    return 0;
+}
+
+static int proc_ish_update_mem_release_probe(struct proc_entry *UNUSED(entry), struct proc_data *data) {
+#ifndef __APPLE__
+    (void) data;
+    return _EOPNOTSUPP;
+#else
+    // `run` is required rather than accepting any write at all, so that a stray
+    // redirection cannot start a multi-megabyte allocation inside the app.
+    if (data->size == 0 || data->size >= 128)
+        return _EINVAL;
+    char command[128];
+    memcpy(command, data->data, data->size);
+    command[data->size] = '\0';
+    // An embedded NUL would hide the rest of the line from the parser while the
+    // writer believed it had been read -- the same reasoning as
+    // proc_ish_update_roots.
+    if (strlen(command) != data->size)
+        return _EINVAL;
+
+    char *save = NULL;
+    char *token = strtok_r(command, " \t\r\n,", &save);
+    if (token == NULL || strcmp(token, "run") != 0)
+        return _EINVAL;
+    unsigned long mb = 0;
+    while ((token = strtok_r(NULL, " \t\r\n,", &save)) != NULL) {
+        // A second mb= is refused rather than resolved: `run mb=64 mb=32` has
+        // no obvious winner, and the one thing this file must not do is
+        // allocate a size nobody asked for.
+        if (mb != 0 || strncmp(token, "mb=", 3) != 0)
+            return _EINVAL;
+        char *end = NULL;
+        long value = strtol(token + 3, &end, 10);
+        if (end == token + 3 || *end != '\0' || value <= 0 || value > HOST_RELEASE_PROBE_MAX_MB)
+            return _EINVAL;
+        mb = (unsigned long) value;
+    }
+    if (mb == 0)
+        mb = HOST_RELEASE_PROBE_DEFAULT_MB;
+
+    if (atomic_exchange(&proc_ish_release_probe_running, true))
+        return _EBUSY;
+    int err = _ENOMEM;
+    char *report = malloc(PROC_ISH_RELEASE_PROBE_MAX);
+    if (report != NULL) {
+        err = host_mem_release_probe(mb, report, PROC_ISH_RELEASE_PROBE_MAX);
+        // Published whether it ran or refused: a refusal explains itself in the
+        // report, and a write that fails with ENOMEM and leaves no explanation
+        // anywhere is exactly the shape that gets a guard blamed for a bug.
+        lock(&proc_ish_release_probe_lock, 0);
+        free(proc_ish_release_probe_report);
+        proc_ish_release_probe_report = report;
+        unlock(&proc_ish_release_probe_lock);
+    }
+    atomic_store(&proc_ish_release_probe_running, false);
+    return err;
+#endif
 }
 
 static int proc_ish_show_amd64_jit(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
@@ -703,6 +1137,58 @@ static int proc_ish_show_uidevice(struct proc_entry *UNUSED(entry), struct proc_
     return 0;
 }
 
+// Every number the memory guards actually decide on, in one place.
+//
+// This exists because its absence cost a day. Three separate conclusions about
+// why a device died were wrong -- "the pressure code refused it", "the host
+// refused before we did", "the per-process test cannot have fired" -- and each
+// was an inference from the guest's MemAvailable, which is the MACHINE's figure
+// and not the one any of these guards read. There was no way to ask the guards
+// what they saw. Now there is: run the workload, read this file, and the answer
+// is arithmetic instead of argument.
+static int proc_ish_show_mem_guard(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    struct mem_usage machine = get_mem_usage();
+    struct mem_budget budget = get_mem_budget();
+    uint64_t floor = host_mem_headroom_floor();
+    unsigned pressure = host_mem_pressure_level();
+
+    proc_printf(buf, "floor            %llu MB  (ISH_GUEST_MEM_HEADROOM_MB)\n",
+                (unsigned long long) (floor >> 20));
+    proc_printf(buf, "\nthe machine (what /proc/meminfo is built from):\n");
+    proc_printf(buf, "  total          %llu MB\n", (unsigned long long) (machine.total >> 20));
+    proc_printf(buf, "  free           %llu MB\n", (unsigned long long) (machine.free >> 20));
+    proc_printf(buf, "  available      %llu MB%s\n",
+                (unsigned long long) (machine.available >> 20),
+                (machine.available != 0 && machine.available < floor)
+                    ? (pressure >= 1 ? "   <-- UNDER FLOOR, and pressure is up: REFUSING"
+                                     : "   <-- under floor, but no system pressure: ignored")
+                    : "");
+    proc_printf(buf, "\nthis process (the jetsam ceiling):\n");
+    if (!budget.known) {
+        proc_printf(buf, "  ceiling        not latched (no per-process limit known)\n");
+    } else {
+        proc_printf(buf, "  ceiling        %llu MB\n", (unsigned long long) (budget.total >> 20));
+        if (budget.available_known)
+            proc_printf(buf, "  headroom       %llu MB%s\n",
+                        (unsigned long long) (budget.available >> 20),
+                        budget.available < floor ? "   <-- UNDER FLOOR" : "");
+        else
+            proc_printf(buf, "  headroom       unmeasured\n");
+    }
+    proc_printf(buf, "\nsystem memory pressure  %s\n",
+                pressure >= 2 ? "CRITICAL  (growth refused)" :
+                pressure >= 1 ? "WARN      (throttle engaged, growth still allowed)" :
+                                "normal");
+    proc_printf(buf, "\ngrowth refused now      %s\n",
+                host_mem_headroom_low() ? "YES" : "no");
+    proc_printf(buf, "throttle engaged now    %s\n",
+                host_mem_should_reclaim() ? "YES" : "no");
+    proc_printf(buf, "\nA jetsam kill is predicted by the MACHINE's figures, not this\n"
+                     "process's. On a small device the ceiling is close to the size of\n"
+                     "RAM, so headroom can read healthy while the machine dies.\n");
+    return 0;
+}
+
 static int proc_ish_show_host_info(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     char *host_info = printHostInfo();
     proc_printf(buf, "%s", host_info);
@@ -774,7 +1260,12 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"ips", .show = proc_ish_show_ips},
     {"logd", S_IFREG | 0644, .show = logd_sink_show, .update = logd_sink_update},
     {"property_area", S_IFREG | 0644, .show = property_area_show, .update = property_area_update},
+    {"mem_guard", .show = proc_ish_show_mem_guard},
+    {"mem_release_probe", S_IFREG | 0644, .show = proc_ish_show_mem_release_probe, .update = proc_ish_update_mem_release_probe},
     {"roots", S_IFREG | 0644, .show = proc_ish_show_roots, .update = proc_ish_update_roots},
+    {"swap", S_IFREG | 0644, .show = proc_ish_show_swap, .update = proc_ish_update_swap},
+    {"swap_evict", S_IFREG | 0644, .show = proc_ish_show_swap_evict, .update = proc_ish_update_swap_evict},
+    {"workspace", S_IFREG | 0666, .show = proc_ish_show_workspace, .update = proc_ish_update_workspace},
     {"version", .show = proc_ish_show_version},
 });
 

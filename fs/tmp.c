@@ -97,6 +97,23 @@ static void tmpfs_update_ctime(struct tmp_inode *inode) {
     inode->stat.ctime_nsec = now.tv_nsec;
 }
 
+// relatime, which is the default everywhere: a read advances atime only when
+// atime is at or behind mtime/ctime, or is more than a day old. tmpfs never
+// touched atime at all, so a reader could not tell a file that had just been
+// read from one nobody had opened since boot -- which is the one thing atime
+// is for, and what mutt, procmail and every "has this been read" check use.
+// Caller holds inode->lock.
+#define TMPFS_RELATIME_DAY 86400
+static void tmpfs_update_atime_relatime(struct tmp_inode *inode) {
+    struct timespec now = timespec_now(CLOCK_REALTIME);
+    if (inode->stat.atime > inode->stat.mtime &&
+            inode->stat.atime > inode->stat.ctime &&
+            (uint64_t) now.tv_sec < (uint64_t) inode->stat.atime + TMPFS_RELATIME_DAY)
+        return;
+    inode->stat.atime = now.tv_sec;
+    inode->stat.atime_nsec = now.tv_nsec;
+}
+
 static void tmpfs_update_mtime_and_ctime(struct tmp_inode *inode) {
     struct timespec now = timespec_now(CLOCK_REALTIME);
     inode->stat.mtime = now.tv_sec;
@@ -203,7 +220,16 @@ static int tmpfs_dir_lookup_existence(struct tmp_dirent *dir, const char *name) 
 }
 
 static int tmpfs_init_regular_file(struct tmp_inode *inode, const char *contents) {
-    assert(S_ISREG(inode->stat.mode));
+    // An invariant today rather than a guest-reachable case: the one caller
+    // builds the inode with tmp_inode_new(S_IFREG | mode) immediately above,
+    // and every mode it passes is a compile-time constant with no type bits.
+    // Refused rather than asserted all the same, for the reason tmpfs_write
+    // gives at length -- an assert on this predicate turns one odd inode into
+    // an abort for every guest in the app, and that is not a hypothetical
+    // here: it is what reached users through mknod. Closing the source of
+    // typeless inodes was the fix; declining to abort is the belt to it.
+    if (!S_ISREG(inode->stat.mode))
+        return _EINVAL;
     if (contents == NULL || contents[0] == '\0')
         return 0;
 
@@ -296,6 +322,9 @@ static bool tmpfs_is_devtmpfs_mount(struct mount *mount) {
 
 // Device nodes are root-owned on a real devtmpfs no matter who mounted it,
 // while tmp_inode_new() inherits the caller's ids -- stamp them explicitly.
+// `mode` carries its own S_IFMT now: the caller says S_IFCHR or S_IFBLK rather
+// than this hardcoding S_IFCHR, because dev_node_spec can describe a block
+// device since /dev/aokswap0.
 static int tmpfs_add_dev_node(struct tmp_dirent *dir, const char *name, mode_t_ mode, dev_t_ dev) {
     int err = tmpfs_dir_lookup_existence(dir, name);
     if (err == _EEXIST)
@@ -303,7 +332,7 @@ static int tmpfs_add_dev_node(struct tmp_dirent *dir, const char *name, mode_t_ 
     if (err < 0)
         return err;
 
-    struct tmp_inode *inode = tmp_inode_new(S_IFCHR | mode);
+    struct tmp_inode *inode = tmp_inode_new((mode & S_IFMT) != 0 ? mode : (S_IFCHR | mode));
     if (inode == NULL)
         return _ENOMEM;
     inode->stat.rdev = dev;
@@ -364,7 +393,8 @@ static int tmpfs_add_dev_symlink(struct tmp_dirent *dir, const char *name, const
 
 static int tmpfs_populate_devtmpfs_root(struct tmp_dirent *dir) {
     for (size_t i = 0; i < dev_standard_nodes_count; i++) {
-        int err = tmpfs_add_dev_node(dir, dev_standard_nodes[i].name, dev_standard_nodes[i].mode,
+        int err = tmpfs_add_dev_node(dir, dev_standard_nodes[i].name,
+                (dev_standard_nodes[i].is_block ? S_IFBLK : S_IFCHR) | dev_standard_nodes[i].mode,
                 dev_make(dev_standard_nodes[i].major, dev_standard_nodes[i].minor));
         if (err < 0)
             return err;
@@ -372,7 +402,8 @@ static int tmpfs_populate_devtmpfs_root(struct tmp_dirent *dir) {
     for (size_t i = 0; i < dev_dynamic_nodes_count; i++) {
         if (!dyn_dev_is_registered(dev_dynamic_nodes[i].major, dev_dynamic_nodes[i].minor))
             continue;
-        int err = tmpfs_add_dev_node(dir, dev_dynamic_nodes[i].name, dev_dynamic_nodes[i].mode,
+        int err = tmpfs_add_dev_node(dir, dev_dynamic_nodes[i].name,
+                (dev_dynamic_nodes[i].is_block ? S_IFBLK : S_IFCHR) | dev_dynamic_nodes[i].mode,
                 dev_make(dev_dynamic_nodes[i].major, dev_dynamic_nodes[i].minor));
         if (err < 0)
             return err;
@@ -590,7 +621,10 @@ static int tmpfs_mount(struct mount *mount) {
     // ("Trying to run as user instance, but $XDG_RUNTIME_DIR is not set")
     // and every user@ start failed. Other options (size=, nr_inodes=,
     // smackfsroot=, ...) remain accepted no-ops as before.
-    mode_t_ root_mode = S_IFDIR | 0777;
+    // 01777 like Linux (verified: a fresh `mount -t tmpfs` gives 1777). 0777
+    // made every tmpfs world-writable with NO sticky bit, so any guest user
+    // could delete or replace another's files in it.
+    mode_t_ root_mode = S_IFDIR | 01777;
     uid_t_ root_uid = 0;
     uid_t_ root_gid = 0;
     const char *opt = mount->info;
@@ -1055,6 +1089,54 @@ out:
     return err;
 }
 
+// link(2). A tmpfs inode is already refcounted and named by a separate dirent,
+// so a second name for the same inode is what the structure was built for --
+// it just had no entry point, and link() came back EPERM, the errno Linux uses
+// for "this filesystem cannot do links at all". Anything that makes a
+// temporary file and links it into place (dpkg, rename-by-link, maildir
+// delivery, GNU ln) failed on a tmpfs.
+static int tmpfs_link(struct mount *mount, const char *src, const char *dst) {
+    struct tmp_dirent *src_dirent = tmpfs_lookup(mount, src);
+    if (IS_ERR(src_dirent))
+        return PTR_ERR(src_dirent);
+    // Linking a directory is EPERM on every filesystem: it would make a cycle
+    // nothing can unwind.
+    if (S_ISDIR(src_dirent->inode->stat.mode)) {
+        tmp_dirent_release(src_dirent);
+        return _EPERM;
+    }
+
+    const char *filename;
+    struct tmp_dirent *parent = tmpfs_lookup_parent(mount, dst, &filename);
+    if (IS_ERR(parent)) {
+        tmp_dirent_release(src_dirent);
+        return PTR_ERR(parent);
+    }
+    if (parent == NULL) {
+        tmp_dirent_release(src_dirent);
+        return _EPERM;
+    }
+
+    lock(&parent->lock, 0);
+    int err = tmpfs_dir_lookup_existence(parent, filename);
+    if (err < 0)
+        goto out;
+    // tmpfs_dir_link consumes a reference on the inode on failure and retains
+    // one on success, so hand it one of its own.
+    err = tmpfs_dir_link(parent, filename, tmp_inode_retain(src_dirent->inode), NULL);
+    if (err == 0) {
+        lock(&src_dirent->inode->lock, 0);
+        src_dirent->inode->stat.nlink++;
+        tmpfs_update_ctime(src_dirent->inode);
+        unlock(&src_dirent->inode->lock);
+    }
+out:
+    unlock(&parent->lock);
+    tmp_dirent_release(parent);
+    tmp_dirent_release(src_dirent);
+    return err;
+}
+
 static int tmpfs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev_t_ dev) {
     const char *filename;
     struct tmp_dirent *parent = tmpfs_lookup_parent(mount, path, &filename);
@@ -1208,6 +1290,8 @@ static ssize_t tmpfs_read(struct fd *fd, void *buf, size_t bufsize) {
     res = _EINVAL;
     if (!S_ISREG(inode->stat.mode))
         goto out;
+
+    tmpfs_update_atime_relatime(inode);
 
     // Snapshot fd->offset once (see tmpfs_write): a concurrent lseek/pwrite on
     // a shared fd could otherwise move it between the clamp and the memcpy,
@@ -1626,7 +1710,16 @@ static unsigned long tmpfs_telldir(struct fd *fd) {
 static void tmpfs_seekdir(struct fd *fd, unsigned long ptr) {
     struct tmp_dirent *dir = fd->tmpfs.dirent;
     lock(&dir->lock, 0);
-    assert(S_ISDIR(dir->inode->stat.mode));
+    // Same reasoning as tmpfs_init_regular_file: an invariant, since fs/dir.c
+    // answers ENOTDIR before any of this is reachable for a descriptor whose
+    // type is not a directory. Seeking a directory that somehow is not one is
+    // a no-op -- there is no error to return through a void function, and
+    // leaving the cursor untouched is what a caller can survive. Aborting the
+    // whole app is not.
+    if (!S_ISDIR(dir->inode->stat.mode)) {
+        unlock(&dir->lock);
+        return;
+    }
     if (ptr == TMPFS_DIROFF_DOT || ptr == TMPFS_DIROFF_DOTDOT) {
         fd->tmpfs.dots_pos = (unsigned) ptr;
         tmpfs_dir_pos_first(fd, dir);
@@ -1721,6 +1814,7 @@ const struct fs_ops tmpfs = {
     .futime = tmpfs_futime,
     .getpath = tmpfs_getpath,
     .mkdir = tmpfs_mkdir,
+    .link = tmpfs_link,
     .mknod = tmpfs_mknod,
     .symlink = tmpfs_symlink,
     .readlink = tmpfs_readlink,
@@ -1747,6 +1841,7 @@ const struct fs_ops devtmpfs = {
     .futime = tmpfs_futime,
     .getpath = tmpfs_getpath,
     .mkdir = tmpfs_mkdir,
+    .link = tmpfs_link,
     .mknod = tmpfs_mknod,
     .symlink = tmpfs_symlink,
     .readlink = tmpfs_readlink,
@@ -1769,6 +1864,7 @@ const struct fs_ops cgroupfs = {
     .futime = tmpfs_futime,
     .getpath = tmpfs_getpath,
     .mkdir = tmpfs_mkdir,
+    .link = tmpfs_link,
     .mknod = tmpfs_mknod,
     .symlink = tmpfs_symlink,
     .readlink = tmpfs_readlink,
@@ -1791,6 +1887,7 @@ const struct fs_ops cgroup2fs = {
     .futime = tmpfs_futime,
     .getpath = tmpfs_getpath,
     .mkdir = tmpfs_mkdir,
+    .link = tmpfs_link,
     .mknod = tmpfs_mknod,
     .symlink = tmpfs_symlink,
     .readlink = tmpfs_readlink,

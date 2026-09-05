@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 
 #include "kernel/fs.h"
+#include "kernel/calls.h"   // MS_READONLY_ and the other mount flags
 #include "fs/fd.h"
 #include "fs/inode.h"
 #include "fs/path.h"
@@ -200,10 +201,32 @@ bool procfd_statat(struct fd *at, const char *path_raw, struct statbuf *stat, in
     return true;
 }
 
+// The mount flags in force for `path`, which are NOT always the returned
+// mount's own: see find_mount_and_trim_path_flags.
 struct mount *find_mount_and_trim_path(char *path) {
+    return find_mount_and_trim_path_flags(path, NULL);
+}
+
+// `mount_flags`, when non-NULL, receives the flags governing this path.
+//
+// ro/nosuid/nodev/noexec are per-MOUNT in Linux, not per-superblock: two binds
+// of the same directory can differ, which is the entire point of
+// `mount -o remount,bind,ro`. A bind here resolves to its origin for storage,
+// and the origin's flags are not the bind's -- reading them off the returned
+// mount answered every permission question about the ORIGIN. A read-only bind
+// was therefore writable, and a nosuid or nodev one was neither.
+//
+// The bind's restrictions are added to the origin's rather than replacing
+// them: a bind can be more restrictive than what it aliases, never less. A
+// bind of a read-only filesystem stays read-only.
+struct mount *find_mount_and_trim_path_flags(char *path, int *mount_flags) {
+    if (mount_flags != NULL)
+        *mount_flags = 0;
     struct mount *mount = mount_find(path);
     if (mount == NULL)
         return NULL;
+    if (mount_flags != NULL)
+        *mount_flags = mount->flags;
     char *dst = path;
     const char *src = path + mount->point_len;
     while (*src != '\0')
@@ -228,21 +251,43 @@ struct mount *find_mount_and_trim_path(char *path) {
         strcpy(path, redirected);
         mount_retain(origin);
         mount_release(mount);
+        if (mount_flags != NULL)
+            *mount_flags |= origin->flags;
         return origin;
     }
     return mount;
 }
 
+// Linux fails every modifying operation on a read-only mount with EROFS. The
+// flag was recorded at mount time and never consulted anywhere, so read-only
+// was purely cosmetic: only /proc/mounts said "ro" while creates, writes,
+// unlinks and renames all went through.
+//
+// Takes the flags rather than the mount because for a bind they differ; see
+// find_mount_and_trim_path_flags.
+static bool mount_flags_readonly(int mount_flags) {
+    return (mount_flags & MS_READONLY_) != 0;
+}
+
+
 bool contains_mount_point(const char *path) {
     struct mount *mount;
     // Optimization: hoist strlen(path) outside the loop to avoid redundant O(N) recalculations
     int n = strlen(path);
+    // mounts_lock, like every other walk of this list: it is mutated under
+    // that lock, and rmdir/rename ask this question about a path while another
+    // thread may be mounting or unmounting.
+    bool found = false;
+    lock(&mounts_lock, 0);
     list_for_each_entry(&mounts, mount, mounts) {
         if (strncmp(path, mount->point, n) == 0 &&
-                (mount->point[n] == '\0' || mount->point[n] == '/'))
-            return true;
+                (mount->point[n] == '\0' || mount->point[n] == '/')) {
+            found = true;
+            break;
+        }
     }
-    return false;
+    unlock(&mounts_lock);
+    return found;
 }
 
 // fd referring to a symlink itself, from openat(O_PATH|O_NOFOLLOW) on a
@@ -369,9 +414,50 @@ bool procns_statat(struct fd *at, const char *path_raw, struct statbuf *stat, in
     return true;
 }
 
-static struct fd *generic_openat_norm(struct fd *at, const char *path_raw, int flags, int mode, int extra_norm) {
+// O_TMPFILE: create an unnamed file on the filesystem holding the named
+// directory. AOK cannot do this, and says so.
+//
+// It used to arrive as O_DIRECTORY plus an unrecognised bit, so the directory
+// was opened and the write mode then failed it with EISDIR -- an errno that
+// tells the caller it passed a directory, which is exactly what it meant to
+// do, and gives it nothing to act on.
+//
+// EOPNOTSUPP is the answer Linux gives when the filesystem has no ->tmpfile,
+// and it is the state AOK is actually in. It matters that this is a REFUSAL
+// rather than a partial implementation: the anonymous file itself would be
+// easy (create a hidden name, open it, unlink it), but a tmpfile opened
+// without O_EXCL can be given a name afterwards with
+// linkat("/proc/self/fd/N", ..., AT_SYMLINK_FOLLOW), and that needs linking an
+// inode that has none -- machinery AOK does not have. Callers commit to the
+// whole contract the moment open succeeds: systemd's open_tmpfile_linkable()
+// falls back to a named temporary file if the open fails, and calls
+// link_tmpfile() if it does not. Succeeding at open and failing at linkat
+// would break exactly the callers that handle the refusal correctly today.
+static struct fd *generic_open_tmpfile(struct fd *at, const char *path_raw, int flags) {
+    // Linux checks the access mode in the open flags before the filesystem is
+    // consulted: an unnamed file you cannot write is of no use to anyone.
+    if (!(flags & (O_WRONLY_ | O_RDWR_)))
+        return ERR_PTR(_EINVAL);
+    // ...and then that the path really is a directory, so the caller can tell
+    // "you named the wrong thing" from "this filesystem cannot do it".
+    char path[MAX_PATH];
+    int err = path_normalize(at, path_raw, path, N_SYMLINK_FOLLOW);
+    if (err < 0)
+        return ERR_PTR(err);
+    struct statbuf stat;
+    err = generic_statat(at, path_raw, &stat, 0);
+    if (err < 0)
+        return ERR_PTR(err);
+    if (!S_ISDIR(stat.mode))
+        return ERR_PTR(_ENOTDIR);
+    return ERR_PTR(_EOPNOTSUPP);
+}
+
+struct fd *generic_openat_norm(struct fd *at, const char *path_raw, int flags, int mode, int extra_norm) {
     if (flags & O_RDWR_ && flags & O_WRONLY_)
         return ERR_PTR(_EINVAL);
+    if (flags & O_TMPFILE_)
+        return generic_open_tmpfile(at, path_raw, flags);
 
     struct fd *procfd = procfd_openat(at, path_raw, flags);
     if (procfd != NULL)
@@ -411,14 +497,33 @@ static struct fd *generic_openat_norm(struct fd *at, const char *path_raw, int f
     // A trailing slash demands a directory; open() must not create through it.
     size_t raw_len = strlen(path_raw);
     bool trailing_slash = raw_len > 0 && path_raw[raw_len - 1] == '/';
-    struct mount *mount = find_mount_and_trim_path(path);
+    int mflags;
+    struct mount *mount = find_mount_and_trim_path_flags(path, &mflags);
     if (mount == NULL)
         return ERR_PTR(_ENOENT);
+    // Refusing the write-mode open is what Linux does for a read-only mount,
+    // and it is sufficient: an fd that cannot be opened for writing cannot be
+    // written through. O_TRUNC counts as a modification even with O_RDONLY,
+    // for the same reason it needs write permission.
+    if (mount_flags_readonly(mflags) &&
+            ((flags & (O_WRONLY_ | O_RDWR_ | O_CREAT_ | O_TRUNC_)) != 0)) {
+        mount_release(mount);
+        return ERR_PTR(_EROFS);
+    }
 
     bool created = false;
 
+    // A may_block filesystem (fusefs) waits on a userspace daemon inside its
+    // ops, so this function's inodes_lock serialization is skipped for it: the
+    // lock guards fakefs's real-op/metadata pairing, which such a filesystem
+    // doesn't have, and holding it across a daemon wait deadlocks (see
+    // kernel/fs.h). It is still taken briefly for the inode-table lookup at
+    // the end.
+    bool fs_blocks = mount->fs->may_block;
+
     struct statbuf stat;
-    lock(&inodes_lock, 0); // TODO: don't do this
+    if (!fs_blocks)
+        lock(&inodes_lock, 0); // TODO: don't do this
 
     // Stat before open so permission checks happen before backends can truncate
     // or otherwise mutate an existing file as a side effect of open.
@@ -427,7 +532,8 @@ static struct fd *generic_openat_norm(struct fd *at, const char *path_raw, int f
         if ((flags & O_CREAT_) && err == _ENOENT) {
             // "newname/" names a directory; open() cannot create one (EISDIR).
             if (trailing_slash) {
-                unlock(&inodes_lock);
+                if (!fs_blocks)
+                    unlock(&inodes_lock);
                 mount_release(mount);
                 return ERR_PTR(_EISDIR);
             }
@@ -458,18 +564,32 @@ static struct fd *generic_openat_norm(struct fd *at, const char *path_raw, int f
                 if (perr >= 0)
                     perr = access_check(&parent_stat, AC_W | AC_X);
                 if (perr < 0) {
-                    unlock(&inodes_lock);
+                    if (!fs_blocks)
+                        unlock(&inodes_lock);
                     mount_release(mount);
                     return ERR_PTR(perr);
                 }
             }
             created = true;
         } else {
-            unlock(&inodes_lock);
+            if (!fs_blocks)
+                unlock(&inodes_lock);
             mount_release(mount);
             return ERR_PTR(err);
         }
     } else {
+        // The target exists and O_EXCL says it must not: that is EEXIST, and
+        // Linux reports it before may_open() looks at permissions at all
+        // (do_last() bails on the excl check first). AOK left O_EXCL to the
+        // host open below, which sits after the target's own access check --
+        // so an O_CREAT|O_EXCL|O_WRONLY open of an existing file the caller
+        // cannot write reported EACCES where every Linux says EEXIST.
+        if ((flags & (O_CREAT_ | O_EXCL_)) == (O_CREAT_ | O_EXCL_)) {
+            if (!fs_blocks)
+                unlock(&inodes_lock);
+            mount_release(mount);
+            return ERR_PTR(_EEXIST);
+        }
         // O_NOFOLLOW: a final symlink we deliberately did not resolve is an
         // error -- unless O_PATH is also set, in which case Linux opens the
         // symlink ITSELF (fstat sees S_IFLNK, readlinkat(fd, "") returns the
@@ -477,7 +597,8 @@ static struct fd *generic_openat_norm(struct fd *at, const char *path_raw, int f
         // component this way, so without this any chase ending on a symlink
         // failed with ELOOP.
         if ((flags & O_NOFOLLOW_) && S_ISLNK(stat.mode)) {
-            unlock(&inodes_lock);
+            if (!fs_blocks)
+                unlock(&inodes_lock);
             if (flags & O_PATH_) {
                 if (flags & O_DIRECTORY_) {
                     mount_release(mount);
@@ -497,14 +618,27 @@ static struct fd *generic_openat_norm(struct fd *at, const char *path_raw, int f
         }
         // O_PATH ignores the access mode: Linux performs no read/write
         // permission check for O_PATH opens (the fd can't do I/O anyway).
-        if (!(flags & O_PATH_)) {
+        // O_NOACCESS_CHECK_ is internal (open_dir, for chdir/chroot): the
+        // caller has already applied the permission rule that governs it, and
+        // it is not this one.
+        if (!(flags & (O_PATH_ | O_NOACCESS_CHECK_))) {
             int accmode;
             if (flags & O_RDWR_) accmode = AC_R | AC_W;
             else if (flags & O_WRONLY_) accmode = AC_W;
             else accmode = AC_R;
+            // O_TRUNC destroys the contents, so it needs write permission even
+            // when the open itself is read-only. Without this, open(path,
+            // O_RDONLY|O_TRUNC) emptied any file the caller could merely READ
+            // -- a root-owned 0755 binary truncated to zero by an ordinary
+            // user. truncate(2) on the same file already returns EACCES, so
+            // this was the only way in. Guarded on S_ISREG because O_TRUNC is
+            // meaningless on other types, which is Linux's rule too.
+            if ((flags & O_TRUNC_) && S_ISREG(stat.mode))
+                accmode |= AC_W;
             err = access_check(&stat, accmode);
             if (err < 0) {
-                unlock(&inodes_lock);
+                if (!fs_blocks)
+                    unlock(&inodes_lock);
                 mount_release(mount);
                 return ERR_PTR(err);
             }
@@ -524,7 +658,8 @@ static struct fd *generic_openat_norm(struct fd *at, const char *path_raw, int f
         // and regular files keep the real-open path: their O_PATH fds are
         // routinely used as dirfds, which the pseudo-fd doesn't support.
         if ((flags & O_PATH_) && (S_ISSOCK(stat.mode) || S_ISFIFO(stat.mode))) {
-            unlock(&inodes_lock);
+            if (!fs_blocks)
+                unlock(&inodes_lock);
             if (flags & O_DIRECTORY_) {
                 mount_release(mount);
                 return ERR_PTR(_ENOTDIR);
@@ -539,6 +674,22 @@ static struct fd *generic_openat_norm(struct fd *at, const char *path_raw, int f
             pfd->flags = flags;
             return pfd;
         }
+
+        // MS_NODEV: on such a mount a device node is not a device, and Linux
+        // refuses to open it at all (may_open_dev -> EACCES). AOK recorded the
+        // flag and printed it in /proc/mounts but never consulted it, so
+        // `mount -o nodev` on untrusted media -- and every container runtime
+        // that relies on it -- got a mount that opened character and block
+        // devices exactly as if the flag had never been passed. O_PATH is
+        // exempt because it opens no device: it makes a path handle, and
+        // Linux skips may_open for it entirely.
+        if ((mflags & MS_NODEV_) && !(flags & O_PATH_) &&
+                (S_ISCHR(stat.mode) || S_ISBLK(stat.mode))) {
+            if (!fs_blocks)
+                unlock(&inodes_lock);
+            mount_release(mount);
+            return ERR_PTR(_EACCES);
+        }
     }
 
     // mount->fs->open can issue a host open() that blocks indefinitely -- most
@@ -548,7 +699,7 @@ static struct fd *generic_openat_norm(struct fd *at, const char *path_raw, int f
     // wedges every other open() in the emulator -- the whole app appears to
     // freeze. Drop the lock around the open for files that can block, and
     // re-acquire it for the inode bookkeeping below.
-    bool open_may_block = !created && S_ISFIFO(stat.mode) && !(flags & O_NONBLOCK_);
+    bool open_may_block = !fs_blocks && !created && S_ISFIFO(stat.mode) && !(flags & O_NONBLOCK_);
     if (open_may_block)
         unlock(&inodes_lock);
     // Strip O_PATH before handing flags to the backend: its bit value
@@ -560,19 +711,24 @@ static struct fd *generic_openat_norm(struct fd *at, const char *path_raw, int f
     if (open_may_block)
         lock(&inodes_lock, 0);
     if (IS_ERR(fd)) {
-        unlock(&inodes_lock);
+        if (!fs_blocks)
+            unlock(&inodes_lock);
         // if an error happens after this point, fd_close will release the
         // mount, but right now we need to do it manually
         mount_release(mount);
         return fd;
     }
     fd->mount = mount;
+    fd->mount_flags = mflags;
 
     err = fd->mount->fs->fstat(fd, &stat);
     if (err < 0) {
-        unlock(&inodes_lock);
+        if (!fs_blocks)
+            unlock(&inodes_lock);
         goto error;
     }
+    if (fs_blocks)
+        lock(&inodes_lock, 0);
     fd->inode = inode_get_unlocked(mount, stat.inode);
     unlock(&inodes_lock);
     fd->type = stat.mode & S_IFMT;
@@ -614,9 +770,10 @@ static struct fd *generic_openat_norm(struct fd *at, const char *path_raw, int f
     err = _ENOTDIR;
     if (!S_ISDIR(fd->type) && flags & O_DIRECTORY_)
         goto error;
-    inotify_notify_open(guest_path);
+    // Creation is reported before the open that caused it, as in Linux.
     if (created)
         inotify_notify_create(guest_path, S_ISDIR(fd->type));
+    inotify_notify_open(guest_path);
     return fd;
 
 error:
@@ -705,11 +862,17 @@ int generic_linkat(struct fd *src_at, const char *src_raw, struct fd *dst_at, co
     if (err < 0)
         return err;
     char dst[MAX_PATH];
-    err = path_normalize(dst_at, dst_raw, dst, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE);
+    err = path_normalize(dst_at, dst_raw, dst, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST);
     if (err < 0)
         return err;
-    struct mount *mount = find_mount_and_trim_path(src);
-    struct mount *dst_mount = find_mount_and_trim_path(dst);
+    // Pre-trim copies for inotify; see generic_openat.
+    char guest_src[MAX_PATH], guest_dst[MAX_PATH];
+    strcpy(guest_src, src);
+    strcpy(guest_dst, dst);
+    int mflags;
+    struct mount *mount = find_mount_and_trim_path_flags(src, &mflags);
+    int dst_mflags;
+    struct mount *dst_mount = find_mount_and_trim_path_flags(dst, &dst_mflags);
     if (mount == NULL || dst_mount == NULL) {
         if (mount != NULL)
             mount_release(mount);
@@ -717,20 +880,35 @@ int generic_linkat(struct fd *src_at, const char *src_raw, struct fd *dst_at, co
             mount_release(dst_mount);
         return _ENOENT;
     }
+    if (mount_flags_readonly(mflags) || mount_flags_readonly(dst_mflags)) {
+        mount_release(mount);
+        mount_release(dst_mount);
+        return _EROFS;
+    }
     // Serialize against generic_openat/generic_mkdirat/etc. on the same path:
     // see the inodes_lock comment in generic_openat for why fakefs needs this
     // (a mutating fs op is a real-host-op + SQLite-metadata-update pair that
     // isn't atomic against a concurrent one of these on its own).
-    lock(&inodes_lock, 0); // TODO: don't do this
+    bool fs_blocks = mount->fs->may_block; // see generic_openat
+    if (!fs_blocks)
+        lock(&inodes_lock, 0); // TODO: don't do this
     if (mount != dst_mount)
         err = _EXDEV;
     else if (mount->fs->link == NULL)
         err = _EPERM;
     else
         err = mount->fs->link(mount, src, dst);
-    unlock(&inodes_lock);
+    if (!fs_blocks)
+        unlock(&inodes_lock);
     mount_release(mount);
     mount_release(dst_mount);
+    if (err >= 0) {
+        // Linux reports a new link two ways: IN_ATTRIB on the inode whose link
+        // count changed, and IN_CREATE in the directory that gained the name.
+        // link() emitted neither, so a file grew a second name with no event.
+        inotify_notify_attrib(guest_src);
+        inotify_notify_create(guest_dst, false);
+    }
     return err;
 }
 
@@ -738,7 +916,6 @@ int generic_linkat(struct fd *src_at, const char *src_raw, struct fd *dst_at, co
 // as /tmp has), you may only remove or rename an entry if you own the entry,
 // own the directory, or are privileged. Without this a world-writable /tmp is
 // not safe -- any user can delete anyone else's files.
-#define S_ISVTX_ 01000
 static int sticky_check(struct mount *mount, const char *path, struct statbuf *entry_stat) {
     if (superuser())
         return 0;
@@ -747,10 +924,16 @@ static int sticky_check(struct mount *mount, const char *path, struct statbuf *e
     char parent[MAX_PATH];
     strcpy(parent, path);
     char *slash = strrchr(parent, '/');
-    if (slash == NULL)
-        return 0;
-    if (slash == parent)
-        parent[1] = '\0'; // entry sits directly in the mount root
+    // The mount root is spelled "" -- what find_mount_and_trim_path leaves for
+    // a path that IS the mount point -- not "/". Asking for "/" made the stat
+    // below return ENOENT, so sticky_check bailed and allowed the unlink: any
+    // user could delete another's files sitting directly in the root of a
+    // sticky mount, while entries one level deeper were correctly refused.
+    // Both spellings of "no directory part" mean the mount root, because a
+    // trimmed path may or may not keep its leading slash depending on the
+    // mount's point_len.
+    if (slash == NULL || slash == parent)
+        parent[0] = '\0';
     else
         *slash = '\0';
     struct statbuf dir_stat;
@@ -771,33 +954,43 @@ int generic_unlinkat(struct fd *at, const char *path_raw) {
     if (path_final_dot(path_raw))
         return _EISDIR;
     char path[MAX_PATH];
-    int err = path_normalize(at, path_raw, path, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE);
+    int err = path_normalize(at, path_raw, path,
+            N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_REMOVE_ENOENT_FIRST);
     if (err < 0)
         return err;
     char guest_path[MAX_PATH]; // pre-trim path for inotify; see generic_openat
     strcpy(guest_path, path);
-    struct mount *mount = find_mount_and_trim_path(path);
+    int mflags;
+    struct mount *mount = find_mount_and_trim_path_flags(path, &mflags);
     if (mount == NULL)
         return _ENOENT;
+    if (mount_flags_readonly(mflags)) {
+        mount_release(mount);
+        return _EROFS;
+    }
     // See the inodes_lock comment in generic_openat: this serializes the
     // stat-check + unlink pair against a concurrent open(O_CREAT)/mkdir/etc.
     // on the same path, so fakefs's real-op + metadata-update pair can't
     // interleave with another one and leave the metadata mismatched with
     // what's actually on the host filesystem.
-    lock(&inodes_lock, 0); // TODO: don't do this
+    bool fs_blocks = mount->fs->may_block; // see generic_openat
+    if (!fs_blocks)
+        lock(&inodes_lock, 0); // TODO: don't do this
     // Linux reports EISDIR for unlink of a directory. Enforce it here so the
     // host's own errno (EPERM on Darwin/iOS hosts) does not leak to the guest.
     struct statbuf ust;
     bool have_ust = mount->fs->stat(mount, path, &ust) >= 0;
     if (have_ust && S_ISDIR(ust.mode)) {
-        unlock(&inodes_lock);
+        if (!fs_blocks)
+            unlock(&inodes_lock);
         mount_release(mount);
         return _EISDIR;
     }
     if (have_ust) {
         err = sticky_check(mount, path, &ust);
         if (err < 0) {
-            unlock(&inodes_lock);
+            if (!fs_blocks)
+                unlock(&inodes_lock);
             mount_release(mount);
             return err;
         }
@@ -805,7 +998,8 @@ int generic_unlinkat(struct fd *at, const char *path_raw) {
     err = _EPERM;
     if (mount->fs->unlink)
         err = mount->fs->unlink(mount, path);
-    unlock(&inodes_lock);
+    if (!fs_blocks)
+        unlock(&inodes_lock);
     mount_release(mount);
     if (err >= 0)
         inotify_notify_delete(guest_path, false);
@@ -825,7 +1019,11 @@ int generic_renameat(struct fd *src_at, const char *src_raw, struct fd *dst_at, 
     // Linux requires write+exec on both the source and destination parent
     // directories for rename (removing the entry from one, adding it to the
     // other), not just the destination.
-    int err = path_normalize(src_at, src_raw, src, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE);
+    // ENOENT-first on the SOURCE only: a source that is not there is ENOENT
+    // even from an unwritable parent, while a destination that is not there is
+    // the ordinary case and leaves the permission error standing.
+    int err = path_normalize(src_at, src_raw, src,
+            N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_REMOVE_ENOENT_FIRST);
     if (err < 0)
         return err;
     char dst[MAX_PATH];
@@ -837,8 +1035,10 @@ int generic_renameat(struct fd *src_at, const char *src_raw, struct fd *dst_at, 
     char guest_src[MAX_PATH], guest_dst[MAX_PATH]; // pre-trim paths for inotify
     strcpy(guest_src, src);
     strcpy(guest_dst, dst);
-    struct mount *mount = find_mount_and_trim_path(src);
-    struct mount *dst_mount = find_mount_and_trim_path(dst);
+    int mflags;
+    struct mount *mount = find_mount_and_trim_path_flags(src, &mflags);
+    int dst_mflags;
+    struct mount *dst_mount = find_mount_and_trim_path_flags(dst, &dst_mflags);
     if (mount == NULL || dst_mount == NULL) {
         if (mount != NULL)
             mount_release(mount);
@@ -846,10 +1046,17 @@ int generic_renameat(struct fd *src_at, const char *src_raw, struct fd *dst_at, 
             mount_release(dst_mount);
         return _ENOENT;
     }
+    if (mount_flags_readonly(mflags) || mount_flags_readonly(dst_mflags)) {
+        mount_release(mount);
+        mount_release(dst_mount);
+        return _EROFS;
+    }
     // See the inodes_lock comment in generic_openat: serialize the
     // stat-check(s) + rename pair against a concurrent open(O_CREAT)/mkdir/
     // unlink/etc. on either path.
-    lock(&inodes_lock, 0); // TODO: don't do this
+    bool fs_blocks = mount->fs->may_block; // see generic_openat
+    if (!fs_blocks)
+        lock(&inodes_lock, 0); // TODO: don't do this
     bool is_dir = false;
     if (mount != dst_mount)
         err = _EXDEV;
@@ -874,7 +1081,8 @@ int generic_renameat(struct fd *src_at, const char *src_raw, struct fd *dst_at, 
                 err = mount->fs->rename(mount, src, dst);
         }
     }
-    unlock(&inodes_lock);
+    if (!fs_blocks)
+        unlock(&inodes_lock);
     mount_release(mount);
     mount_release(dst_mount);
     if (err >= 0)
@@ -890,22 +1098,30 @@ int generic_symlinkat(const char *target, struct fd *at, const char *link_raw) {
     // path_final_dot().
     if (path_final_dot(link_raw))
         return _EEXIST;
-    int err = path_normalize(at, link_raw, link, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE);
+    int err = path_normalize(at, link_raw, link, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST);
     if (err < 0)
         return err;
     char guest_path[MAX_PATH]; // pre-trim path for inotify; see generic_openat
     strcpy(guest_path, link);
-    struct mount *mount = find_mount_and_trim_path(link);
+    int mflags;
+    struct mount *mount = find_mount_and_trim_path_flags(link, &mflags);
     if (mount == NULL)
         return _ENOENT;
+    if (mount_flags_readonly(mflags)) {
+        mount_release(mount);
+        return _EROFS;
+    }
     // See the inodes_lock comment in generic_openat: serializes the
     // real-symlink-create + metadata-write pair against a concurrent
     // open(O_CREAT)/mkdir/unlink/etc. on the same path.
-    lock(&inodes_lock, 0); // TODO: don't do this
+    bool fs_blocks = mount->fs->may_block; // see generic_openat
+    if (!fs_blocks)
+        lock(&inodes_lock, 0); // TODO: don't do this
     err = _EPERM;
     if (mount->fs->symlink)
         err = mount->fs->symlink(mount, target, link);
-    unlock(&inodes_lock);
+    if (!fs_blocks)
+        unlock(&inodes_lock);
     mount_release(mount);
     if (err >= 0)
         inotify_notify_create(guest_path, false);
@@ -921,22 +1137,30 @@ int generic_mknodat(struct fd *at, const char *path_raw, mode_t_ mode, dev_t_ de
         return _EPERM;
 
     char path[MAX_PATH];
-    int err = path_normalize(at, path_raw, path, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE);
+    int err = path_normalize(at, path_raw, path, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST);
     if (err < 0)
         return err;
     char guest_path[MAX_PATH]; // pre-trim path for inotify; see generic_openat
     strcpy(guest_path, path);
-    struct mount *mount = find_mount_and_trim_path(path);
+    int mflags;
+    struct mount *mount = find_mount_and_trim_path_flags(path, &mflags);
     if (mount == NULL)
         return _ENOENT;
+    if (mount_flags_readonly(mflags)) {
+        mount_release(mount);
+        return _EROFS;
+    }
     // See the inodes_lock comment in generic_openat: serializes the
     // real-mknod + metadata-write pair against a concurrent
     // open(O_CREAT)/mkdir/unlink/etc. on the same path.
-    lock(&inodes_lock, 0); // TODO: don't do this
+    bool fs_blocks = mount->fs->may_block; // see generic_openat
+    if (!fs_blocks)
+        lock(&inodes_lock, 0); // TODO: don't do this
     err = _EPERM;
     if (mount->fs->mknod)
         err = mount->fs->mknod(mount, path, mode, dev);
-    unlock(&inodes_lock);
+    if (!fs_blocks)
+        unlock(&inodes_lock);
     mount_release(mount);
     if (err >= 0)
         inotify_notify_create(guest_path, false);
@@ -950,9 +1174,14 @@ int generic_setattrat(struct fd *at, const char *path_raw, struct attr attr, boo
         return err;
     char guest_path[MAX_PATH]; // pre-trim path for inotify; see generic_openat
     strcpy(guest_path, path);
-    struct mount *mount = find_mount_and_trim_path(path);
+    int mflags;
+    struct mount *mount = find_mount_and_trim_path_flags(path, &mflags);
     if (mount == NULL)
         return _ENOENT;
+    if (mount_flags_readonly(mflags)) {
+        mount_release(mount);
+        return _EROFS;
+    }
     struct statbuf stat = {};
     err = mount->fs->stat(mount, path, &stat);
     if (err >= 0)
@@ -979,9 +1208,14 @@ int generic_utime(struct fd *at, const char *path_raw, struct timespec atime, st
     int err = path_normalize(at, path_raw, path, follow_links ? N_SYMLINK_FOLLOW : N_SYMLINK_NOFOLLOW);
     if (err < 0)
         return err;
-    struct mount *mount = find_mount_and_trim_path(path);
+    int mflags;
+    struct mount *mount = find_mount_and_trim_path_flags(path, &mflags);
     if (mount == NULL)
         return _ENOENT;
+    if (mount_flags_readonly(mflags)) {
+        mount_release(mount);
+        return _EROFS;
+    }
     err = _EPERM;
     if (mount->fs->utime)
         err = mount->fs->utime(mount, path, atime, mtime, follow_links);
@@ -994,7 +1228,8 @@ ssize_t generic_readlinkat(struct fd *at, const char *path_raw, char *buf, size_
     int err = path_normalize(at, path_raw, path, N_SYMLINK_NOFOLLOW);
     if (err < 0)
         return err;
-    struct mount *mount = find_mount_and_trim_path(path);
+    int mflags;
+    struct mount *mount = find_mount_and_trim_path_flags(path, &mflags);
     if (mount == NULL)
         return _ENOENT;
     err = _EINVAL;
@@ -1010,34 +1245,44 @@ int generic_mkdirat(struct fd *at, const char *path_raw, mode_t_ mode) {
         return _EEXIST;
     // The final component is the name being created and is never followed, so
     // mkdir over an existing (even dangling) symlink reports EEXIST like Linux.
-    int err = path_normalize(at, path_raw, path, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE);
+    int err = path_normalize(at, path_raw, path, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST);
     if (err < 0)
         return err;
     char guest_path[MAX_PATH]; // pre-trim path for inotify; see generic_openat
     strcpy(guest_path, path);
-    struct mount *mount = find_mount_and_trim_path(path);
+    int mflags;
+    struct mount *mount = find_mount_and_trim_path_flags(path, &mflags);
     if (mount == NULL)
         return _ENOENT;
+    if (mount_flags_readonly(mflags)) {
+        mount_release(mount);
+        return _EROFS;
+    }
     // See the inodes_lock comment in generic_openat: serializes the
     // exists-check + real-mkdir + metadata-write against a concurrent
     // open(O_CREAT)/unlink/mkdir/etc. on the same path.
-    lock(&inodes_lock, 0); // TODO: don't do this
+    bool fs_blocks = mount->fs->may_block; // see generic_openat
+    if (!fs_blocks)
+        lock(&inodes_lock, 0); // TODO: don't do this
     struct statbuf stat;
     err = mount->fs->stat(mount, path, &stat);
     if (err == 0) {
-        unlock(&inodes_lock);
+        if (!fs_blocks)
+            unlock(&inodes_lock);
         mount_release(mount);
         return _EEXIST;
     }
     if (err < 0 && err != _ENOENT) {
-        unlock(&inodes_lock);
+        if (!fs_blocks)
+            unlock(&inodes_lock);
         mount_release(mount);
         return err;
     }
     err = _EPERM;
     if (mount->fs->mkdir)
         err = mount->fs->mkdir(mount, path, mode);
-    unlock(&inodes_lock);
+    if (!fs_blocks)
+        unlock(&inodes_lock);
     mount_release(mount);
     if (err >= 0)
         inotify_notify_create(guest_path, true);
@@ -1054,25 +1299,34 @@ int generic_rmdirat(struct fd *at, const char *path_raw) {
     if (dot == 2)
         return _ENOTEMPTY;
     // rmdir does not follow a final symlink: rmdir("symlink-to-dir") is ENOTDIR.
-    int err = path_normalize(at, path_raw, path, N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE);
+    int err = path_normalize(at, path_raw, path,
+            N_SYMLINK_NOFOLLOW | N_PARENT_DIR_WRITE | N_REMOVE_ENOENT_FIRST);
     if (err < 0)
         return err;
     if (contains_mount_point(path))
         return _EBUSY;
     char guest_path[MAX_PATH]; // pre-trim path for inotify; see generic_openat
     strcpy(guest_path, path);
-    struct mount *mount = find_mount_and_trim_path(path);
+    int mflags;
+    struct mount *mount = find_mount_and_trim_path_flags(path, &mflags);
     if (mount == NULL)
         return _ENOENT;
+    if (mount_flags_readonly(mflags)) {
+        mount_release(mount);
+        return _EROFS;
+    }
     // See the inodes_lock comment in generic_openat: serializes the
     // real-rmdir + metadata-update against a concurrent
     // open(O_CREAT)/mkdir/unlink/etc. on the same path.
-    lock(&inodes_lock, 0); // TODO: don't do this
+    bool fs_blocks = mount->fs->may_block; // see generic_openat
+    if (!fs_blocks)
+        lock(&inodes_lock, 0); // TODO: don't do this
     struct statbuf dst_stat;
     if (mount->fs->stat(mount, path, &dst_stat) >= 0) {
         err = sticky_check(mount, path, &dst_stat);
         if (err < 0) {
-            unlock(&inodes_lock);
+            if (!fs_blocks)
+                unlock(&inodes_lock);
             mount_release(mount);
             return err;
         }
@@ -1080,7 +1334,8 @@ int generic_rmdirat(struct fd *at, const char *path_raw) {
     err = _EPERM;
     if (mount->fs->rmdir)
         err = mount->fs->rmdir(mount, path);
-    unlock(&inodes_lock);
+    if (!fs_blocks)
+        unlock(&inodes_lock);
     mount_release(mount);
     if (err >= 0)
         inotify_notify_delete(guest_path, true);

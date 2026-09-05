@@ -13,7 +13,10 @@
 #include "kernel/time.h"
 #include "kernel/resource.h"
 #include "kernel/ptrace.h"
+#include "kernel/aio.h"
 
+// See kernel/calls.c: cancels a pending _ERESTART_NOHAND rewind.
+void cancel_syscall_restart(void);
 void handle_interrupt(int interrupt);
 // One syscall on behalf of a natively-compiled program (kernel/native.h),
 // reached from host code instead of from a guest trap. Numbering is
@@ -75,6 +78,14 @@ guest_addr_t sys_brk_guest(guest_addr_t new_brk);
 
 #define MMAP_SHARED 0x1
 #define MMAP_PRIVATE 0x2
+// MAP_SHARED_VALIDATE is spelled as both bits together: MAP_SHARED with
+// strict rejection of flags the kernel does not recognise.
+#define MMAP_SHARED_VALIDATE 0x3
+// PROT_SEM asks for a mapping usable for atomics. Every mapping here already
+// is, and Linux accepts and ignores it on every architecture -- but its guest
+// value collides with P_GROWSDOWN in the internal page flags, so it must be
+// stripped rather than passed through.
+#define PROT_SEM_ 0x8
 #define MMAP_FIXED 0x10
 #define MMAP_ANONYMOUS 0x20
 #define MMAP_FIXED_NOREPLACE 0x100000
@@ -227,6 +238,9 @@ int_t sys_inotify_rm_watch(fd_t fd, int_t wd);
 int_t sys_memfd_create(addr_t name_addr, uint_t flags);
 int_t sys_memfd_create_guest(guest_addr_t name_addr, uint_t flags);
 struct fd;
+// Called from emu/memory.c when a mapping that was counted as a live writable
+// shared mapping of a memfd is torn down. A no-op for any other kind of fd.
+void memfd_mapping_released(struct fd *fd);
 int_t memfd_add_seals(struct fd *fd, uint_t arg);
 int_t memfd_get_seals(struct fd *fd);
 
@@ -357,6 +371,10 @@ dword_t sys_sendfile(fd_t out_fd, fd_t in_fd, addr_t offset_addr, dword_t count)
 dword_t sys_sendfile64(fd_t out_fd, fd_t in_fd, addr_t offset_addr, dword_t count);
 dword_t sys_sendfile_guest(fd_t out_fd, fd_t in_fd, guest_addr_t offset_addr, uint64_t count);
 dword_t sys_splice(fd_t in_fd, addr_t in_off_addr, fd_t out_fd, addr_t out_off_addr, dword_t count, dword_t flags);
+dword_t sys_splice_guest(fd_t in_fd, guest_addr_t in_off_addr, fd_t out_fd, guest_addr_t out_off_addr, uint64_t count, dword_t flags);
+dword_t sys_vmsplice(fd_t f, addr_t iov_addr, dword_t iov_count, dword_t flags);
+dword_t sys_vmsplice_guest(fd_t f, guest_addr_t iov_addr, uint64_t iov_count, dword_t flags);
+dword_t sys_tee(fd_t in_fd, fd_t out_fd, dword_t count, dword_t flags);
 dword_t sys_copy_file_range(fd_t in_fd, addr_t in_off, fd_t out_fd, addr_t out_off, dword_t len, uint_t flags);
 dword_t sys_copy_file_range_guest(fd_t in_fd, guest_addr_t in_off, fd_t out_fd, guest_addr_t out_off, uint64_t len, uint_t flags);
 

@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include "kernel/calls.h"
+#include "kernel/native.h"
 #include "kernel/inotify.h"
 #include "kernel/task.h"
 #include "fs/fd.h"
@@ -105,6 +106,9 @@ struct audit_features_ {
 
 #define SOCK_DIAG_BY_FAMILY_ 20
 
+// A socket's network namespace, as an nsfs fd. Privileged on Linux -- it
+// needs CAP_SYS_ADMIN in the target namespace -- and EPERM without it.
+#define SIOCGSKNS_ 0x894c
 #define SIOCGIFNAME_ 0x8910
 #define SIOCGIFCONF_ 0x8912
 #define SIOCGIFFLAGS_ 0x8913
@@ -1341,6 +1345,16 @@ static lock_t peer_lock = LOCK_INITIALIZER;
 #define DEFAULT_TCP_CONGESTION "cubic"
 
 static void sock_init_emulation_defaults(struct fd *fd);
+// Linux's socket-buffer conventions, as the guest observes them.
+// SOCK_MIN_RCVBUF/SOCK_MIN_SNDBUF are the floors sock_setsockopt applies
+// after doubling; SOCK_MEM_MAX is net.core.{r,w}mem_max, which AOK already
+// reports as 212992 in /proc/sys/net/core (fs/proc/sys.c) -- the two have to
+// agree, or a program that reads the limit and then sets it gets a different
+// number back.
+#define SOCK_MIN_RCVBUF 2304
+#define SOCK_MIN_SNDBUF 4608
+#define SOCK_MEM_MAX 212992
+
 static bool sockopt_is_linux_soft_unsupported(dword_t level, dword_t option);
 static ssize_t sock_ioctl_size(int cmd);
 
@@ -1890,11 +1904,31 @@ static void sock_trace_tcp_info(const char *label, struct fd *sock) {
 }
 #endif
 
+// The same question realfs_guest_signal_pending() asks, and it has to be
+// answered the same way -- these are the two I/O paths a native program can be
+// blocked in from inside a host stdio callback, where signal delivery is
+// deliberately deferred (native_delivery_deferred) so a handler cannot longjmp
+// out of stdio's frames with its FILE lock held. A signal the program marked
+// SA_RESTART must not cut the transfer short there: the handler will not run,
+// so the interruption buys nothing and the caller sees an EINTR that Linux
+// would have hidden. Waiting is exactly what SA_RESTART asked for.
+//
+// Everything else still interrupts, which is the half that matters: a fatal
+// signal is never shim-held, so a native program stuck on a full socket still
+// fails its callback, unwinds stdio and dies.
+//
+// Unlike fs/real.c this path already attempted the I/O before asking -- the
+// host call runs non-blocking and only an EAGAIN reaches socket_wait_ready --
+// so the "a transfer that could not block was failed anyway" half of that bug
+// never existed here.
 static bool socket_guest_signal_pending(void) {
     lock(&current->sighand->lock, 0);
-    bool signal_pending = !!((current->pending | current->sighand->pending) & ~task_wake_blocked(current));
+    sigset_t_ pending = (current->pending | current->sighand->pending) &
+            ~task_wake_blocked(current);
+    if (native_delivery_deferred())
+        pending &= ~__atomic_load_n(&current->native_restart, __ATOMIC_ACQUIRE);
     unlock(&current->sighand->lock);
-    return signal_pending;
+    return !!pending;
 }
 
 static bool socket_should_retry_io_eintr(struct fd *sock, int real_flags) {
@@ -2133,7 +2167,14 @@ static int socket_wait_ready(struct fd *sock, short events, struct socket_io_wai
         // purely spurious poke (a TLB-shootdown SIGUSR1, or a notify for a
         // signal this task has blocked) just re-enters the wait.
         if (socket_guest_signal_pending()) {
-            err = _EINTR;
+            // SA_RESTART: the blocking socket calls are restartable, EXCEPT
+            // when SO_RCVTIMEO/SO_SNDTIMEO is armed -- signal(7) puts a
+            // timed socket wait in the never-restarted list, because a
+            // restart would silently extend a timeout the guest asked for.
+            // A NULL `wait` is one of iSH's own internal handshakes, which
+            // has no guest syscall to restart.
+            err = (wait != NULL && !wait->has_deadline)
+                    ? signal_restart_or_eintr(_EINTR) : _EINTR;
             break;
         }
     }
@@ -2392,10 +2433,38 @@ static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol) {
     if (fd == NULL)
         return _ENOMEM;
     fd->stat.mode = S_IFSOCK | 0666;
+    // A socket's inode belongs to whoever created it. adhoc_fd_create zeroes
+    // the whole statbuf, so this was uid 0 -- every socket in the system
+    // looked root-owned, and an unprivileged process could not set the times
+    // on a socket it had made itself: futimens answered EPERM where Linux
+    // succeeds (measured on 6.12, where sockfs and pipefs carry the creator's
+    // uid while the anon_inode family -- eventfd, epoll, timerfd, signalfd --
+    // really is root-owned and really does answer EPERM). fs/pipe.c has always
+    // done this; sockets were simply missed.
+    fd->stat.uid = current->uid;
+    fd->stat.gid = current->gid;
+    // fd->type is set by generic_open for path-opened files; a socket() fd
+    // never goes through that, so it was left 0 and every S_ISSOCK(fd->type)
+    // test in the tree read false for an actual socket -- including the poll
+    // layer's, which needs it to tell a half-close from a hangup, and the
+    // inotify close notification, which Linux does not emit for sockets.
+    fd->type = S_IFSOCK;
     fd->real_fd = sock_fd;
     fd->socket.domain = domain;
     fd->socket.type = type & SOCKET_TYPE_MASK;
+    // SO_PROTOCOL reports the protocol the socket ACTUALLY speaks, which for
+    // the usual socket(AF_INET, SOCK_STREAM, 0) form is the family/type
+    // default rather than the 0 that was passed in. Storing the raw argument
+    // meant every default-protocol socket reported 0, so a caller using
+    // SO_PROTOCOL to find out what it had -- which is what the option is for
+    // -- learned nothing. Resolved once, here, where the type is known.
     fd->socket.protocol = protocol;
+    if (protocol == 0 && (domain == AF_INET_ || domain == AF_INET6_)) {
+        switch (type & SOCKET_TYPE_MASK) {
+            case SOCK_STREAM_: fd->socket.protocol = IPPROTO_TCP; break;
+            case SOCK_DGRAM_:  fd->socket.protocol = IPPROTO_UDP; break;
+        }
+    }
     sock_init_emulation_defaults(fd);
     if (domain == AF_LOCAL_) {
         cond_init(&fd->socket.unix_got_peer);
@@ -2459,6 +2528,15 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
         if (fd == NULL)
             return _ENOMEM;
         fd->stat.mode = S_IFSOCK | 0666;
+        // Same ownership as the socket() path above: the creator's, not root's.
+        fd->stat.uid = current->uid;
+        fd->stat.gid = current->gid;
+    // fd->type is set by generic_open for path-opened files; a socket() fd
+    // never goes through that, so it was left 0 and every S_ISSOCK(fd->type)
+    // test in the tree read false for an actual socket -- including the poll
+    // layer's, which needs it to tell a half-close from a hangup, and the
+    // inotify close notification, which Linux does not emit for sockets.
+    fd->type = S_IFSOCK;
         fd->real_fd = -1;
         fd->socket.domain = domain;
         fd->socket.type = socket_type;
@@ -2469,12 +2547,42 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
         netlink_notify_register(fd);
         return f_install(fd, type & ~SOCKET_TYPE_MASK);
     }
+    // Three different failures were all reported as EINVAL, and a program
+    // probing for what this kernel supports could not tell them apart. Linux
+    // is specific, and the distinction is the point of having these errnos:
+    //   an address family that does not exist   -> EAFNOSUPPORT
+    //   a type that is not a socket type at all -> EINVAL
+    //   a protocol the family/type cannot speak -> EPROTONOSUPPORT
+    //
+    // The AF_UNIX normalisation is Linux's unix_create: protocol 0 and PF_UNIX
+    // (1) are both accepted, anything else is EPROTONOSUPPORT. Without it
+    // socket(AF_UNIX, SOCK_STREAM, 1) failed, and libraries do write that.
+    // socketpair() below gets the same treatment -- it shares __sock_create on
+    // Linux, so it shares the rules.
     int real_domain = sock_family_to_real(domain);
     if (real_domain < 0)
+        return _EAFNOSUPPORT;
+    // Both halves of the type word: the low bits name a socket type, the high
+    // bits are SOCK_NONBLOCK/SOCK_CLOEXEC and nothing else. Linux checks the
+    // flag half first, which is why socket(AF_INET, 99, 0) is EINVAL even
+    // though 99 & SOCK_TYPE_MASK is a perfectly good type.
+    if (type & ~(SOCKET_TYPE_MASK | SOCK_NONBLOCK_ | SOCK_CLOEXEC_))
         return _EINVAL;
+    switch (type & SOCKET_TYPE_MASK) {
+        case SOCK_STREAM_: case SOCK_DGRAM_:
+        case SOCK_RAW_: case SOCK_SEQPACKET_:
+            break;
+        default:
+            return _EINVAL;
+    }
+    if (domain == PF_LOCAL_) {
+        if (protocol != 0 && protocol != PF_LOCAL_)
+            return _EPROTONOSUPPORT;
+        protocol = 0;
+    }
     int real_type = sock_type_to_real(type, protocol);
     if (real_type < 0)
-        return _EINVAL;
+        return _EPROTONOSUPPORT;
 
     // this hack makes mtr work
     if (type == SOCK_RAW_ && protocol == IPPROTO_RAW)
@@ -2796,18 +2904,36 @@ static bool sock_bound_inet_conflicts(struct fd *sock, const struct inet_bind_in
             // accepted socket returns the same local port), so without this
             // check any live connection -- e.g. the very ssh session used to
             // restart sshd -- would falsely block a fresh bind() on that port.
-            if (!other->socket.listening)
-                continue;
+            //
+            // A DEFERRED bind counts too, and has to: it holds the slot from
+            // the guest's point of view while deliberately not holding it on
+            // the host, so the host can no longer be the thing that reports
+            // the conflict. Its address comes from what bind() was told,
+            // because the host does not have one for it yet.
             struct sockaddr_storage other_addr = {};
             socklen_t other_addr_len = sizeof(other_addr);
-            if (getsockname(other->real_fd, (struct sockaddr *) &other_addr, &other_addr_len) < 0)
+            if (other->socket.bind_deferred) {
+                other_addr_len = other->socket.deferred_addr_len;
+                if (other_addr_len > sizeof(other_addr))
+                    other_addr_len = sizeof(other_addr);
+                memcpy(&other_addr, other->socket.deferred_addr, other_addr_len);
+            } else if (!other->socket.listening) {
                 continue;
+            } else if (getsockname(other->real_fd, (struct sockaddr *) &other_addr,
+                        &other_addr_len) < 0) {
+                continue;
+            }
             struct inet_bind_info other_info = {};
             if (!inet_bind_info_from_sockaddr((const struct sockaddr *) &other_addr, &other_info))
                 continue;
             if (!inet_bind_addr_overlaps(candidate, &other_info))
                 continue;
-            if (sock->socket.reuseport && other->socket.reuseport)
+            // Linux has required identical socket euid across an
+            // SO_REUSEPORT group since v3.9, precisely so an unprivileged user
+            // cannot join a root daemon's port and take its connections. We
+            // checked only that both had the flag set.
+            if (sock->socket.reuseport && other->socket.reuseport &&
+                    sock->socket.bind_euid == other->socket.bind_euid)
                 continue;
             conflict = true;
             break;
@@ -3495,6 +3621,19 @@ static int unix_socket_get(const char *path_raw, struct fd *bind_fd, uint32_t *s
         goto out;
     }
 
+    // Connecting to a unix socket needs write permission on the socket file --
+    // Linux's unix_find_other() calls inode_permission(MAY_WRITE) at exactly
+    // this point. Without it the socket's own mode meant nothing: mode 0700,
+    // 0666 and even 0000 all connected for any uid, so every daemon whose
+    // access control IS its socket mode (0660 root:docker and friends) was
+    // open to the whole guest. Only bind is exempt -- it is creating the
+    // socket, not reaching one that already exists.
+    if (bind_fd == NULL) {
+        err = access_check(&stat, AC_W);
+        if (err < 0)
+            goto out;
+    }
+
     // Look up the socket ID for the inode number.
     struct inode_data *inode = inode_get(mount, stat.inode);
     lock(&inode->lock, 0);
@@ -4120,6 +4259,7 @@ struct inet_nat_entry {
     uint16_t guest_port;   // network byte order
     uint16_t host_port;    // network byte order
     int type;              // SOCK_STREAM_ / SOCK_DGRAM_
+    bool reuseport;        // owner had SO_REUSEPORT set at bind time
     struct fd *owner;
 };
 
@@ -4128,6 +4268,42 @@ static struct list inet_nat_table = LIST_INITIALIZER(inet_nat_table);
 
 static bool inet_addr_is_loopback(uint32_t addr_be) {
     return (ntohl(addr_be) >> 24) == 127;
+}
+
+// Does this guest endpoint collide with one already NAT'd? The host cannot
+// answer that for us: every NAT'd bind lands on 127.0.0.1:<ephemeral>, a
+// different port each time, so two guests asking for the SAME 127.x alias and
+// port both succeed at the host and each believes it owns the endpoint --
+// while only one of them can ever be reached. Linux says EADDRINUSE.
+//
+// Same overlap rule as an ordinary bind: identical address and port collide,
+// and a wildcard collides with any specific address on that port. Port 0 is
+// an ephemeral request and never collides. Two sockets that both asked for
+// SO_REUSEPORT may share, as they may on Linux.
+//
+// Caller must NOT hold inet_nat_lock.
+static bool inet_nat_endpoint_taken(uint32_t guest_addr, uint16_t guest_port,
+        int type, bool reuseport) {
+    if (guest_port == 0)
+        return false;
+    bool taken = false;
+    lock(&inet_nat_lock, 0);
+    struct inet_nat_entry *entry;
+    list_for_each_entry(&inet_nat_table, entry, list) {
+        if (entry->guest_port != guest_port || entry->type != type)
+            continue;
+        bool same_addr = entry->guest_addr == guest_addr;
+        bool wildcard = entry->guest_addr == htonl(INADDR_ANY) ||
+                        guest_addr == htonl(INADDR_ANY);
+        if (!same_addr && !wildcard)
+            continue;
+        if (reuseport && entry->reuseport)
+            continue;
+        taken = true;
+        break;
+    }
+    unlock(&inet_nat_lock);
+    return taken;
 }
 
 // Try to recover a failed AF_INET bind by re-binding to
@@ -4144,6 +4320,12 @@ static int inet_nat_bind_fallback(struct fd *sock, struct sockaddr_in *sin, int 
 
     uint32_t guest_addr = sin->sin_addr.s_addr;
     uint16_t guest_port = sin->sin_port;
+
+    // Checked before the host bind, so a rejected duplicate leaves the socket
+    // exactly as it was rather than bound to a stray ephemeral port.
+    bool reuseport = sock->socket.reuseport;
+    if (inet_nat_endpoint_taken(guest_addr, guest_port, sock->socket.type, reuseport))
+        return _EADDRINUSE;
 
     struct sockaddr_in host_sin = *sin;
     if (loopback)
@@ -4162,6 +4344,7 @@ static int inet_nat_bind_fallback(struct fd *sock, struct sockaddr_in *sin, int 
     entry->guest_port = guest_port;
     entry->host_port = host_sin.sin_port;
     entry->type = sock->socket.type;
+    entry->reuseport = reuseport;
     entry->owner = sock;
     lock(&inet_nat_lock, 0);
     list_add_tail(&inet_nat_table, &entry->list);
@@ -4265,6 +4448,83 @@ static void release_unix_names(struct fd *fd) {
     }
 }
 
+// Linux refuses a connection to a socket that is bound but not yet listening:
+// the port is in the bound hash but not the listening one, so the SYN gets an
+// RST and the client's connect() returns ECONNREFUSED immediately. Darwin
+// silently DROPS that SYN instead, so the client retries and times out about
+// eight seconds later. Measured on the host, in the CLI guest, and on the
+// device with an external client and a listening control.
+//
+// What causes it is holding the port on the host in that state, so AOK stops
+// holding it: a plain TCP bind() is validated with a throwaway socket and then
+// remembered rather than applied, and the real host bind happens when the
+// socket is about to become reachable -- at listen(), or at connect() where
+// the bind is the source address.
+//
+// Validating with a probe keeps every existing bind() error exactly as it was.
+// If the probe bind fails for any reason the caller falls through to the
+// original path -- real host bind, NAT fallback for the loopback-alias and
+// privileged-port cases, and the errno that produced -- so nothing about the
+// hard cases changes. Only the case that would plainly have succeeded is
+// deferred.
+static bool sock_bind_should_defer(struct fd *sock, const void *addr) {
+    if (sock->socket.domain != AF_INET_ && sock->socket.domain != AF_INET6_)
+        return false;
+    if (sock->socket.type != SOCK_STREAM_ || sock->real_fd < 0)
+        return false;
+    // Never a port-0 bind: the port is assigned BY the bind, and getsockname
+    // has to report the assigned one straight away. Deferring would have it
+    // answer 0, and nothing can connect blind to an ephemeral port anyway, so
+    // there is nothing to gain.
+    struct inet_bind_info want = {};
+    if (!inet_bind_info_from_sockaddr((const struct sockaddr *) addr, &want))
+        return false;
+    return want.port != 0;
+}
+
+// Would this bind have succeeded? Answered on a socket of its own so the port
+// is not left held. Returns true only when it plainly would.
+static bool sock_bind_probe_ok(struct fd *sock, const void *addr, uint_t addr_len) {
+    int probe = socket(sock_family_to_real(sock->socket.domain), SOCK_STREAM, 0);
+    if (probe < 0)
+        return false;
+    // The reuse flags decide whether a bind conflicts, so the probe has to
+    // carry the same ones or it answers a different question.
+    int on = 0;
+    socklen_t on_len = sizeof(on);
+    if (getsockopt(sock->real_fd, SOL_SOCKET, SO_REUSEADDR, &on, &on_len) == 0 && on)
+        setsockopt(probe, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+#ifdef SO_REUSEPORT
+    on = 0; on_len = sizeof(on);
+    if (getsockopt(sock->real_fd, SOL_SOCKET, SO_REUSEPORT, &on, &on_len) == 0 && on)
+        setsockopt(probe, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+#endif
+#ifdef IPV6_V6ONLY
+    if (sock->socket.domain == AF_INET6_) {
+        on = 0; on_len = sizeof(on);
+        if (getsockopt(sock->real_fd, IPPROTO_IPV6, IPV6_V6ONLY, &on, &on_len) == 0)
+            setsockopt(probe, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
+    }
+#endif
+    bool ok = bind(probe, (const struct sockaddr *) addr, addr_len) == 0;
+    close(probe);
+    return ok;
+}
+
+// Hand a deferred bind to the host. Called when the socket is about to become
+// reachable; a no-op for every other socket.
+static int sock_bind_materialize(struct fd *sock) {
+    if (!sock->socket.bind_deferred)
+        return 0;
+    sock->socket.bind_deferred = false;
+    if (bind(sock->real_fd, (struct sockaddr *) sock->socket.deferred_addr,
+                sock->socket.deferred_addr_len) < 0)
+        // Somebody else took the port in the window. Narrow, and an honest
+        // error here beats silently swallowing connections for eight seconds.
+        return errno_map();
+    return 0;
+}
+
 static int_t sys_bind_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t sockaddr_len) {
     STRACE("bind(%d, 0x%llx, %d)", sock_fd, (unsigned long long) sockaddr_addr, sockaddr_len);
     int_t sock_err;
@@ -4287,6 +4547,22 @@ static int_t sys_bind_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t so
         return 0;
     }
 
+    // CAP_NET_BIND_SERVICE: ports below 1024 are privileged on Linux. We had no
+    // check at all, so uid 1000 could bind 127.0.0.1:80 or :53 and serve
+    // guest-local traffic there -- and because the NAT fallback below rescues a
+    // privileged-port bind the host refuses, it worked even though the host
+    // itself would never allow it. Checked before the host bind so the fallback
+    // only ever runs for a caller Linux would have permitted.
+    if (sock->socket.domain == AF_INET_ || sock->socket.domain == AF_INET6_) {
+        struct inet_bind_info want = {};
+        if (inet_bind_info_from_sockaddr((const struct sockaddr *) &sockaddr, &want) &&
+                want.port != 0 && ntohs(want.port) < 1024 &&
+                !current_capable(CAP_NET_BIND_SERVICE_))
+            return _EACCES;
+    }
+    // Remember who bound this socket, for the SO_REUSEPORT same-uid rule.
+    sock->socket.bind_euid = current->euid;
+
 #if defined(__APPLE__)
     if ((sock->socket.domain == AF_INET_ || sock->socket.domain == AF_INET6_) &&
             sock->socket.type == SOCK_STREAM_) {
@@ -4297,6 +4573,17 @@ static int_t sys_bind_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t so
         }
     }
 #endif
+
+    if (sock_bind_should_defer(sock, &sockaddr) &&
+            sock_bind_probe_ok(sock, &sockaddr, sockaddr_len)) {
+        memcpy(sock->socket.deferred_addr, &sockaddr,
+               sockaddr_len < sizeof(sock->socket.deferred_addr)
+                   ? sockaddr_len : sizeof(sock->socket.deferred_addr));
+        sock->socket.deferred_addr_len = sockaddr_len;
+        sock->socket.bind_deferred = true;
+        sock->socket.unix_name_inode = inode;
+        return 0;
+    }
 
     err = bind(sock->real_fd, (void *) &sockaddr, sockaddr_len);
     if (err < 0) {
@@ -4446,6 +4733,12 @@ static int_t sys_connect_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t
         connect_initctl_target = !connect_devlog_target &&
             guest_sockaddr_is_initctl(sockaddr_addr, sockaddr_len);
     }
+    // A deferred bind is this connection's source address, so it has to be
+    // real before we connect.
+    int deferred_err = sock_bind_materialize(sock);
+    if (deferred_err < 0)
+        return deferred_err;
+
     struct sockaddr_max_ sockaddr;
     int err = sockaddr_read(sockaddr_addr, &sockaddr, &sockaddr_len);
     if (err < 0) {
@@ -4624,6 +4917,11 @@ int_t sys_listen(fd_t sock_fd, int_t backlog) {
     struct fd *sock = sock_getfd(sock_fd, &sock_err);
     if (sock == NULL)
         return sock_err;
+    // The bind was deferred so the port would not sit on the host in a state
+    // where Darwin swallows connections; this is the moment it must be real.
+    int bind_err = sock_bind_materialize(sock);
+    if (bind_err < 0)
+        return bind_err;
     int err = listen(sock->real_fd, backlog);
     if (err < 0)
         return errno_map();
@@ -4659,6 +4957,9 @@ static int_t sys_accept4_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_
 
     char sockaddr[sockaddr_len];
     int client =0;
+    // Hoisted out of the wait block below: the SA_RESTART decision on the
+    // error path needs it (a timed accept is never restarted).
+    bool has_deadline = false;
     if (!sock->socket.listening) {
         // Not a listening socket: the host accept() fails immediately
         // (EINVAL/EOPNOTSUPP) and can never block, so take the direct path.
@@ -4701,7 +5002,7 @@ static int_t sys_accept4_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_
         socklen_t rcvtimeo_len = sizeof(rcvtimeo);
         if (getsockopt(sock->real_fd, SOL_SOCKET, SO_RCVTIMEO, &rcvtimeo, &rcvtimeo_len) < 0)
             rcvtimeo = (struct timeval) {0, 0};
-        bool has_deadline = !guest_nonblock && (rcvtimeo.tv_sec != 0 || rcvtimeo.tv_usec != 0);
+        has_deadline = !guest_nonblock && (rcvtimeo.tv_sec != 0 || rcvtimeo.tv_usec != 0);
         struct timespec deadline;
         if (has_deadline) {
             deadline = timespec_now(CLOCK_MONOTONIC);
@@ -4858,8 +5159,14 @@ static int_t sys_accept4_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_
         if (client < 0)
             errno = fail_errno;
     }
-    if (client < 0)
-        return errno_map();
+    if (client < 0) {
+        // SA_RESTART: accept() is restartable, but not with SO_RCVTIMEO armed
+        // (signal(7)) -- restarting would silently extend the guest's timeout.
+        int mapped = errno_map();
+        if (mapped == _EINTR && !has_deadline)
+            mapped = signal_restart_or_eintr(mapped);
+        return mapped;
+    }
 
     // BSD accepted sockets inherit O_NONBLOCK from the listener (which is
     // now kept permanently nonblocking above); Linux accepted sockets start
@@ -4954,6 +5261,26 @@ static int_t sys_getsockname_common(fd_t sock_fd, guest_addr_t sockaddr_addr, gu
     // unsigned-underflow-driven out-of-bounds memset/memcpy (PF_LOCAL path)
     // whenever the guest asked for a very small buffer.
     char sockaddr[sizeof(struct sockaddr_storage)];
+
+    // A deferred bind is not on the host yet, so the host has no name to give
+    // -- answer from what bind() was told. Through sockaddr_write, NOT a raw
+    // copy: what we stored is in HOST layout (sockaddr_read_bind converted it
+    // on the way in), and Darwin's sockaddr_in starts with a one-byte sin_len
+    // where Linux has a two-byte family. Writing those bytes back unconverted
+    // handed the guest a mangled address -- python's http.server read the
+    // host part of getsockname() as an int and died in socket.getfqdn().
+    if (sock->socket.bind_deferred) {
+        dword_t real_len = sock->socket.deferred_addr_len;
+        if (real_len > sizeof(sockaddr))
+            real_len = sizeof(sockaddr);
+        memcpy(sockaddr, sock->socket.deferred_addr, real_len);
+        int err = sockaddr_write(sockaddr_addr, sockaddr, sockaddr_len, &real_len);
+        if (err < 0)
+            return err;
+        if (user_put(sockaddr_len_addr, real_len))
+            return _EFAULT;
+        return 0;
+    }
 
     if (sock->socket.domain == AF_NETLINK_) {
         if (sockaddr_len < sizeof(struct sockaddr_nl_))
@@ -5116,10 +5443,28 @@ static int_t sys_socketpair_common(dword_t domain, dword_t type, dword_t protoco
             (unsigned long long) sockets_addr);
     int real_domain = sock_family_to_real(domain);
     if (real_domain < 0)
+        return _EAFNOSUPPORT;
+    // Both halves of the type word: the low bits name a socket type, the high
+    // bits are SOCK_NONBLOCK/SOCK_CLOEXEC and nothing else. Linux checks the
+    // flag half first, which is why socket(AF_INET, 99, 0) is EINVAL even
+    // though 99 & SOCK_TYPE_MASK is a perfectly good type.
+    if (type & ~(SOCKET_TYPE_MASK | SOCK_NONBLOCK_ | SOCK_CLOEXEC_))
         return _EINVAL;
+    switch (type & SOCKET_TYPE_MASK) {
+        case SOCK_STREAM_: case SOCK_DGRAM_:
+        case SOCK_RAW_: case SOCK_SEQPACKET_:
+            break;
+        default:
+            return _EINVAL;
+    }
+    if (domain == PF_LOCAL_) {
+        if (protocol != 0 && protocol != PF_LOCAL_)
+            return _EPROTONOSUPPORT;
+        protocol = 0;
+    }
     int real_type = sock_type_to_real(type, protocol);
     if (real_type < 0)
-        return _EINVAL;
+        return _EPROTONOSUPPORT;
 
     int sockets[2];
     int err;
@@ -5335,7 +5680,8 @@ static int_t sys_sendto_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t l
             sock_x11_event("sendto-eagain", sock, -1, _EAGAIN, len);
             return _EAGAIN;
         }
-        int mapped_err = errno_map();
+        // MSG_NOSIGNAL: EPIPE without the guest's SIGPIPE.
+        int mapped_err = errno_map_flags(flags & MSG_NOSIGNAL_);
         sock_translate_err(sock, &mapped_err);
         // Linux returns ENOTCONN for a send() on an unconnected AF_UNIX
         // datagram socket with no destination address; Darwin returns
@@ -5640,8 +5986,19 @@ int_t sys_shutdown(fd_t sock_fd, dword_t how) {
     if (sock == NULL)
         return sock_err;
     int err = shutdown(sock->real_fd, how);
-    if (err < 0)
+    if (err < 0) {
+        // Linux shuts a LISTENING socket down cleanly -- inet_shutdown's
+        // TCP_LISTEN arm disconnects and returns 0 -- and reserves ENOTCONN
+        // for a socket that never had a peer (TCP_CLOSE). Darwin makes no such
+        // distinction and refuses both, so the ordinary "stop accepting, wake
+        // everyone polling this listener" idiom failed here.
+        // Asked of the fd, not of the host: Darwin has no SO_ACCEPTCONN at all
+        // (getsockopt on it returns ENOPROTOOPT), which is why sys_listen
+        // records this in the first place.
+        if (errno == ENOTCONN && sock->socket.listening)
+            return 0;
         return errno_map();
+    }
     return 0;
 }
 
@@ -5649,6 +6006,10 @@ static void sock_init_emulation_defaults(struct fd *fd) {
     strcpy(fd->socket.tcp_congestion, DEFAULT_TCP_CONGESTION);
     fd->socket.ipv6_recverr_fd = -1;
     // Linux's net.core.rmem_default/wmem_default default.
+    // SO_INCOMING_CPU is -1 until a packet arrives, which for AOK is always.
+    fd->socket.so_incoming_cpu = (dword_t) -1;
+    // Linux's default: no peek offset.
+    fd->socket.so_peek_off = (dword_t) -1;
     fd->socket.netlink_rcvbuf = 212992;
     fd->socket.netlink_sndbuf = 212992;
     lock_init(&fd->socket.netlink_reply_lock, "netlink_reply\0");
@@ -5729,7 +6090,14 @@ static int_t sys_setsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
     if (level == IPPROTO_IP && option == IP_RETOPTS_) {
         // Linux ping probes this on IPv4 sockets. Darwin raw sockets do not
         // provide a compatible implementation, and the option is not required
-        // for basic echo functionality.
+        // for basic echo functionality -- but the flag itself has to survive a
+        // set/get round trip. It was accepted and thrown away, and the get had
+        // no handler at all, so it reported optlen 0 and left the caller's
+        // buffer untouched: whatever uninitialised value was already there
+        // read back as the answer.
+        if (value_len < sizeof(dword_t))
+            return _EINVAL;
+        sock->socket.ip_retopts = *(dword_t *) value != 0;
         return 0;
     }
     if (level == IPPROTO_TCP && option == TCP_CONGESTION_) {
@@ -5746,9 +6114,225 @@ static int_t sys_setsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
         sock->socket.tcp_defer_accept = *(dword_t *) value;
         return 0;
     }
+    // Linux takes TCP_MAXSEG as an advisory cap at any time; Darwin refuses it
+    // on an unconnected socket (EINVAL). Remember the guest's value and pass it
+    // to the host on a best-effort basis, so the set succeeds and the get
+    // reports what was asked for rather than the host's current MSS.
+    if (level == IPPROTO_TCP && option == TCP_MAXSEG_) {
+        if (value_len < sizeof(dword_t))
+            return _EINVAL;
+        dword_t mss = *(dword_t *) value;
+        if ((int_t) mss < 0)
+            return _EINVAL;
+        sock->socket.tcp_maxseg = mss;
+        int real_mss = (int) mss;
+        (void) setsockopt(sock->real_fd, IPPROTO_TCP, TCP_MAXSEG, &real_mss, sizeof(real_mss));
+        return 0;
+    }
+
+    // See the block in fs/fd.h: Linux always accepts these, so accepting and
+    // remembering them is closer than an ENOPROTOOPT no Linux ever returns.
+    // SO_BINDTODEVICE: send and receive only through the named interface.
+    // setsockopt refused it with ENOPROTOOPT while getsockopt reported success
+    // with an empty name, so a program that bound to an interface and then
+    // checked was told the bind had happened when it never did. `ping -I lo0`
+    // failed outright with "can't bind to interface".
+    //
+    // Darwin spells it IP_BOUND_IF / IPV6_BOUND_IF and takes an interface
+    // INDEX, so the name is resolved here. The guest sees the host's own
+    // interface names (lo0, en0, ...), so no translation is needed beyond
+    // that. An empty name unbinds, which is how Linux clears it.
+    if (level == SOL_SOCKET_ && option == SO_BINDTODEVICE_) {
+        char name[sizeof(sock->socket.so_bindtodevice)];
+        size_t copy = value_len < sizeof(name) - 1 ? value_len : sizeof(name) - 1;
+        memcpy(name, value, copy);
+        name[copy] = '\0';
+
+        unsigned index = 0;
+        if (name[0] != '\0') {
+            index = if_nametoindex(name);
+            // A name that matches no interface is ENODEV, not EINVAL: the
+            // request was well formed, the device just is not there.
+            if (index == 0)
+                return _ENODEV;
+        }
+        // A fake socket (netlink, the devlog sink) has no host fd and nothing
+        // to bind; the name is still recorded so the get reports it.
+        if (sock->real_fd >= 0 &&
+                (sock->socket.domain == AF_INET_ || sock->socket.domain == AF_INET6_)) {
+#if defined(IP_BOUND_IF) && defined(IPV6_BOUND_IF)
+            // Darwin: bind by interface INDEX.
+            int host_opt = sock->socket.domain == AF_INET6_ ? IPV6_BOUND_IF : IP_BOUND_IF;
+            int host_level = sock->socket.domain == AF_INET6_ ? IPPROTO_IPV6 : IPPROTO_IP;
+            int idx = (int) index;
+            if (setsockopt(sock->real_fd, host_level, host_opt, &idx, sizeof(idx)) < 0)
+                return errno_map();
+#elif defined(SO_BINDTODEVICE)
+            // Building on Linux, where the host has the real thing and takes
+            // the NAME. Binding to a device is privileged there, and a guest
+            // that is not privileged on the host should not fail for that
+            // reason alone -- the name is recorded either way, which is what
+            // the guest can observe.
+            (void) setsockopt(sock->real_fd, SOL_SOCKET, SO_BINDTODEVICE,
+                              name, (socklen_t) strlen(name));
+#else
+            (void) index;
+#endif
+        }
+        strcpy(sock->socket.so_bindtodevice, name);
+        return 0;
+    }
+
+    // SOL_SOCKET options Linux accepts unconditionally and Darwin has no knob
+    // for. Remembered and reported back, the same way the TCP block below
+    // already does -- refusing them with ENOPROTOOPT is a state real Linux
+    // never produces.
+    if (level == SOL_SOCKET_ &&
+            (option == SO_PRIORITY_ || option == SO_MARK_ ||
+             option == SO_BUSY_POLL_ || option == SO_NO_CHECK_ ||
+             option == SO_TIMESTAMPNS_ || option == SO_INCOMING_CPU_)) {
+        if (value_len < sizeof(dword_t))
+            return _EINVAL;
+        dword_t v = *(dword_t *) value;
+        switch (option) {
+            case SO_PRIORITY_:
+                // Linux: 0..6 unprivileged, above that needs CAP_NET_ADMIN.
+                if (v > 6 && !superuser())
+                    return _EPERM;
+                sock->socket.so_priority = v;
+                break;
+            case SO_MARK_:
+                // Routing marks are CAP_NET_ADMIN on Linux, and EPERM is what
+                // a caller checks for -- never EINVAL.
+                if (!superuser())
+                    return _EPERM;
+                sock->socket.so_mark = v;
+                break;
+            case SO_BUSY_POLL_:
+                if (!superuser() && v != 0)
+                    return _EPERM;
+                sock->socket.so_busy_poll = v;
+                break;
+            case SO_NO_CHECK_: sock->socket.so_no_check = v != 0; break;
+            case SO_TIMESTAMPNS_: sock->socket.so_timestampns = v != 0; break;
+            case SO_INCOMING_CPU_: sock->socket.so_incoming_cpu = v; break;
+        }
+        return 0;
+    }
+
+    // Three options whose whole value is a promise to deliver something
+    // later, and AOK cannot deliver any of it. Turning them ON is refused
+    // rather than accepted-and-ignored, because a caller that succeeds here
+    // goes on to WAIT for what it was promised:
+    //
+    //   SO_ZEROCOPY makes send(MSG_ZEROCOPY) return before the data is
+    //   copied and report completion on the error queue. Without the
+    //   notification the sender never learns its buffer is free again and
+    //   blocks on a completion that is never coming.
+    //
+    //   SO_TIMESTAMPING's transmit flags do the same through the error
+    //   queue, and its receive flags promise SCM_TIMESTAMPING control
+    //   messages that would never arrive.
+    //
+    //   SO_PEEK_OFF makes recv(MSG_PEEK) start N bytes into the queue. AOK
+    //   peeks from the front, so a caller that set an offset would silently
+    //   read the wrong bytes -- the one failure mode with no symptom.
+    //
+    // EOPNOTSUPP is what Linux itself returns for SO_ZEROCOPY on a family
+    // that cannot do it, so callers already handle it. Turning them OFF, and
+    // SO_PEEK_OFF's disabled value of -1, are accepted: they ask for nothing.
+    if (level == SOL_SOCKET_ &&
+            (option == SO_ZEROCOPY_ || option == SO_TIMESTAMPING_ ||
+             option == SO_PEEK_OFF_)) {
+        if (value_len < sizeof(dword_t))
+            return _EINVAL;
+        dword_t v = *(dword_t *) value;
+        // Offset 0 asks to peek from the front, which is what AOK does
+        // anyway, so it is accepted along with the -1 that disables it.
+        // Only a positive offset would move data the guest sees.
+        bool asking_for_nothing = option == SO_PEEK_OFF_
+            ? (int32_t) v <= 0
+            : v == 0;
+        if (!asking_for_nothing)
+            return _EOPNOTSUPP;
+        if (option == SO_PEEK_OFF_)
+            sock->socket.so_peek_off = v;
+        return 0;
+    }
+
+    // SO_RCVBUF/SO_SNDBUF: Linux stores TWICE what it is asked for and
+    // reports the doubled number back, so a program that sets 8192 and reads
+    // 8192 concludes the kernel truncated its request. It also clamps -- to
+    // net.core.{r,w}mem_max on the way in (the FORCE variants skip that and
+    // need CAP_NET_ADMIN) and to a floor on the way out, so a request of 0
+    // is legal and yields the minimum rather than EINVAL.
+    //
+    // The host is still asked for the undoubled size, best-effort: Darwin has
+    // its own limits and rejects 0 outright, and the guest-visible number is
+    // the one that has to follow Linux's rules.
+    if (level == SOL_SOCKET_ && sock->real_fd >= 0 &&
+            (option == SO_RCVBUF_ || option == SO_SNDBUF_ ||
+             option == SO_RCVBUFFORCE_ || option == SO_SNDBUFFORCE_)) {
+        if (value_len < sizeof(dword_t))
+            return _EINVAL;
+        bool force = option == SO_RCVBUFFORCE_ || option == SO_SNDBUFFORCE_;
+        bool rcv = option == SO_RCVBUF_ || option == SO_RCVBUFFORCE_;
+        if (force && !superuser())
+            return _EPERM;
+        uint32_t v = *(dword_t *) value;
+        if (v > (uint32_t) INT32_MAX / 2)
+            v = (uint32_t) INT32_MAX / 2;
+        if (!force && v > SOCK_MEM_MAX)
+            v = SOCK_MEM_MAX;
+        uint32_t doubled = v * 2;
+        uint32_t floor = rcv ? SOCK_MIN_RCVBUF : SOCK_MIN_SNDBUF;
+        if (doubled < floor)
+            doubled = floor;
+        // Best-effort on the host; its own clamps are its business, and a
+        // rejection must not fail a call Linux always accepts.
+        int host_val = (int) (v == 0 ? floor / 2 : v);
+        (void) setsockopt(sock->real_fd, SOL_SOCKET,
+                          rcv ? SO_RCVBUF : SO_SNDBUF, &host_val, sizeof(host_val));
+        if (rcv) {
+            sock->socket.so_rcvbuf = doubled;
+            sock->socket.so_rcvbuf_set = true;
+        } else {
+            sock->socket.so_sndbuf = doubled;
+            sock->socket.so_sndbuf_set = true;
+        }
+        return 0;
+    }
+
+    if (level == IPPROTO_TCP &&
+            (option == TCP_SYNCNT_ || option == TCP_LINGER2_ ||
+             option == TCP_WINDOW_CLAMP_ || option == TCP_USER_TIMEOUT_ ||
+             option == TCP_QUICKACK_)) {
+        if (value_len < sizeof(dword_t))
+            return _EINVAL;
+        dword_t v = *(dword_t *) value;
+        switch (option) {
+            case TCP_SYNCNT_:
+                // Linux: 1..MAXSYNRETRIES(127), anything else EINVAL.
+                if (v == 0 || v > 127) return _EINVAL;
+                sock->socket.tcp_syncnt = v; break;
+            case TCP_LINGER2_: sock->socket.tcp_linger2 = v; break;
+            case TCP_WINDOW_CLAMP_: sock->socket.tcp_window_clamp = v; break;
+            case TCP_USER_TIMEOUT_:
+                if ((int_t) v < 0) return _EINVAL;
+                sock->socket.tcp_user_timeout = v; break;
+            case TCP_QUICKACK_:
+                sock->socket.tcp_quickack = v != 0;
+                sock->socket.tcp_quickack_set = true;
+                break;
+        }
+        return 0;
+    }
     if (level == IPPROTO_TCP && option == TCP_FASTOPEN_) {
         if (value_len < sizeof(dword_t))
             return _EINVAL;
+        // Remember the queue length so the get reports it, as Linux does;
+        // it was discarded and the get hardcoded 0.
+        sock->socket.tcp_fastopen = *(dword_t *) value;
         return 0;
     }
 
@@ -5759,8 +6343,11 @@ static int_t sys_setsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
             sock->socket.unix_passcred = (*(dword_t *) value) != 0;
             return 0;
         }
-        if (sock->socket.domain != AF_LOCAL_)
-            return _ENOPROTOOPT;
+        // Accepted on every family, as Linux does. It only MEANS anything
+        // where credentials travel (AF_UNIX, netlink) -- setting it on a TCP
+        // socket is a no-op there too -- but refusing it was a state real
+        // Linux never produces, and libraries that set it unconditionally
+        // before deciding what kind of socket they have saw an error.
         sock->socket.unix_passcred = (*(dword_t *) value) != 0;
         return 0;
     }
@@ -6004,10 +6591,13 @@ static int_t sys_setsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
 
     int real_opt = sock_opt_to_real(option, level);
     if (real_opt < 0)
-        return sockopt_is_linux_soft_unsupported(level, option) ? _ENOPROTOOPT : _EINVAL;
+        // Linux reports an option the level does not recognise as
+        // ENOPROTOOPT; EINVAL is for a malformed argument. Probing code
+        // treats ENOPROTOOPT as "not available, carry on" and EINVAL as a
+        // hard error, so the distinction is load-bearing. (The soft-unsupported
+        // list this replaces was the same fix applied one option at a time.)
+        return _ENOPROTOOPT;
     int real_level = sock_level_to_real(level);
-    if (real_level < 0)
-        return _EINVAL;
 
     if (real_opt == 0)
         return _ENOPROTOOPT;
@@ -6039,14 +6629,17 @@ static void sockopt_store_value(void *dst, dword_t dst_len, dword_t *result_len,
     size_t copy_len = dst_len < src_len ? dst_len : src_len;
     if (copy_len != 0)
         memcpy(dst, src, copy_len);
-    *result_len = src_len;
+    // Linux clamps the option's natural size to the caller's buffer and writes
+    // THAT back through optlen -- a short buffer truncates silently, it is not
+    // an error. Reporting the natural size instead told the caller more bytes
+    // had been written than the buffer could hold.
+    *result_len = (dword_t) copy_len;
 }
 
 static bool sockopt_is_linux_soft_unsupported(dword_t level, dword_t option) {
     if (level != SOL_SOCKET_)
         return false;
     switch (option) {
-        case SO_BINDTODEVICE_:
         case SO_PEERSEC_:
         case SO_PASSSEC_:
         case SO_PEERGROUPS_:
@@ -6105,13 +6698,10 @@ static int_t sys_getsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
         sockopt_store_value(value, user_value_len, &value_len, &cred, sizeof(cred));
     } else if (level == SOL_SOCKET_ && option == SO_PASSCRED_) {
         dword_t passcred;
-        if (sock->socket.domain == AF_NETLINK_) {
-            passcred = sock->socket.unix_passcred;
-        } else if (sock->socket.domain != AF_LOCAL_) {
-            return _ENOPROTOOPT;
-        } else {
-            passcred = sock->socket.unix_passcred;
-        }
+        // Readable on every family, as Linux is: setsockopt accepts it
+        // everywhere (it only MEANS anything where credentials travel), so
+        // the read has to answer everywhere too.
+        passcred = sock->socket.unix_passcred;
         sockopt_store_value(value, user_value_len, &value_len, &passcred, sizeof(passcred));
     } else if (level == SOL_SOCKET_ && option == SO_ACCEPTCONN_) {
         // Report our own tracked listen() state. Darwin's getsockopt does not
@@ -6145,13 +6735,18 @@ static int_t sys_getsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
             return _ENOPROTOOPT;
         }
     } else if (level == SOL_SOCKET_ && option == SO_BINDTODEVICE_) {
-        // Linux reports an unbound socket as success with an empty interface
-        // name (optlen = 0), and nothing under iSH can bind a socket to a
-        // device, so every socket is unbound. Returning ENOPROTOOPT here made
-        // OpenSSH's sys_get_rdomain() VRF probe log "cannot determine VRF for
-        // fd=N : Protocol not available" on every ssh session. setsockopt
-        // still rejects it via the soft-unsupported list below.
-        value_len = 0;
+        // The interface name this socket was bound to, or nothing (optlen 0)
+        // if it never was -- which is what Linux reports for an unbound
+        // socket, and what OpenSSH's sys_get_rdomain() VRF probe expects. It
+        // used to report that unconditionally, while setsockopt refused the
+        // bind outright, so a caller was told a bind had happened that never
+        // could.
+        size_t name_len = strlen(sock->socket.so_bindtodevice);
+        if (name_len == 0)
+            value_len = 0;
+        else
+            sockopt_store_value(value, user_value_len, &value_len,
+                    sock->socket.so_bindtodevice, (dword_t) name_len + 1);
     } else if (sockopt_is_linux_soft_unsupported(level, option)) {
         return _ENOPROTOOPT;
     } else if (level == SOL_SOCKET_ && (option == SO_RCVTIMEO_OLD_ || option == SO_SNDTIMEO_OLD_)) {
@@ -6206,6 +6801,37 @@ static int_t sys_getsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
             return _ENOTCONN;
         dword_t mtu = 1500;
         sockopt_store_value(value, user_value_len, &value_len, &mtu, sizeof(mtu));
+    } else if (level == SOL_SOCKET_ &&
+               (option == SO_ZEROCOPY_ || option == SO_TIMESTAMPING_ ||
+                option == SO_PEEK_OFF_)) {
+        // setsockopt refuses to turn these on (see there), so the answer is
+        // always the off value -- 0, and -1 for the peek offset, which is how
+        // Linux spells "no offset". Answering at all is the point: a caller
+        // that reads back what it set is entitled to a number, not EINVAL.
+        dword_t v = option == SO_PEEK_OFF_ ? sock->socket.so_peek_off : 0;
+        sockopt_store_value(value, user_value_len, &value_len, &v, sizeof(v));
+    } else if (level == IPPROTO_IP && option == IP_RETOPTS_) {
+        dword_t retopts = sock->socket.ip_retopts;
+        sockopt_store_value(value, user_value_len, &value_len, &retopts, sizeof(retopts));
+    } else if (level == SOL_SOCKET_ &&
+               (option == SO_RCVBUF_ || option == SO_SNDBUF_) &&
+               (option == SO_RCVBUF_ ? sock->socket.so_rcvbuf_set
+                                     : sock->socket.so_sndbuf_set)) {
+        // What the guest last asked for, in Linux's doubled-and-clamped form.
+        // Only once it HAS asked: before that the host's own default is the
+        // better answer, and it already matches.
+        dword_t v = option == SO_RCVBUF_ ? sock->socket.so_rcvbuf
+                                         : sock->socket.so_sndbuf;
+        sockopt_store_value(value, user_value_len, &value_len, &v, sizeof(v));
+    } else if (level == IPPROTO_IPV6 && sock->socket.domain != AF_INET6_) {
+        // An IPv6 option on a socket that is not IPv6 is not a bad option --
+        // it is a level this socket does not have. Linux dispatches socket
+        // options by family and lands in no IPv6 handler at all, which is
+        // EOPNOTSUPP, the same answer it gives for a wholly unknown level.
+        // AOK recognised the level regardless of the family and reported
+        // ENOPROTOOPT ("no such option"), which tells a caller probing for
+        // IPv6 support the wrong thing about why.
+        return _EOPNOTSUPP;
     } else if (level == IPPROTO_IP && option == IP_RECVERR_) {
         dword_t recverr = sock->socket.ip_recverr;
         sockopt_store_value(value, user_value_len, &value_len, &recverr, sizeof(recverr));
@@ -6234,15 +6860,79 @@ static int_t sys_getsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
             socket_error = real_error == 0 ? 0 : -err_map(real_error);
         }
         sockopt_store_value(value, user_value_len, &value_len, &socket_error, sizeof(socket_error));
+    } else if (level == SOL_SOCKET_ &&
+            (option == SO_PRIORITY_ || option == SO_MARK_ ||
+             option == SO_BUSY_POLL_ || option == SO_NO_CHECK_ ||
+             option == SO_TIMESTAMPNS_ || option == SO_INCOMING_CPU_)) {
+        // The remembered value, as set above. These have no Darwin knob to
+        // read back from, so this IS the state.
+        dword_t v = 0;
+        switch (option) {
+            case SO_PRIORITY_: v = sock->socket.so_priority; break;
+            case SO_MARK_: v = sock->socket.so_mark; break;
+            case SO_BUSY_POLL_: v = sock->socket.so_busy_poll; break;
+            case SO_NO_CHECK_: v = sock->socket.so_no_check; break;
+            case SO_TIMESTAMPNS_: v = sock->socket.so_timestampns; break;
+            case SO_INCOMING_CPU_: v = sock->socket.so_incoming_cpu; break;
+        }
+        sockopt_store_value(value, user_value_len, &value_len, &v, sizeof(v));
+    } else if ((level == IPPROTO_IP &&
+                (option == IP_MULTICAST_TTL_ || option == IP_MULTICAST_LOOP_)) ||
+               (level == IPPROTO_IPV6 &&
+                (option == IPV6_MULTICAST_HOPS_ || option == IPV6_MULTICAST_LOOP_))) {
+        // setsockopt forwards these to the host, so the host has the answer;
+        // only the read side was missing, which left them settable and not
+        // readable. Darwin's IPv4 pair are u_char and the IPv6 pair int, while
+        // Linux reports an int for all four -- so widen on the way out.
+        dword_t out = 0;
+        if (level == IPPROTO_IP) {
+            unsigned char host_val = 0;
+            socklen_t host_len = sizeof(host_val);
+            int real_opt = option == IP_MULTICAST_TTL_ ? IP_MULTICAST_TTL : IP_MULTICAST_LOOP;
+            if (getsockopt(sock->real_fd, IPPROTO_IP, real_opt, &host_val, &host_len) < 0)
+                return errno_map();
+            out = host_val;
+        } else {
+            int host_val = 0;
+            socklen_t host_len = sizeof(host_val);
+            int real_opt = option == IPV6_MULTICAST_HOPS_ ? IPV6_MULTICAST_HOPS : IPV6_MULTICAST_LOOP;
+            if (getsockopt(sock->real_fd, IPPROTO_IPV6, real_opt, &host_val, &host_len) < 0)
+                return errno_map();
+            out = (dword_t) host_val;
+        }
+        sockopt_store_value(value, user_value_len, &value_len, &out, sizeof(out));
     } else if (level == IPPROTO_TCP && option == TCP_DEFER_ACCEPT_) {
         dword_t defer_accept = sock->socket.tcp_defer_accept;
         sockopt_store_value(value, user_value_len, &value_len, &defer_accept, sizeof(defer_accept));
+    } else if (level == IPPROTO_TCP && option == TCP_MAXSEG_ && sock->socket.tcp_maxseg != 0) {
+        dword_t mss = sock->socket.tcp_maxseg;
+        sockopt_store_value(value, user_value_len, &value_len, &mss, sizeof(mss));
+    } else if (level == IPPROTO_TCP &&
+            (option == TCP_SYNCNT_ || option == TCP_LINGER2_ ||
+             option == TCP_WINDOW_CLAMP_ || option == TCP_USER_TIMEOUT_ ||
+             option == TCP_QUICKACK_)) {
+        dword_t v = 0;
+        switch (option) {
+            // Linux's defaults, so an untouched socket reads back what a
+            // Linux one would rather than a bare zero.
+            case TCP_SYNCNT_: v = sock->socket.tcp_syncnt ? sock->socket.tcp_syncnt : 6; break;
+            case TCP_LINGER2_: v = sock->socket.tcp_linger2 ? sock->socket.tcp_linger2 : 60; break;
+            case TCP_WINDOW_CLAMP_: v = sock->socket.tcp_window_clamp; break;
+            case TCP_USER_TIMEOUT_: v = sock->socket.tcp_user_timeout; break;
+            // QUICKACK is on by default on Linux until something clears it.
+            case TCP_QUICKACK_: v = sock->socket.tcp_quickack_set ? sock->socket.tcp_quickack : 1; break;
+        }
+        sockopt_store_value(value, user_value_len, &value_len, &v, sizeof(v));
     } else if (level == IPPROTO_TCP && option == TCP_FASTOPEN_) {
-        dword_t fastopen = 0;
+        dword_t fastopen = sock->socket.tcp_fastopen;
         sockopt_store_value(value, user_value_len, &value_len, &fastopen, sizeof(fastopen));
     } else if (level == IPPROTO_TCP && option == TCP_CONGESTION_) {
-        sockopt_store_value(value, user_value_len, &value_len,
-                sock->socket.tcp_congestion, strlen(sock->socket.tcp_congestion));
+        // Linux hands back TCP_CA_NAME_MAX bytes, NUL-padded, not strlen():
+        // callers size a 16-byte buffer and use the returned length.
+        char ca[16];
+        memset(ca, 0, sizeof(ca));
+        strncpy(ca, sock->socket.tcp_congestion, sizeof(ca) - 1);
+        sockopt_store_value(value, user_value_len, &value_len, ca, sizeof(ca));
 #if defined(__APPLE__)
     } else if (level == IPPROTO_TCP && option == TCP_INFO_) {
         // This one's fun. On Linux, the struct is not ABI dependent, so no
@@ -6289,18 +6979,35 @@ static int_t sys_getsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
         sockopt_store_value(value, user_value_len, &value_len, &info, sizeof(info));
 #endif
     } else {
+        // Level before option, and the two failures are different errnos.
+        // Linux's ip_getsockopt opens with `if (level != SOL_IP) return
+        // -EOPNOTSUPP`, so an unrecognised LEVEL is EOPNOTSUPP on the read
+        // side (the write side gives ENOPROTOOPT -- measured, and it really is
+        // asymmetric). An unrecognised OPTION at a level that does exist is
+        // ENOPROTOOPT either way; EINVAL is for a malformed argument, and
+        // probing code treats ENOPROTOOPT as "not available, carry on" while
+        // EINVAL is a hard error, so the distinction is load-bearing.
+        if (!sock_level_is_known((int) level))
+            return _EOPNOTSUPP;
+        int real_level = sock_level_to_real(level);
         int real_opt = sock_opt_to_real(option, level);
         if (real_opt < 0)
-            return sockopt_is_linux_soft_unsupported(level, option) ? _ENOPROTOOPT : _EINVAL;
-        int real_level = sock_level_to_real(level);
-        if (real_level < 0)
-            return _EINVAL;
+            return _ENOPROTOOPT;
 
         socklen_t host_value_len = user_value_len;
         int err = getsockopt(sock->real_fd, real_level, real_opt, value, &host_value_len);
         if (err < 0)
             return errno_map();
         value_len = host_value_len;
+        // Normalise the flag options to 0/1. BSD hands back the option's own
+        // bit from so_options, so an enabled SO_KEEPALIVE reads as 8 and an
+        // enabled TCP_NODELAY as 4; Linux reports 1 for both.
+        if (sock_opt_is_boolean(option, level) && value_len == sizeof(int)) {
+            int raw;
+            memcpy(&raw, value, sizeof(raw));
+            int norm = raw != 0;
+            memcpy(value, &norm, sizeof(norm));
+        }
     }
 
     if (user_put(len_addr, value_len))
@@ -7039,7 +7746,7 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
             sock_x11_event("sendmsg-eagain", sock, -1, err, requested);
             goto out_free_scm;
         }
-        err = errno_map();
+        err = errno_map_flags(flags & MSG_NOSIGNAL_);   // MSG_NOSIGNAL
         // A /dev/log or initctl path whose socket exists but has no live reader
         // falls back to discarding rather than failing the send.
         if (sendmsg_devlog_fallback &&
@@ -7266,6 +7973,12 @@ static ssize_t recvmsg_ipv6_errqueue(struct fd *sock, struct msghdr *msg, int re
 static int_t sys_recvmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t flags,
         enum guest_abi abi) {
     STRACE("recvmsg(%d, %#llx, %d)", sock_fd, (unsigned long long) msghdr_addr, flags);
+    // MSG_CMSG_CLOEXEC applies to every fd this call installs from SCM_RIGHTS.
+    // It was ignored, so a descriptor a program had explicitly asked to be
+    // close-on-exec arrived without it and leaked into the next exec -- and
+    // there is no race-free way for the caller to repair that afterwards,
+    // which is the entire reason the flag exists.
+    int scm_install_flags = (flags & MSG_CMSG_CLOEXEC_) ? O_CLOEXEC_ : 0;
     int_t sock_err;
     struct fd *sock = sock_getfd(sock_fd, &sock_err);
     if (sock == NULL)
@@ -7769,7 +8482,7 @@ out_recvmsg_done:
                     fd_t fds[scm->num_fds];
                     for (unsigned i = 0; i < scm->num_fds; i++) {
                         fd_retain(scm->fds[i]); // f_install takes ownership; scm_free releases separately
-                        fds[i] = f_install(scm->fds[i], 0);
+                        fds[i] = f_install(scm->fds[i], scm_install_flags);
                         STRACE(" receiving fd %d", fds[i]);
                     }
                     bool appended = guest_cmsg_append(abi, guest_msg_control, required_msg_control, &guest_msg_control_len,
@@ -7796,7 +8509,7 @@ out_recvmsg_done:
                 fd_t fds[dgram_scm->num_fds];
                 for (unsigned i = 0; i < dgram_scm->num_fds; i++) {
                     fd_retain(dgram_scm->fds[i]); // f_install takes ownership; scm_free releases separately
-                    fds[i] = f_install(dgram_scm->fds[i], 0);
+                    fds[i] = f_install(dgram_scm->fds[i], scm_install_flags);
                     STRACE(" receiving dgram fd %d", fds[i]);
                 }
                 bool appended = guest_cmsg_append(abi, guest_msg_control, required_msg_control, &guest_msg_control_len,
@@ -8058,6 +8771,26 @@ static int sock_poll(struct fd *fd) {
     if (fd->socket.conn_dead)
         return POLL_ERR | POLL_HUP;
     int types = realfs_poll(fd);
+    // Darwin's poll() answers POLLHUP the moment the peer stops writing and
+    // gives no way to tell that from a connection that is actually finished.
+    // Linux keeps them apart: EPOLLRDHUP for the peer's half, EPOLLHUP only
+    // once both directions are down. Reporting HUP for a half-close is
+    // provably wrong -- the socket is still writable, and a program treats
+    // EPOLLHUP as "connection over" and drops it.
+    //
+    // A zero-length send is the discriminator, and it is a single syscall with
+    // nothing to clean up: it transmits no segment, leaves pending inbound
+    // data alone, and returns EPIPE exactly when our own write direction has
+    // gone. (SIGPIPE is ignored process-wide -- kernel/init.c -- so it cannot
+    // fire here.) Only for connection-oriented sockets: on a datagram socket a
+    // zero-length send would put an empty datagram on the wire.
+    if ((types & POLL_HUP) &&
+            (fd->socket.type == SOCK_STREAM_ || fd->socket.type == SOCK_SEQPACKET_)) {
+        types &= ~POLL_HUP;
+        types |= POLL_RDHUP;
+        if (send(fd->real_fd, "", 0, MSG_DONTWAIT) < 0 && errno == EPIPE)
+            types |= POLL_HUP;
+    }
 #if defined(__APPLE__)
     if (types & POLL_WRITE)
         sock_trace_tcp_info("poll-write", fd);
@@ -8295,6 +9028,24 @@ out_write:
 }
 
 static int sock_ioctl(struct fd *fd, int cmd, void *arg) {
+    if (cmd == SIOCGSKNS_) {
+        // Which network namespace this socket lives in. There is exactly one
+        // here, so the answer is always the same fd the /proc/<pid>/ns/net
+        // link opens -- which is the truthful answer, not a stand-in.
+        //
+        // Worth having because it is how lsns learns that a socket belongs to
+        // a namespace at all. Refused, it falls back to opening every
+        // descriptor of every process and asking each one whether it is a
+        // namespace, which is noisy and much slower.
+        if (!superuser())
+            return _EPERM;
+        struct fd *ns = proc_ns_open(current->pid, "net");
+        if (ns == NULL)
+            return _EINVAL;
+        if (IS_ERR(ns))
+            return PTR_ERR(ns);
+        return f_install(ns, O_CLOEXEC_);
+    }
     if (cmd == SIOCGIFNAME_)
         return sock_ifreq_name_from_index(arg);
     if (cmd == SIOCGIFCONF_)
@@ -8355,6 +9106,8 @@ static int sock_ioctl(struct fd *fd, int cmd, void *arg) {
 
 static ssize_t sock_ioctl_size(int cmd) {
     switch (cmd) {
+        case SIOCGSKNS_:
+            return 0;   // no argument; the answer is the returned descriptor
         case SIOCOUTQ_:
             return sizeof(dword_t);
         case SIOCGIFNAME_:

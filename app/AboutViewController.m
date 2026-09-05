@@ -178,6 +178,7 @@ BOOL ISHLLMClientEnabled(void) {
 
 @property (nonatomic, strong) UISwitch *llmClientSwitch;
 @property (nonatomic, strong) UISwitch *loginAsDefaultUserSwitch;
+@property (nonatomic, strong) UISwitch *shortcutsRunCommandsSwitch;
 
 @end
 
@@ -809,13 +810,36 @@ static NSString *ISHLLMModelsEndpoint(void) {
     return [base stringByAppendingString:@"/models"];
 }
 
+@interface UINavigationController (ISHLLMSettingsDismiss)
+- (void)ish_dismissLLMSettings;
+@end
+
 static void ISHConfigureLLMSettingsNavigationController(UINavigationController *navigationController) {
     if (@available(iOS 13.0, *)) {
         navigationController.modalPresentationStyle = UIModalPresentationFormSheet;
     } else {
         navigationController.modalPresentationStyle = UIModalPresentationPageSheet;
     }
+    // A modal root has no back button -- it is the root -- so it needs its own
+    // dismiss, and a swipe-down nobody knows about does not count. Every LLM
+    // modal presentation funnels through here, so installing it once covers
+    // all four call sites. Only when the root has not already provided one:
+    // LLMSettingsViewController and LLMChatSessionListViewController do.
+    UIViewController *root = navigationController.viewControllers.firstObject;
+    if (root != nil && root.navigationItem.leftBarButtonItem == nil) {
+        root.navigationItem.leftBarButtonItem =
+            [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                                                          target:navigationController
+                                                          action:@selector(ish_dismissLLMSettings)];
+    }
 }
+
+@implementation UINavigationController (ISHLLMSettingsDismiss)
+- (void)ish_dismissLLMSettings {
+    UIViewController *presenter = self.presentingViewController;
+    [(presenter ?: self) dismissViewControllerAnimated:YES completion:nil];
+}
+@end
 
 static NSArray<NSDictionary<NSString *, NSString *> *> *ISHLLMProviderPresets(void) {
     return @[
@@ -1665,11 +1689,22 @@ static NSString *ISHLLMToolTimeoutTitle(NSInteger seconds) {
 // return its combined stdout+stderr. This makes "web search" just `curl`/`wget`
 // in the environment iSH already is, with no extra API key.
 static NSArray<NSDictionary<NSString *, id> *> *ISHLLMChatToolDefinitions(void) {
+    // Rebuilt per request, so the description tracks the current "Open
+    // Everything as Default User" state: commands run as that account (via su
+    // and its login shell) when the setting is on, as root via /bin/sh -c
+    // otherwise. Only the preference is consulted here -- this runs on the
+    // main thread while composing the request, and resolving the actual
+    // account name means a guest-VFS read of /etc/passwd (the per-session
+    // environment note, built on the guest command queue, carries the exact
+    // name).
+    NSString *identityNote = UserPreferences.shared.shouldLoginAsDefaultUser
+        ? @"Commands run as the unprivileged default user account (not root) when this filesystem has one. "
+        : @"";
     return @[@{
         @"type": @"function",
         @"function": @{
             @"name": @"run_shell",
-            @"description": [NSString stringWithFormat:@"Run a command in the local iSH Linux shell (/bin/sh -c) and return its combined stdout and stderr. Use this to fetch web pages or APIs, read files, or run any Linux command available in this environment. The userland varies by distro -- it may be a minimal BusyBox/Alpine system or a full Debian/Devuan/glibc one -- so use the tools that are actually present (a per-session environment note lists what was detected) and try an alternative if a command reports 'not found'. Output is capped at %ld KB and the command is killed after %ld seconds.", (long) ISHLLMToolOutputLimitKB(), (long) ISHLLMToolTimeoutSeconds()],
+            @"description": [NSString stringWithFormat:@"Run a command in the local iSH Linux shell and return its combined stdout and stderr. %@Use this to fetch web pages or APIs, read files, or run any Linux command available in this environment. The userland varies by distro -- it may be a minimal BusyBox/Alpine system or a full Debian/Devuan/glibc one -- so use the tools that are actually present (a per-session environment note lists what was detected) and try an alternative if a command reports 'not found'. Output is capped at %ld KB and the command is killed after %ld seconds.", identityNote, (long) ISHLLMToolOutputLimitKB(), (long) ISHLLMToolTimeoutSeconds()],
             @"parameters": @{
                 @"type": @"object",
                 @"properties": @{
@@ -1762,12 +1797,27 @@ static NSData *ISHLLMSynchronousChatPost(NSURL *url, NSData *body, NSString *api
 static NSString *ISHLLMRunGuestShellCommand(NSString *command, NSString **summaryOut) {
     NSInteger timeoutSeconds = ISHLLMToolTimeoutSeconds();
     NSInteger outputLimitKB = ISHLLMToolOutputLimitKB();
+    // "Open Everything as Default User": tool commands run as the same account
+    // the user's own workspace terminals sign in as, via su (see
+    // run_guest_command_capture_user). nil account = the plain root path.
+    NSString *account = [AppDelegate headlessCommandAccountName];
     struct guest_command_result result;
-    int rc = run_guest_command_capture(command.UTF8String, NULL,
-                                       (int) (timeoutSeconds * 1000), (size_t) outputLimitKB * 1024, &result);
+    int rc = account != nil
+        ? run_guest_command_capture_user(account.UTF8String, command.UTF8String, NULL,
+                                         (int) (timeoutSeconds * 1000), (size_t) outputLimitKB * 1024, &result)
+        : run_guest_command_capture(command.UTF8String, NULL,
+                                    (int) (timeoutSeconds * 1000), (size_t) outputLimitKB * 1024, &result);
     if (rc < 0) {
         if (summaryOut != NULL)
             *summaryOut = @"failed to start";
+        // Never fall back to running as root here: the failure is reported
+        // instead, naming the setting that chose the su path (mirrors the
+        // Display applet's Wayland-session failure guidance).
+        if (account != nil)
+            return [NSString stringWithFormat:@"Could not start the command as user \"%@\" (error %d). "
+                    @"The \"Open Everything as Default User\" setting runs commands via /bin/su -- "
+                    @"if su is missing or that account cannot log in, disable the setting or fix the account.",
+                    account, rc];
         return [NSString stringWithFormat:@"Could not start the command (error %d). Is the guest system booted?", rc];
     }
 
@@ -1820,8 +1870,13 @@ static NSString *ISHLLMDetectGuestEnvironmentNote(void) {
         "for t in curl wget jq python3 python git make gcc cc vi vim nano tar unzip ssh nc ss netstat ip ifconfig ps top apk apt apt-get dpkg rc-service rc-status service systemctl crontab; do "
         "command -v \"$t\" >/dev/null 2>&1 && printf 'have=%s\\n' \"$t\"; done; "
         "[ -d /etc/init.d ] && printf 'have=/etc/init.d\\n'";
+    // Probe as the same account tool commands will run as, so the detected
+    // tools/PATH match what run_shell actually sees.
+    NSString *account = [AppDelegate headlessCommandAccountName];
     struct guest_command_result result;
-    int rc = run_guest_command_capture(probe, NULL, 10000, 16 * 1024, &result);
+    int rc = account != nil
+        ? run_guest_command_capture_user(account.UTF8String, probe, NULL, 10000, 16 * 1024, &result)
+        : run_guest_command_capture(probe, NULL, 10000, 16 * 1024, &result);
     if (rc < 0)
         return nil;
     NSString *raw = (result.output != NULL && result.output_len > 0)
@@ -1845,6 +1900,10 @@ static NSString *ISHLLMDetectGuestEnvironmentNote(void) {
     NSMutableString *note = [NSMutableString stringWithFormat:
         @"You can run shell commands in this iSH Linux guest with the run_shell tool; it returns combined stdout+stderr (capped at %ld KB, killed after %lds).",
         (long) ISHLLMToolOutputLimitKB(), (long) ISHLLMToolTimeoutSeconds()];
+    if (account != nil)
+        [note appendFormat:@" Commands run as the unprivileged user \"%@\" (the app's \"Open Everything as "
+         @"Default User\" setting), not root -- expect permission errors from root-only operations "
+         @"(package installs, service control) and say so rather than retrying.", account];
     if (distro.length > 0)
         [note appendFormat:@" Detected distro: %@.", distro];
     if (hasCurl && hasWget)
@@ -3027,12 +3086,16 @@ static NSString *ISHLLMShortenedButtonTitle(NSString *text, NSUInteger limit) {
 - (void)showLLMSettings:(id)sender {
     (void) sender;
     UIViewController *settingsViewController = ISHCreateLLMSettingsViewController();
-    if (self.navigationController != nil) {
+    // NOT `navigationController != nil`. In Workspace mode the chat is a bare
+    // child of a host whose navigation bar is hidden, so it INHERITS that
+    // navigation controller -- pushing succeeds and leaves the user with no
+    // chevron, no title, and no working pop gesture. See -ish_canPushSubpage.
+    if (self.ish_canPushSubpage) {
         [self.navigationController pushViewController:settingsViewController animated:YES];
     } else {
         UINavigationController *navigationController = [[UINavigationController alloc] initWithRootViewController:settingsViewController];
         ISHConfigureLLMSettingsNavigationController(navigationController);
-        [self presentViewController:navigationController animated:YES completion:nil];
+        [[self ish_presentationViewController] presentViewController:navigationController animated:YES completion:nil];
     }
 }
 
@@ -4794,9 +4857,15 @@ typedef NS_ENUM(NSInteger, ISHLLMSettingsRow) {
     BOOL onDevice = ISHLLMUsesAppleFoundationModels();
     switch ((ISHLLMSettingsRow) indexPath.row) {
         case ISHLLMSettingsRowDestinations: {
+            // Name the ACTIVE one, not just how many there are. A bare count
+            // reads as bookkeeping; the name reads as "this is what you are
+            // talking to, and this row is where you change it".
             NSUInteger count = ISHLLMDestinations().count;
+            NSString *active = ISHLLMDestinationDisplayName(ISHLLMActiveDestination());
             cell.textLabel.text = @"Destinations";
-            cell.detailTextLabel.text = count == 1 ? @"1 saved" : [NSString stringWithFormat:@"%lu saved", (unsigned long) count];
+            cell.detailTextLabel.text = count == 1
+                ? active
+                : [NSString stringWithFormat:@"%@ · %lu saved", active, (unsigned long) count];
             break;
         }
         case ISHLLMSettingsRowProvider:
@@ -5200,13 +5269,40 @@ typedef NS_ENUM(NSInteger, ISHLLMSettingsRow) {
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     NSDictionary<NSString *, NSString *> *preset = ISHLLMProviderPresets()[indexPath.row];
-    UserPreferences.shared.llmProvider = preset[@"name"];
-    UserPreferences.shared.llmServerURL = preset[@"url"] ?: @"";
-    if (preset[@"model"].length > 0)
-        UserPreferences.shared.llmModel = preset[@"model"];
-    // Keep the saved destination describing the live configuration: a preset
-    // pick edits the ACTIVE destination in place rather than adding one.
-    ISHLLMSyncActiveDestinationFromPreferences();
+    NSString *name = preset[@"name"];
+
+    // Picking a provider SWITCHES destinations; it does not overwrite one.
+    //
+    // This used to write the four scalars and then sync them into the active
+    // destination, so choosing Groq while OpenAI was active replaced the OpenAI
+    // entry -- its model, its URL, and the fact it existed at all. Anyone who
+    // uses two providers had to know to go to Destinations and add one FIRST,
+    // and if they did not, the only copy of the old setup was gone. It also
+    // carried the previous provider's API key over to the new one, which is
+    // both wrong and quietly confusing to debug.
+    //
+    // So: if a saved destination already uses this provider, activate it and
+    // restore its model, URL and key. Otherwise add a new one seeded from the
+    // preset and leave the current destination untouched.
+    for (NSDictionary<NSString *, NSString *> *destination in ISHLLMDestinations()) {
+        if ([ISHLLMStringValue(destination, kISHLLMDestinationProvider) isEqualToString:name]) {
+            ISHLLMActivateDestination(destination);
+            [self.navigationController popViewControllerAnimated:YES];
+            return;
+        }
+    }
+
+    NSDictionary<NSString *, NSString *> *fresh = @{
+        kISHLLMDestinationID: NSUUID.UUID.UUIDString,
+        kISHLLMDestinationName: name,
+        kISHLLMDestinationProvider: name,
+        kISHLLMDestinationURL: preset[@"url"] ?: @"",
+        kISHLLMDestinationModel: preset[@"model"] ?: @"",
+        // Deliberately empty: a key belongs to the provider that issued it.
+        kISHLLMDestinationAPIKey: @"",
+    };
+    ISHLLMSaveDestination(fresh);
+    ISHLLMActivateDestination(fresh);
     [self.navigationController popViewControllerAnimated:YES];
 }
 
@@ -5821,13 +5917,17 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
 }
 
 // Appended sections live past the storyboard's static ones, in a fixed order:
-// user-account section, then LLM section.
+// user-account section, then LLM section, then Shortcuts section.
 - (NSInteger)_userAccountSectionIndex {
     return [self _visibleStoryboardSectionCount];
 }
 
 - (NSInteger)_llmSectionIndex {
     return [self _visibleStoryboardSectionCount] + 1;
+}
+
+- (NSInteger)_shortcutsSectionIndex {
+    return [self _visibleStoryboardSectionCount] + 2;
 }
 
 - (UITableViewCell *)_loginAsDefaultUserCell {
@@ -5862,11 +5962,23 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
     return cell;
 }
 
+- (UITableViewCell *)_shortcutsRunCommandsCell {
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    cell.textLabel.text = @"Allow Shortcuts to Run Commands";
+    UISwitch *enabledSwitch = [UISwitch new];
+    enabledSwitch.on = UserPreferences.shared.shortcutsRunCommandsEnabled;
+    [enabledSwitch addTarget:self action:@selector(shortcutsRunCommandsChanged:) forControlEvents:UIControlEventValueChanged];
+    cell.accessoryView = enabledSwitch;
+    self.shortcutsRunCommandsSwitch = enabledSwitch;
+    return cell;
+}
+
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     if (indexPath.section == [self _llmSectionIndex]) {
         if (indexPath.row == 1) {
             UIViewController *settingsViewController = ISHCreateLLMSettingsViewController();
-            if (self.navigationController != nil) {
+            if (self.ish_canPushSubpage) {
                 [self.navigationController pushViewController:settingsViewController animated:YES];
             } else {
                 UINavigationController *navigationController = [[UINavigationController alloc] initWithRootViewController:settingsViewController];
@@ -6026,15 +6138,17 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
     if (section == [self _userAccountSectionIndex]) {
         NSString *accountName = [AppDelegate defaultUserAccountName];
         return accountName.length != 0
-            ? [NSString stringWithFormat:@"When enabled, new Workspace terminals and app sessions sign in as \"%@\" (UID %d) instead of root. The Session Shell always signs in as root.",
+            ? [NSString stringWithFormat:@"When enabled, new Workspace terminals, app sessions, and headless commands (LLM Chat's shell tool, Shortcuts' Run Command) run as \"%@\" (UID %d) instead of root. The Session Shell always signs in as root.",
                accountName, ISHDefaultUserAccountUID]
-            : [NSString stringWithFormat:@"When enabled, new Workspace terminals and app sessions sign in as the UID %d account instead of root -- but this filesystem doesn't have one yet. The Session Shell always signs in as root.",
+            : [NSString stringWithFormat:@"When enabled, new Workspace terminals, app sessions, and headless commands (LLM Chat's shell tool, Shortcuts' Run Command) run as the UID %d account instead of root -- but this filesystem doesn't have one yet. The Session Shell always signs in as root.",
                ISHDefaultUserAccountUID];
     }
     if (section == [self _llmSectionIndex])
         return UserPreferences.shared.shouldEnableLLMClient
             ? @"When enabled, LLM Chat appears in Switch Terminal and Workspace menus."
             : @"Enable to show an OpenAI-compatible LLM client in terminal and Workspace menus.";
+    if (section == [self _shortcutsSectionIndex])
+        return @"When enabled, the Shortcuts app's \"Run Command\" action can run shell commands in the guest system without opening iSH-AOK.";
     if (section == 1) { // filesystems / upgrade
         if (!FsIsManaged()) {
             return @"The current filesystem is not managed by iSH.";
@@ -6052,11 +6166,13 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
         return @"Default User";
     if (section == [self _llmSectionIndex])
         return @"LLM Client";
+    if (section == [self _shortcutsSectionIndex])
+        return @"Shortcuts";
     return [super tableView:tableView titleForHeaderInSection:section];
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
-    return [self _visibleStoryboardSectionCount] + 2;
+    return [self _visibleStoryboardSectionCount] + 3;
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -6064,6 +6180,8 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
         return 1;
     if (section == [self _llmSectionIndex])
         return UserPreferences.shared.shouldEnableLLMClient ? 2 : 1;
+    if (section == [self _shortcutsSectionIndex])
+        return 1;
     return [super tableView:tableView numberOfRowsInSection:section];
 }
 
@@ -6075,6 +6193,8 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
             return [self _llmEnabledCell];
         return [self _llmSettingsCell];
     }
+    if (indexPath.section == [self _shortcutsSectionIndex])
+        return [self _shortcutsRunCommandsCell];
     return [super tableView:tableView cellForRowAtIndexPath:indexPath];
 }
 
@@ -6175,6 +6295,10 @@ typedef NS_ENUM(NSInteger, ISHLLMDestinationEditorRow) {
 
 - (void)loginAsDefaultUserChanged:(UISwitch *)sender {
     UserPreferences.shared.shouldLoginAsDefaultUser = sender.on;
+}
+
+- (void)shortcutsRunCommandsChanged:(UISwitch *)sender {
+    UserPreferences.shared.shortcutsRunCommandsEnabled = sender.on;
 }
 
 //- (IBAction)shouldLockSleepNanoseconds:(id)sender {

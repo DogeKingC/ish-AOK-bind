@@ -182,7 +182,7 @@ static off_t_ proc_seek(struct fd *fd, off_t_ off, int whence) {
 static ssize_t proc_pread(struct fd *fd, void *buf, size_t bufsize, off_t off) {
     if (fd->proc.entry.meta->pread) {
         struct proc_data data = {buf, bufsize, bufsize};
-        return fd->proc.entry.meta->pread(&fd->proc.entry, &data, off);
+        return fd->proc.entry.meta->pread(&fd->proc.entry, &data, off, fd->flags);
     }
     
     int err = proc_refresh_data(fd);
@@ -239,7 +239,14 @@ static ssize_t proc_pwrite(struct fd *fd, const void *buf, size_t bufsize, off_t
     if (!fd->proc.entry.meta->update) {
         return _EPERM;
     }
-    
+
+    // A zero-length write is write(2)'s business, not the file's: it writes
+    // nothing and returns 0, and Linux's proc_sys_call_handler short-circuits
+    // before the handler is ever asked. Passing it through made every sysctl
+    // answer EINVAL for `write(fd, buf, 0)`, which is not an error anywhere.
+    if (bufsize == 0)
+        return 0;
+
     struct proc_data data = {(char *)buf, bufsize, bufsize};
     int err = fd->proc.entry.meta->update(&fd->proc.entry, &data);
     if (err < 0)
@@ -279,7 +286,9 @@ static int proc_close(struct fd *fd) {
 // mask (fs/poll.c triggered_types) suppresses re-delivery after the first
 // event, and proc_mountinfo_notify_changed's poll_wakeup re-arms it per
 // mount-table change.
-static int proc_poll(struct fd *UNUSED(fd)) {
+static int proc_poll(struct fd *fd) {
+    if (fd->proc.entry.meta->poll != NULL)
+        return fd->proc.entry.meta->poll(&fd->proc.entry, (off_t) fd->offset);
     return POLL_READ;
 }
 
@@ -335,8 +344,19 @@ void proc_printf(struct proc_data *buf, const char *format, ...) {
     char data[4096];
     va_list args;
     va_start(args, format);
-    size_t size = vsnprintf(data, sizeof(data), format, args);
+    int printed = vsnprintf(data, sizeof(data), format, args);
     va_end(args);
+    // vsnprintf reports what it WOULD have written, not what it did, and the
+    // result went straight to proc_buf_append as a length. Two ways that reads
+    // off the end of this stack buffer and copies the result into a file the
+    // guest then reads: output longer than the buffer (printed > sizeof data),
+    // and an encoding error (printed < 0, which as a size_t is SIZE_MAX).
+    // Clamp to what is actually in the buffer.
+    if (printed < 0)
+        return;
+    size_t size = (size_t) printed;
+    if (size >= sizeof(data))
+        size = sizeof(data) - 1;
     proc_buf_append(buf, data, size);
 }
 

@@ -14,6 +14,7 @@
 #include "kernel/calls.h"
 #include "kernel/errno.h"
 #include "kernel/sysvipc.h"
+#include "fs/proc.h"
 #include "kernel/task.h"
 #include "util/list.h"
 #include "util/sync.h"
@@ -66,6 +67,7 @@ struct msg_queue {
 };
 
 static struct list msg_queues = LIST_INITIALIZER(msg_queues);
+
 static lock_t msg_lock = LOCK_INITIALIZER;
 static int msg_next_id = 1;
 
@@ -199,6 +201,12 @@ int_t sys_msgsnd_guest(int_t msqid, guest_addr_t msgp, qword_t msgsz, int_t msgf
         free(msg);
         return _EINVAL;
     }
+    // Sending needs write permission on the queue.
+    if (!ipc_access_ok(queue->uid, queue->gid, queue->cuid, queue->cgid, queue->mode, 2)) {
+        unlock(&msg_lock);
+        free(msg);
+        return _EACCES;
+    }
     while (queue->cbytes + msgsz > queue->qbytes) {
         if (msgflg & IPC_NOWAIT_) {
             unlock(&msg_lock);
@@ -262,6 +270,11 @@ int_t sys_msgrcv_guest(int_t msqid, guest_addr_t msgp, qword_t msgsz,
     if (queue == NULL) {
         unlock(&msg_lock);
         return _EINVAL;
+    }
+    // Receiving needs read permission on the queue.
+    if (!ipc_access_ok(queue->uid, queue->gid, queue->cuid, queue->cgid, queue->mode, 4)) {
+        unlock(&msg_lock);
+        return _EACCES;
     }
     struct msg_msg *msg;
     for (;;) {
@@ -366,6 +379,10 @@ int_t sys_msgctl_guest(int_t msqid, int_t cmd, guest_addr_t buf) {
     }
 
     if (cmd_base == IPC_RMID_) {
+        if (!ipc_owner_ok(queue->uid, queue->cuid)) {
+            unlock(&msg_lock);
+            return _EPERM;
+        }
         queue->removed = true;
         notify(&queue->snd_cond);
         notify(&queue->rcv_cond);
@@ -375,6 +392,10 @@ int_t sys_msgctl_guest(int_t msqid, int_t cmd, guest_addr_t buf) {
     }
 
     if (cmd_base == IPC_SET_) {
+        if (!ipc_owner_ok(queue->uid, queue->cuid)) {
+            unlock(&msg_lock);
+            return _EPERM;
+        }
         // Only perms and qbytes are settable; read the ABI-appropriate
         // layout and apply the fields we track.
         uid_t_ uid; uid_t_ gid; mode_t_ mode; qword_t qbytes;
@@ -475,4 +496,23 @@ int_t sys_msgrcv(int_t msqid, addr_t msgp, dword_t msgsz, int_t msgtyp, int_t ms
 }
 int_t sys_msgctl(int_t msqid, int_t cmd, addr_t buf) {
     return sys_msgctl_guest(msqid, cmd, buf);
+}
+
+// /proc/sysvipc/msg -- see the note on proc_sysvipc_show_sem.
+void proc_sysvipc_show_msg(struct proc_data *buf) {
+    proc_printf(buf, "%10s %10s %-10s %10s %10s %5s %5s %5s %5s %5s %5s %10s %10s %10s\n",
+                "key", "msqid", "perms", "cbytes", "qnum", "lspid", "lrpid",
+                "uid", "gid", "cuid", "cgid", "stime", "rtime", "ctime");
+    lock(&msg_lock, 0);
+    struct msg_queue *q;
+    list_for_each_entry(&msg_queues, q, qlist) {
+        if (q->removed)
+            continue;
+        proc_printf(buf, "%10d %10d %-10o %10zu %10zu %5d %5d %5u %5u %5u %5u %10lld %10lld %10lld\n",
+                    (int) q->key, q->id, q->mode & 0777, q->cbytes, q->qnum,
+                    (int) q->lspid, (int) q->lrpid,
+                    q->uid, q->gid, q->cuid, q->cgid,
+                    (long long) q->stime, (long long) q->rtime, (long long) q->ctime);
+    }
+    unlock(&msg_lock);
 }

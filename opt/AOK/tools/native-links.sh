@@ -1,10 +1,19 @@
 #!/bin/sh
-# Link SmallCLUE's applets into a bin directory so they run natively.
+# Link iSH-AOK's native programs into a bin directory so they run natively:
+# SmallCLUE's applets, and the standalone programs beside it in /AOK/native --
+# helix (`hx`), bash and zsh.
 #
 # /AOK/native/smallclue is compiled into iSH-AOK and runs as host code rather
 # than translated guest instructions, so it costs the same on every guest
 # architecture. Like any multicall binary it picks its applet from argv[0], so
 # a symlink named `wc` runs the wc applet.
+#
+# The standalone programs are not applets: each is its own binary, so its link
+# points at its own file and argv[0] selects nothing. Which of them exist is a
+# build property -- `hx` is in the app build and absent from a CLI build
+# configured without -Dnative_helix -- so they are enumerated from /AOK/native
+# rather than named here. See PROGRAMS_EXCLUDED for the three that are not
+# commands.
 #
 # Use a SYMlink, never a hard link: /AOK is its own filesystem, so `ln` across
 # it fails with EXDEV.
@@ -41,7 +50,7 @@
 #   sh /AOK/tools/native-links.sh [options] [directory]
 #
 #   --list     show what would happen, change nothing
-#   --remove   remove links pointing at /AOK/native/smallclue
+#   --remove   remove links pointing anywhere into /AOK/native
 #   --all      include applets that do not work in this build (see EXCLUDED)
 #   --force    replace files that are not our own symlinks
 #   --no-shell leave the UID 1000 login shell alone
@@ -56,8 +65,28 @@
 set -eu
 
 NATIVE=/AOK/native/smallclue
+NATIVE_DIR=/AOK/native
 NATIVE_BASH=/AOK/native/bash
 NATIVE_ZSH=/AOK/native/zsh
+
+# The standalone native programs -- everything in /AOK/native that is NOT
+# SmallCLUE -- get linked too. They are whole programs rather than applets of a
+# multicall binary, so each link points at its own file instead of at
+# $NATIVE, and argv[0] selects nothing.
+#
+# Enumerated from the directory rather than listed here, for the same reason
+# the applet list is read out of the binary: which ones exist is a property of
+# the BUILD. helix is the case that proves it -- `hx` is in the app build and
+# absent from a CLI build configured without -Dnative_helix, and a hardcoded
+# name would be wrong in one of them.
+#
+# Not linked, and neither is a judgement about whether it works:
+#   rust-probe   a diagnostic that exercises the Rust/kqueue path, not a
+#                command anybody types
+#   zsh-multio   an internal variant of zsh, not a second shell
+#   smallclue    the multicall binary itself; its applets are linked by name
+#                further down, and a `smallclue` link would just be the banner
+PROGRAMS_EXCLUDED="smallclue rust-probe zsh-multio"
 # Which of them becomes the login shell. Empty means "decide below": prefer bash
 # when it is there, otherwise zsh. That ordering keeps this script doing exactly
 # what it always did on a build that HAS bash -- which is the default build, since
@@ -67,7 +96,12 @@ NATIVE_ZSH=/AOK/native/zsh
 # binary, switch to zsh instead of silently switching nothing.
 SHELL_WANT=
 TARGET_DIR=/usr/local/native-bin
-MODE=link
+# MODE is what the run is FOR; DRY_RUN is whether it touches anything. Two
+# variables rather than one, so --list composes with --remove instead of
+# racing it: `--list --remove` prints what a removal would take back and takes
+# nothing back. Held in one variable, the last flag simply won.
+MODE=link          # link | remove
+DRY_RUN=0          # --list: print, change nothing, in either mode
 INCLUDE_ALL=0
 FORCE=0
 DO_SHELL=1
@@ -157,19 +191,37 @@ zsh_path_file() {
 #                    command with no authentication at all
 #   not commands     smallclue, smallclue-help, licenses
 #
-# Three entries left this list after being fixed rather than reclassified, which
+# Five entries left this list after being fixed rather than reclassified, which
 # is the outcome to aim for: ipaddr (the shim's getifaddrs is real now -- the
 # host's interfaces ARE the guest's, and /proc/net/dev was already built from
 # them), kill (which now takes -0, -s SIG and a signal by name or number), and
 # dmesg -- whose __linux__ test was answering the wrong question, since AOK's
 # guest IS Linux and now answers klogctl through the shim.
 #
+# less and more are the fourth and fifth, on 2026-08-22. They were excluded
+# because `apt search maria` wedged the app every time and removing the less
+# symlink cured it. The trigger was never SmallCLUE's: apt hands its pager a
+# close-on-exec pipe and reads four bytes from it to learn whether the exec
+# worked, and iSH-AOK's native dispatch was returning from execve without
+# applying close-on-exec at all. The write end survived in the pager, so apt's
+# read never saw EOF -- it sat on four bytes while the pager sat on the stdin
+# apt had not begun writing. Fixed in kernel/exec.c
+# (exec_apply_native_process_state), which is why a shell script or an explicit
+# PAGER between the two always "worked": a script IS a real exec, and it closed
+# the pipe on apt's behalf.
+#
+# The pager was fixed too, and independently: it read the WHOLE stream before
+# drawing a line, where real less paints the first screen as soon as it has
+# one. It now streams, and it takes real less's other rule with it -- output
+# that is not a tty is copied through rather than paged, so `less file | head`
+# in a session no longer waits for a keystroke nobody will type.
+#
 # Absent from this list on purpose, because they are handled by PROBED below
 # rather than hardcoded: everything whose availability depends on what this
 # particular build has compiled in.
-EXCLUDED="chroot halt init licenses mdev mknod mount passwd poweroff
-reboot runit script smallclue smallclue-help su sudo umount version
-vproc-test watch"
+EXCLUDED="chroot halt init licenses mdev mknod mount passwd
+poweroff reboot runit script smallclue smallclue-help su sudo umount
+version vproc-test watch"
 
 # Availability-gated applets: present in every build, working only in some.
 # These are the ones that made the list stale, because whether they work is a
@@ -227,17 +279,41 @@ probe_missing() {
     return 1
 }
 
+# Every file in /AOK/native, so the ownership test below can recognise a link
+# this script made to ANY of them, not just to SmallCLUE. Populated even in
+# --remove mode: that is the mode that most needs to know what is ours.
+NATIVE_ALL=
+if [ -d "$NATIVE_DIR" ]; then
+    for np in "$NATIVE_DIR"/*; do
+        [ -f "$np" ] || continue
+        NATIVE_ALL="$NATIVE_ALL ${np##*/}"
+    done
+fi
+
+# True when $1 is a symlink that resolves to something in /AOK/native -- which
+# is what "this script made it" means now that the links have more than one
+# target. `readlink` is itself an applet this script links, so this uses -ef
+# against the enumerated names and stays builtin-only.
+link_is_native() {
+    [ -L "$1" ] || return 1
+    for _np in $NATIVE_ALL; do
+        [ "$1" -ef "$NATIVE_DIR/$_np" ] && return 0
+    done
+    return 1
+}
+
 # Inlined rather than read out of the file header with sed: `sed` is itself an
 # applet this script links, so --help would break after installation. Same
 # reason the applet list is parsed with builtins.
 usage() {
-    echo "Link SmallCLUE's applets into a bin directory so they run natively."
+    echo "Link iSH-AOK's native programs into a bin directory so they run"
+    echo "natively: SmallCLUE's applets, plus hx, bash and zsh from /AOK/native."
     echo
     echo "Usage: sh /AOK/tools/native-links.sh [options] [directory]"
     echo "       (defaults to /usr/local/native-bin, put first on PATH unless --no-path)"
     echo
     echo "  --list     show what would happen, change nothing"
-    echo "  --remove   remove links pointing at /AOK/native/smallclue"
+    echo "  --remove   remove links pointing anywhere into /AOK/native"
     echo "  --all      include applets that do not work in this build"
     echo "  --force    replace files that are not our own symlinks"
     echo "  --no-shell leave the UID 1000 login shell alone"
@@ -257,7 +333,7 @@ usage() {
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --list) MODE=list ;;
+        --list) DRY_RUN=1 ;;
         --remove) MODE=remove ;;
         --all) INCLUDE_ALL=1 ;;
         --force) FORCE=1 ;;
@@ -358,27 +434,49 @@ apply_path() {
     zfile=$(zsh_path_file)
     if [ "$MODE" = remove ]; then
         if [ -f "$PATH_FILE" ]; then
-            rm -f "$PATH_FILE"
-            echo "  removed $PATH_FILE (PATH reverts at next login)"
+            if [ "$DRY_RUN" -eq 1 ]; then
+                echo "  would remove $PATH_FILE (PATH reverts at next login)"
+            else
+                if rm -f "$PATH_FILE" 2>/dev/null && [ ! -f "$PATH_FILE" ]; then
+                    echo "  removed $PATH_FILE (PATH reverts at next login)"
+                else
+                    echo "  could NOT remove $PATH_FILE (need root?)" >&2
+                fi
+            fi
         fi
         # Only ever the block this script wrote: the file may be the distro's.
         if zsh_block_present "$zfile"; then
-            tmp=$zfile.aok.$$
-            skip=0
-            while IFS= read -r zline || [ -n "$zline" ]; do
-                case "$zline" in
-                    "$ZSH_MARK_BEGIN") skip=1; continue ;;
-                    "$ZSH_MARK_END")   skip=0; continue ;;
-                esac
-                [ "$skip" -eq 1 ] || printf '%s\n' "$zline"
-            done < "$zfile" > "$tmp" && mv "$tmp" "$zfile"
-            # A file left empty was one this script created.
-            [ -s "$zfile" ] || rm -f "$zfile"
-            echo "  removed the PATH block from $zfile"
+            if [ "$DRY_RUN" -eq 1 ]; then
+                echo "  would remove the PATH block from $zfile"
+            else
+                tmp=$zfile.aok.$$
+                skip=0
+                # Every step here can fail on a file this user does not own,
+                # and saying so is the whole point: the message used to print
+                # unconditionally, so a run that changed nothing reported
+                # having removed the block. That is worse than the failure --
+                # it sends you looking somewhere else for the problem.
+                if { while IFS= read -r zline || [ -n "$zline" ]; do
+                        case "$zline" in
+                            "$ZSH_MARK_BEGIN") skip=1; continue ;;
+                            "$ZSH_MARK_END")   skip=0; continue ;;
+                        esac
+                        [ "$skip" -eq 1 ] || printf '%s\n' "$zline"
+                     done < "$zfile" > "$tmp"; } 2>/dev/null && mv "$tmp" "$zfile" 2>/dev/null; then
+                    # A file left empty was one this script created. Only
+                    # considered once the rewrite actually landed, or a failed
+                    # run could delete a file it never managed to touch.
+                    [ -s "$zfile" ] || rm -f "$zfile"
+                    echo "  removed the PATH block from $zfile"
+                else
+                    rm -f "$tmp" 2>/dev/null || :
+                    echo "  could NOT edit $zfile (need root?); its PATH block is still there" >&2
+                fi
+            fi
         fi
         return 0
     fi
-    if [ "$MODE" = list ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
         [ -f "$PATH_FILE" ] && echo "  $PATH_FILE already present" \
                             || echo "  would put $TARGET_DIR first on PATH via $PATH_FILE"
         if zsh_block_present "$zfile"; then
@@ -448,10 +546,14 @@ apply_shell() {
         [ -n "$prev" ] || { echo "  saved shell for $user is empty; leaving $cur alone"; return 0; }
         if [ "$cur" = "$prev" ]; then
             echo "  $user already uses $prev"
+        elif [ "$DRY_RUN" -eq 1 ]; then
+            echo "  would restore $user's shell: $cur -> $prev"
         elif set_uid1000_shell "$prev"; then
             echo "  restored $user's shell: $cur -> $prev"
         fi
-        rm -f "$SHELL_STATE"
+        # The saved shell is what a real --remove consumes; a preview must
+        # leave it behind or the run that follows has nothing to restore from.
+        [ "$DRY_RUN" -eq 1 ] || rm -f "$SHELL_STATE"
         return 0
     fi
 
@@ -465,7 +567,7 @@ apply_shell() {
         echo "  $NATIVE_SHELL not present; leaving $user's shell as $cur" >&2
         return 0
     fi
-    if [ "$MODE" = list ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
         echo "  would set $user's shell: $cur -> $NATIVE_SHELL"
         return 0
     fi
@@ -500,18 +602,37 @@ is_excluded() {
 # real file that happens to share a name is never touched.
 if [ "$MODE" = remove ]; then
     removed=0
+    failed=0
     for f in "$TARGET_DIR"/*; do
-        [ -L "$f" ] || continue
         # `readlink` is itself an applet this script may have linked, so avoid
-        # it: -ef compares what the paths resolve to, using the shell alone.
-        [ "$f" -ef "$NATIVE" ] || continue
-        rm -f "$f"
+        # it: link_is_native compares what the paths resolve to, using the
+        # shell alone, and covers the standalone programs as well as SmallCLUE.
+        link_is_native "$f" || continue
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "  would unlink $f"
+        elif rm -f "$f" 2>/dev/null && [ ! -e "$f" ] && [ ! -L "$f" ]; then
+            :
+        else
+            # Counting a removal that did not happen is how "removed 115
+            # link(s)" gets printed by a run that changed nothing, which sends
+            # the reader looking anywhere but here. Count what actually went.
+            failed=$((failed + 1))
+            continue
+        fi
         removed=$((removed + 1))
     done
-    echo "removed $removed link(s) from $TARGET_DIR"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "would remove $removed link(s) from $TARGET_DIR"
+    else
+        echo "removed $removed link(s) from $TARGET_DIR"
+        if [ "$failed" -gt 0 ]; then
+            echo "  $failed link(s) could NOT be removed (need root?)" >&2
+            REMOVE_FAILED=1
+        fi
+    fi
     [ "$DO_PATH" -eq 1 ] && apply_path
     [ "$DO_SHELL" -eq 1 ] && apply_shell
-    exit 0
+    exit "${REMOVE_FAILED:-0}"
 fi
 
 # The applet list comes from the binary, not from a list in here, so it tracks
@@ -521,7 +642,17 @@ fi
 # had installed the links, `awk` resolved to the NATIVE awk, which reads the
 # banner differently, and the second run could no longer find any applets. A
 # script that installs commands onto PATH must not then depend on that PATH.
-APPLETS=$(
+#
+# A function rather than the loop written straight inside `APPLETS=$( ... )`,
+# which is what it used to be. bash 3.2 -- still what macOS ships as /bin/bash,
+# so still what a `bash native-links.sh` or a `sh -n` lint run on a Mac uses --
+# counts parentheses naively inside $( ), takes the `)` that ends a case PATTERN
+# for the one that ends the substitution, and rejects the whole file at the
+# following `;;'. Nothing here is bash-specific and no guest shell has the bug
+# (ash, dash, zsh and ksh all parse it), but a script nobody can lint is one
+# whose next real syntax error goes unnoticed. Moving the case out of the
+# substitution costs nothing and parses everywhere.
+applet_list() {
     "$NATIVE" 2>&1 | while IFS= read -r line; do
         case "$line" in
             "  "[a-z[]*)
@@ -531,13 +662,14 @@ APPLETS=$(
                 ;;
         esac
     done
-)
+}
+APPLETS=$(applet_list)
 if [ -z "$APPLETS" ]; then
     echo "$0: could not read the applet list from $NATIVE" >&2
     exit 1
 fi
 
-[ "$MODE" = list ] || mkdir -p "$TARGET_DIR"
+[ "$DRY_RUN" -eq 1 ] || mkdir -p "$TARGET_DIR"
 
 linked=0; skipped=0; excluded=0; blocked=0
 pruned=0
@@ -557,7 +689,7 @@ for applet in $APPLETS; do
         # somebody else's link, is never touched.
         stale="$TARGET_DIR/$applet"
         if [ -L "$stale" ] && [ "$stale" -ef "$NATIVE" ]; then
-            if [ "$MODE" = list ]; then
+            if [ "$DRY_RUN" -eq 1 ]; then
                 echo "  would unlink $stale (now excluded)"
             else
                 rm -f "$stale"
@@ -575,13 +707,13 @@ for applet in $APPLETS; do
     fi
     if [ -e "$dest" ] || [ -L "$dest" ]; then
         if [ "$FORCE" -eq 0 ]; then
-            [ "$MODE" = list ] && echo "  would NOT replace $dest (exists; --force to override)"
+            [ "$DRY_RUN" -eq 1 ] && echo "  would NOT replace $dest (exists; --force to override)"
             blocked=$((blocked + 1))
             continue
         fi
     fi
 
-    if [ "$MODE" = list ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
         echo "  would link $dest -> $NATIVE"
     else
         ln -sf "$NATIVE" "$dest"
@@ -589,10 +721,47 @@ for applet in $APPLETS; do
     linked=$((linked + 1))
 done
 
-if [ "$MODE" = list ]; then
-    echo "would link $linked, leave $blocked in place, skip $excluded excluded, $skipped already linked, unlink $pruned now-excluded"
+# The standalone programs. Same rules as the applets -- never replace
+# something that is not ours without --force, idempotent when the link is
+# already right -- but each points at its own file rather than at $NATIVE.
+programs=0
+for prog in $NATIVE_ALL; do
+    skip=0
+    for e in $PROGRAMS_EXCLUDED; do
+        [ "$prog" = "$e" ] && skip=1
+    done
+    [ "$skip" -eq 1 ] && continue
+
+    src="$NATIVE_DIR/$prog"
+    dest="$TARGET_DIR/$prog"
+
+    if [ -L "$dest" ] && [ "$dest" -ef "$src" ]; then
+        skipped=$((skipped + 1))   # already ours and already right
+        continue
+    fi
+    # A link of ours pointing somewhere else in /AOK/native is ours to correct
+    # -- an applet link left by an older run whose name a program has since
+    # taken, say -- and is repointed without needing --force.
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        if ! link_is_native "$dest" && [ "$FORCE" -eq 0 ]; then
+            [ "$DRY_RUN" -eq 1 ] && echo "  would NOT replace $dest (exists; --force to override)"
+            blocked=$((blocked + 1))
+            continue
+        fi
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "  would link $dest -> $src"
+    else
+        ln -sf "$src" "$dest"
+    fi
+    programs=$((programs + 1))
+done
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "would link $linked applet(s) and $programs program(s), leave $blocked in place, skip $excluded excluded, $skipped already linked, unlink $pruned now-excluded"
 else
-    echo "linked $linked into $TARGET_DIR ($skipped already, $blocked left in place, $excluded excluded, $pruned stale removed)"
+    echo "linked $linked applet(s) and $programs program(s) into $TARGET_DIR ($skipped already, $blocked left in place, $excluded excluded, $pruned stale removed)"
     [ "$blocked" -gt 0 ] && echo "  $blocked existing command(s) left alone; --force to replace, --list to see them"
 fi
 

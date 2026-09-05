@@ -71,8 +71,15 @@ echo op=remove >&3; echo name=Experiment >&3; echo confirm=yes >&3; echo run >&3
 The **Filesystems** screen — in app settings, and the same screen as the **Boot
 Images** applet in Workspace — lists four groups:
 
-- **Installed Filesystems** — the roots you already have, with the one that
-  boots next marked. Swipe to delete one.
+- **Installed Filesystems** — the roots you already have. The one currently
+  running as `/` is tinted and bold, and reads "● IN USE — mounted at / ·
+  can't be deleted"; the others read "Mounted at `/AOK/roots/<name>`", or
+  carry no subtitle at all if their mount failed. The root set to boot next
+  is usually that same row but need not be — choosing a different default
+  takes effect immediately while `/` stays where it is until the next launch
+  — and neither of those two can be deleted or renamed while it is in use. To
+  delete or rename one, tap it and use the detail screen — swipe-to-delete
+  applies to the cached archives below, not to installed roots.
 - **Root Cached Filesystems (`/AOK/persist/roots`)** — any root archives
   sitting in that shared, persistent folder, whether they got there via
   automatic download or because you (or the Files app) dropped a
@@ -113,8 +120,8 @@ booted into.
 
 Being visible under `/AOK/roots/<name>` isn't enough to actually run
 programs from another root the way a distro install would expect —
-`/proc`, `/sys`, `/dev`, and `/dev/pts` still need to be bind-mounted in so
-guest tools see the same view of the (single, shared) kernel that the
+`/proc`, `/sys`, `/dev`, `/dev/pts` and `/run` still need to be bind-mounted
+in so guest tools see the same view of the (single, shared) kernel that the
 outer root sees. `/AOK/tools/mount-root.sh` does that bind-mounting and
 then chroots you in.
 
@@ -135,15 +142,57 @@ sh /AOK/tools/mount-root.sh --unmount Devuan6-x86_64
 sh /AOK/tools/mount-root.sh --unmount all
 ```
 
-The script also bind-mounts `/AOK/tools` itself into the chroot, so
-`mount-root.sh` and `ktop` stay reachable from inside it. Root names are
-sanity-checked to reject `/`, `.`, and `..`.
+The script also bind-mounts `/AOK/tools` and `/AOK/tests` into the chroot, so
+`mount-root.sh`, `ktop` and the guest regression suite stay reachable from
+inside it — `/AOK` is the booted root's aokfs mount and does not otherwise
+exist in another root, which is what makes
+`mount-root.sh <root> -- sh /AOK/tests/setup-regressions.sh --run`
+possible at all. Root names are sanity-checked to reject `/`, `.`, and `..`.
 
 Because there's only one real kernel underneath, a process started inside
 a `mount-root.sh` chroot is a completely ordinary process from the outer
 root's point of view — `ktop` or `ps` run outside the chroot will see it,
 architecture and all. See [ktop.md](ktop.md) for the one caveat that runs
 the other way (running `ktop` *from inside* a chroot).
+
+## Bind mounts by hand
+
+`mount-root.sh` does its bind-mounting for you, but `mount --bind` is available
+directly and behaves the way Linux does:
+
+```sh
+mount --bind /some/dir  /mnt/point     # directory over directory
+mount --bind /etc/hosts /tmp/hosts     # a single FILE over another file
+umount /tmp/hosts                      # the original contents come back
+```
+
+Binding a file over a file is the case people most often assume is missing; it
+works, and it is how a config file gets shadowed without touching the original.
+
+The shapes have to match, exactly as on Linux — directory onto directory, or
+non-directory onto non-directory. Mixing them fails with `ENOTDIR`, and a source
+that does not exist fails with `ENOENT` rather than quietly creating a bind that
+shadows the target with a dead path.
+
+**`--rbind` is genuinely recursive.** A plain `--bind` copies only the one
+filesystem at the source; `--rbind` replicates every mount underneath it at the
+matching place under the new location:
+
+```sh
+mount --bind  /a /b     # anything mounted *under* /a is not visible under /b
+mount --rbind /a /c     # it is under /c
+```
+
+Recursive propagation flags (`--make-rprivate` and friends) are accepted and do
+nothing, which is the honest answer here: there are no mount namespaces to
+propagate between.
+
+That last point is the one real difference from a normal Linux box, and it is
+worth keeping in mind — **a bind mount you create is visible to everything**,
+including processes in other roots and other chroots, because there is a single
+mount table underneath all of them (see [00-overview.md](00-overview.md)). A
+bind is a system-wide change, not a private one, so unmount what you no longer
+need.
 
 ## Provisioning scripts: turning a bare rootfs into a full terminal environment
 
@@ -203,3 +252,25 @@ even though the daemon is actually running. Apply it with:
 ```sh
 sh /AOK/fixes/devuan/fix-pkcsslotd-init.sh
 ```
+
+`/AOK/fixes/arch` does the same for Arch Linux ARM, where a stock root cannot
+install packages at all until three things are dealt with — none of them an
+emulator bug:
+
+- **pacman's sandbox needs Landlock**, the Linux LSM, which AOK does not
+  implement. pacman treats its absence as fatal rather than degrading
+  (`restricting filesystem access failed because Landlock is not supported by
+  the kernel!`), so the sandbox is switched off explicitly. AOK will not
+  pretend to support it: a syscall claiming to have sandboxed something it did
+  not is worse than one that says it cannot.
+- **`/etc/resolv.conf` is a dangling symlink** to the file systemd-resolved
+  would create. Nothing runs systemd here, so every mirror lookup fails with
+  "Could not resolve host".
+- **The keyring is empty**, so signed packages are refused.
+
+```sh
+sh /AOK/fixes/arch/fix-pacman.sh
+```
+
+Safe to re-run; each step checks whether it is already done. The keyring step
+takes a few minutes and needs no network.

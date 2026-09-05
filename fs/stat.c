@@ -365,11 +365,17 @@ int generic_statat_full(struct fd *at, const char *path_raw, struct statbuf *sta
     // metadata-update pair under inodes_lock -- see generic_openat) can land
     // in between those two steps and produce a torn combination: metadata
     // describing one entry type together with a live host entry of a
-    // different type. mount->fs->stat never blocks, so it's safe to hold
-    // the lock across it unconditionally.
-    lock(&inodes_lock, 0); // TODO: don't do this
-    err = mount->fs->stat(mount, path, stat);
-    unlock(&inodes_lock);
+    // different type. mount->fs->stat never blocks for those filesystems, so
+    // it's safe to hold the lock across it -- except for a may_block
+    // filesystem (fusefs), whose stat waits on a userspace daemon and has no
+    // torn-metadata pair to protect; see the may_block comment in kernel/fs.h.
+    if (!mount->fs->may_block) {
+        lock(&inodes_lock, 0); // TODO: don't do this
+        err = mount->fs->stat(mount, path, stat);
+        unlock(&inodes_lock);
+    } else {
+        err = mount->fs->stat(mount, path, stat);
+    }
     if (err >= 0)
         stat_stamp_fake_dev(mount, stat);
     if (mnt_id)
@@ -386,22 +392,26 @@ int generic_statat(struct fd *at, const char *path_raw, struct statbuf *stat, in
     return generic_statat_full(at, path_raw, stat, flags, NULL, NULL);
 }
 
-// TODO get rid of this and maybe everything else in the file
-static struct fd *at_fd(fd_t f) {
-    if (f == AT_FDCWD_)
-        return AT_PWD;
-    return f_get(f);
+// The `flags` parameter accepts AT_ flags
+// Linux's vfs_statx rejects any flag outside this set with EINVAL, up front.
+// AOK accepted whatever it was handed and silently ignored the bits it did not
+// know, so a caller probing for a flag this kernel does not implement was told
+// it worked -- and then got the behaviour of not having asked.
+static bool statat_flags_valid(int flags) {
+    return (flags & ~(AT_SYMLINK_NOFOLLOW_ | AT_NO_AUTOMOUNT_ |
+                      AT_EMPTY_PATH_ | AT_STATX_SYNC_TYPE_)) == 0;
 }
 
-// The `flags` parameter accepts AT_ flags
 static dword_t sys_stat_path(fd_t at_f, addr_t path_addr, addr_t statbuf_addr, int flags) {
+    if (!statat_flags_valid(flags))
+        return _EINVAL;
     int err;
     char path[MAX_PATH];
     int path_err = user_read_path(path_addr, path, sizeof(path));
     if (path_err)
         return path_err;
     STRACE("stat(at=%d, path=\"%s\", statbuf=0x%x, flags=0x%x)", at_f, path, statbuf_addr, flags);
-    struct fd *at = at_fd(at_f);
+    struct fd *at = at_fd_for_path(at_f, path);
     if (at == NULL)
         return _EBADF;
     struct statbuf stat = {};
@@ -421,13 +431,15 @@ static dword_t sys_stat_path(fd_t at_f, addr_t path_addr, addr_t statbuf_addr, i
 }
 
 static dword_t sys_stat_path_amd64_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_t statbuf_addr, int flags) {
+    if (!statat_flags_valid(flags))
+        return _EINVAL;
     int err;
     char path[MAX_PATH];
     int path_err = user_read_path(path_addr, path, sizeof(path));
     if (path_err)
         return path_err;
     STRACE("stat64_amd64(at=%d, path=\"%s\", statbuf=0x%x, flags=0x%x)", at_f, path, statbuf_addr, flags);
-    struct fd *at = at_fd(at_f);
+    struct fd *at = at_fd_for_path(at_f, path);
     if (at == NULL)
         return _EBADF;
     struct statbuf stat = {};
@@ -464,6 +476,8 @@ dword_t sys_newfstatat_amd64(fd_t at, addr_t path_addr, addr_t statbuf_addr, dwo
 // above, marshalled through struct arm64_stat_ (fs/stat.h) — the
 // asm-generic layout, which genuinely differs from amd64's.
 dword_t sys_newfstatat_arm64_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_t statbuf_addr, dword_t flags) {
+    if (!statat_flags_valid((int) flags))
+        return _EINVAL;
     int err;
     char path[MAX_PATH];
     int path_err = user_read_path(path_addr, path, sizeof(path));
@@ -471,7 +485,7 @@ dword_t sys_newfstatat_arm64_guest(fd_t at_f, guest_addr_t path_addr, guest_addr
         return path_err;
     STRACE("newfstatat_arm64(at=%d, path=\"%s\", statbuf=0x%llx, flags=0x%x)", at_f, path,
            (unsigned long long) statbuf_addr, flags);
-    struct fd *at = at_fd(at_f);
+    struct fd *at = at_fd_for_path(at_f, path);
     if (at == NULL)
         return _EBADF;
     struct statbuf stat = {};
@@ -553,13 +567,15 @@ dword_t sys_fstat_amd64(fd_t fd_no, addr_t statbuf_addr) {
 
 // Legacy i386 stat ABI.
 static dword_t sys_stat_path_legacy(fd_t at_f, addr_t path_addr, addr_t statbuf_addr, int flags) {
+    if (!statat_flags_valid(flags))
+        return _EINVAL;
     int err;
     char path[MAX_PATH];
     int path_err = user_read_path(path_addr, path, sizeof(path));
     if (path_err)
         return path_err;
     STRACE("stat32(at=%d, path=\"%s\", statbuf=0x%x, flags=0x%x)", at_f, path, statbuf_addr, flags);
-    struct fd *at = at_fd(at_f);
+    struct fd *at = at_fd_for_path(at_f, path);
     if (at == NULL)
         return _EBADF;
     struct statbuf stat = {};
@@ -627,7 +643,7 @@ static dword_t sys_statx_guest_abi(fd_t at_f, guest_addr_t path_addr, dword_t fl
     if (flags & ~supported_flags)
         return _EINVAL;
 
-    struct fd *at = at_fd(at_f);
+    struct fd *at = at_fd_for_path(at_f, path);
     if (at == NULL)
         return _EBADF;
 

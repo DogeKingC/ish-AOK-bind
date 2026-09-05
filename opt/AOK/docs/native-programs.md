@@ -13,7 +13,7 @@ You reach them through `/AOK/native`:
 
 ```sh
 ls /AOK/native
-# bash  smallclue  zsh  zsh-multio
+# bash  bmm  bmt  hx  ktop  libs  motepad  rust-probe  smallclue  zsh  zsh-multio
 ```
 
 Everything else — `ssh`, `wc`, `vi` — is a symlink to
@@ -31,11 +31,12 @@ own thread.
 
 The task keeps its pid, its open files, its working directory, its environment
 and its signal state — from the guest's point of view nothing unusual happened,
-and `ps` shows an ordinary process. But there is no new memory image, and that
-has one visible consequence: `/proc/<pid>/exe` still points at whatever guest
-binary that task loaded last. In [ktop](ktop.md) the COMMAND column shows the
-native program's real name while ARCH describes the previous image, which is why
-you can see `x86` next to a native `zsh`.
+and `ps` shows an ordinary process. But no image is loaded, and that has one
+visible consequence: `/proc/<pid>/exe` names the `/AOK/native` entry that was
+exec'd, since there is no ELF file to name instead. In [ktop](ktop.md) the
+COMMAND column shows the native program's real name and the ARCH column reports
+the *host's* architecture, which is what that code actually is — `arm64` next
+to a native `zsh` in an `x86` root.
 
 It also explains `fork`. A native program cannot fork, because forking means
 copying an address space and it does not have one of its own. The shells solve
@@ -82,6 +83,11 @@ which is how a build leaves bash's GPLv3 code out of the binary. When that
 happens the registry entry is empty and **`/AOK/native/bash` simply does not
 exist**, rather than existing and failing.
 
+Not everything here has a switch. `smallclue`, `motepad`, `ktop` and the
+`bmm`/`bmt` benchmarks are unconditional, because there is nothing to gate them
+on: none drags in a toolchain or a licence question the way bash, zsh and helix
+do. So a script may reasonably assume those and should check for the rest.
+
 The files that *do* exist are worth a look:
 
 ```sh
@@ -105,6 +111,11 @@ diagnostic rather than a program.
 | `/AOK/native/bash` | bash 5.2. GPLv3, which is why it has a build switch at all |
 | `/AOK/native/zsh` | zsh, with fork-by-relaunch; `zsh --version` for the exact one |
 | `/AOK/native/zsh-multio` | a helper for zsh's MULTIOS redirections, which need a process that is not the shell to hold the descriptors |
+| `/AOK/native/motepad` | a modeless terminal text editor, the counterpart to Workspace's MotePad applet — see [motepad.md](motepad.md) |
+| `/AOK/native/ktop` | the process viewer, with no build step — the same source that ships at `/AOK/tools/ktop`, compiled as host code. See [ktop.md](ktop.md) |
+| `/AOK/native/hx` | [helix](https://helix-editor.com), a modal editor with syntax highlighting and multiple selections. MPL-2.0, so like bash it has a build switch; registered as `hx`, which is what helix calls itself. Its grammars and themes are served from `/AOK/native/libs` |
+| `/AOK/native/rust-probe` | a probe that exercises the Rust-on-the-shim path, not a tool you have a use for. Present because the Rust support it checks is what `hx` is built on |
+| `/AOK/native/bmm`, `/AOK/native/bmt` | the CPU and thread microbenchmarks, so the same workload can be timed with and without emulation — see [benchmarks.md](benchmarks.md) |
 
 SmallCLUE's applets are *smaller* implementations, not drop-in replacements for
 the distro's. They cover the common cases and diverge on individual flags — the

@@ -1,5 +1,6 @@
 #include "kernel/calls.h"
 #include "fs/poll.h"
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -77,6 +78,10 @@ static bool epoll_event_aligned(void) {
 // (returned 0), errno was left untouched from an unrelated earlier syscall,
 // so the stressor's failure message showed a stale, misleading errno instead
 // of the real problem: the call should have failed with ELOOP and didn't.
+// Linux's ceiling on epoll_wait's maxevents (fs/eventpoll.c): anything larger
+// is EINVAL there, so match it rather than trying to serve the request.
+#define EP_MAX_EVENTS ((int) (INT_MAX / sizeof(struct epoll_event_)))
+
 #define EP_MAX_NESTS 4
 
 // Would adding `target` -> `fd` (i.e. target starts watching fd) create a
@@ -198,7 +203,30 @@ int_t sys_epoll_ctl_guest(fd_t epoll_f, int_t op, fd_t f, guest_addr_t event_add
 
     int_t res;
     if (op == EPOLL_CTL_ADD_) {
-        if (poll_has_fd(epoll->epollfd.poll, fd, f))
+        // Not everything can be polled, and Linux answers EPERM for the
+        // things that cannot. Accepting them is worse than an error: an event
+        // that can never arrive looks exactly like an idle fd, so a program
+        // waiting on a file it should have been told to just read blocks
+        // forever with no indication why.
+        //
+        // Linux decides per-file, on whether the entry has an f_op->poll, and
+        // its synthetic filesystems are not uniform about it -- measured:
+        // /proc/self/mountinfo, /proc/cpuinfo, /proc/uptime and
+        // /sys/kernel/profiling are all accepted while /proc/self/stat is
+        // EPERM, and every DIRECTORY is EPERM including /proc itself.
+        //
+        // This is deliberately the coarser rule: a directory always, and a
+        // regular file on an ordinary filesystem. That gets every real file
+        // and every directory right, keeps procfs and sysfs working (which is
+        // what mount-change notification needs -- the guest suite's
+        // mountinfo_epollet and epoll_nested both poll /proc/self/mountinfo),
+        // and over-permits a handful of procfs entries rather than breaking
+        // the ones that matter.
+        bool synthetic_fs = fd->mount != NULL &&
+            (fd->mount->fs == &procfs || fd->mount->fs == &sysfs);
+        if (S_ISDIR(fd->type) || (S_ISREG(fd->type) && !synthetic_fs))
+            res = _EPERM;
+        else if (poll_has_fd(epoll->epollfd.poll, fd, f))
             res = _EEXIST;
         else if (epoll_would_loop(epoll, fd, 0))
             res = _ELOOP;
@@ -248,7 +276,21 @@ static int epoll_wait_common(fd_t epoll_f, guest_addr_t events_addr, int_t max_e
         fd_close(epoll);
         return _EINVAL;
     }
-    struct epoll_event_ events[max_events];
+    // Linux's own ceiling, for errno parity: anything above it is EINVAL rather
+    // than an allocation attempt.
+    if (max_events > EP_MAX_EVENTS) {
+        fd_close(epoll);
+        return _EINVAL;
+    }
+    // NOT a VLA. max_events is guest-controlled, and sizing stack storage by it
+    // let one epoll_wait(~1e6) fault the host process on the C stack before a
+    // single fd was examined -- killing the emulator and every guest process in
+    // it. The heap fails an oversized request with ENOMEM instead.
+    struct epoll_event_ *events = calloc((size_t) max_events, sizeof(*events));
+    if (events == NULL) {
+        fd_close(epoll);
+        return _ENOMEM;
+    }
 
     struct epoll_context context = {.events = events, .n = 0, .max_events = max_events};
     STRACE("...\n");
@@ -269,6 +311,16 @@ static int epoll_wait_common(fd_t epoll_f, guest_addr_t events_addr, int_t max_e
         res = poll_wait(epoll->epollfd.poll, epoll_callback, &context,
                         guest_infinite ? &bounded : timeout_ts_ptr);
     } while (guest_infinite && res == 0);
+    // epoll_wait is EINTR on a pending signal, full stop -- it does not
+    // restart. Linux's ep_poll() breaks out with -EINTR the moment
+    // signal_pending() is true and never reaches the restart machinery, while
+    // poll and select resume transparently through their restart block. The
+    // difference is visible with nothing more than a job-control stop: on
+    // Devuan 6 / Linux 6.12, ^Z-ing a process waiting in poll() and resuming
+    // leaves the poll completing, and the same treatment of epoll_wait()
+    // returns EINTR. AOK shared poll_wait() for both and so restarted both.
+    if (res == _ERESTART || res == _ERESTART_NOHAND)
+        res = _EINTR;
     STRACE("%d end epoll_wait", current->pid);
     if (res >= 0) {
         for (int i = 0; i < res; i++) {
@@ -277,22 +329,30 @@ static int epoll_wait_common(fd_t epoll_f, guest_addr_t events_addr, int_t max_e
         int fault = 0;
         if (res > 0) {
             if (epoll_event_aligned()) {
-                struct epoll_event_arm64 aligned[res];
+                struct epoll_event_arm64 *aligned = calloc((size_t) res, sizeof(*aligned));
+                if (aligned == NULL) {
+                    free(events);
+                    fd_close(epoll);
+                    return _ENOMEM;
+                }
                 for (int i = 0; i < res; i++) {
                     aligned[i].events = events[i].events;
                     aligned[i].pad = 0;
                     aligned[i].data = events[i].data;
                 }
-                fault = user_write(events_addr, aligned, sizeof(aligned));
+                fault = user_write(events_addr, aligned, sizeof(*aligned) * (size_t) res);
+                free(aligned);
             } else {
                 fault = user_write(events_addr, events, sizeof(struct epoll_event_) * res);
             }
         }
         if (fault) {
+            free(events);
             fd_close(epoll);
             return _EFAULT;
         }
     }
+    free(events);
     fd_close(epoll);
     return res;
 }

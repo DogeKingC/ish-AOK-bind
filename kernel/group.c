@@ -62,7 +62,7 @@ dword_t sys_setpgid(pid_t_ id, pid_t_ pgid) {
         goto out;
     // a session leader cannot create a process group
     err = _EPERM;
-    if (tgroup->sid == tgroup->leader->pid)
+    if (tgroup_is_session_leader(tgroup))
         goto out;
 
     if (tgroup->pgid != pgid) {
@@ -121,6 +121,35 @@ void task_leave_session(struct task *task) {
         group->tty = NULL;
         unlock(&ttys_lock);
     }
+}
+
+// POSIX: a process group is orphaned when no member has a parent that is in a
+// DIFFERENT process group but the SAME session -- that is, when there is
+// nobody outside the group yet still inside the session who could ever
+// continue it after a stop.
+//
+// It matters because stopping such a group would wedge it forever. Linux
+// therefore refuses the terminal access that would have stopped it (EIO)
+// instead of sending SIGTTIN/SIGTTOU, and AOK had no notion of this at all.
+//
+// Caller holds pids_lock, which is what keeps the membership lists still.
+bool pgroup_is_orphaned(pid_t_ pgid, pid_t_ sid) {
+    struct pid *pid = pid_get(pgid);
+    if (pid == NULL)
+        return true;
+    struct tgroup *tgroup;
+    list_for_each_entry(&pid->pgroup, tgroup, pgroup) {
+        struct task *leader = tgroup->leader;
+        struct task *parent = leader != NULL ? leader->parent : NULL;
+        if (parent == NULL || parent->group == NULL || parent->group == tgroup)
+            continue;
+        lock(&parent->group->lock, 0);
+        bool rescuer = parent->group->pgid != pgid && parent->group->sid == sid;
+        unlock(&parent->group->lock);
+        if (rescuer)
+            return false;
+    }
+    return true;
 }
 
 pid_t_ task_setsid(struct task *task) {

@@ -15,7 +15,9 @@
 #include "kernel/calls.h"
 #include "kernel/fs.h"
 #include "kernel/task.h"
+#include "kernel/swap.h"
 #include "xX_main_Xx.h"
+#include "platform/platform.h"
 
 extern void run_at_boot(void);
 
@@ -105,7 +107,7 @@ static void configure_standalone_amd64_jit(void) {
 // kernel/init.c; TERM passes through from the host when set.
 static char *build_initial_envp(void) {
     static const char path_var[] =
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+        "PATH=/AOK/persist/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
     static const char home_var[] = "HOME=/root";
     const char *term = getenv("TERM");
     if (term == NULL)
@@ -147,6 +149,10 @@ static noreturn void cli_halt(int status) {
         extern void jit_timing_dump(void); // no-op unless ISH_JIT_TIMING counted compiles
         jit_timing_dump();
     }
+    {
+        extern void lockstats_dump(void); // no-op unless a lockstats knob is set
+        lockstats_dump();
+    }
     // Deliberately NOT fflush(NULL). That walks every host stream and takes
     // each one's lock, and the shim gives a native program host FILEs for its
     // stdout and stderr -- so a guest task killed inside stdio leaves a stream
@@ -180,15 +186,28 @@ static void ignore_eexist(int err) {
 // then just accumulates real bytes on the fakefs backing store forever
 // instead of discarding them. Repair the standard set here at every boot so
 // it doesn't matter what the source tarball shipped.
-static void ensure_dev_node(const char *path, int major, int minor) {
+// `fmt` is S_IFCHR or S_IFBLK. It is a parameter rather than a constant because
+// /dev/aokswap0 is a block device, and a node of the wrong TYPE is exactly what
+// this function exists to repair -- comparing against S_ISCHR unconditionally
+// would have it recreate the block node on every boot, forever.
+static void ensure_dev_node_typed(const char *path, int major, int minor, mode_t_ mode,
+                                  mode_t_ fmt) {
     dev_t_ dev = dev_make(major, minor);
     struct statbuf stat;
     int err = generic_statat(AT_PWD, path, &stat, false);
-    if (err == 0 && S_ISCHR(stat.mode) && stat.rdev == dev)
+    if (err == 0 && (stat.mode & S_IFMT) == fmt && stat.rdev == dev)
         return;
     if (err == 0)
         generic_unlinkat(AT_PWD, path);
-    ignore_eexist(generic_mknodat(AT_PWD, path, S_IFCHR | 0666, dev));
+    ignore_eexist(generic_mknodat(AT_PWD, path, fmt | mode, dev));
+}
+
+static void ensure_dev_node_mode(const char *path, int major, int minor, mode_t_ mode) {
+    ensure_dev_node_typed(path, major, minor, mode, S_IFCHR);
+}
+
+static void ensure_dev_node(const char *path, int major, int minor) {
+    ensure_dev_node_mode(path, major, minor, 0666);
 }
 
 static void setup_host_mounts(void) {
@@ -200,6 +219,21 @@ static void setup_host_mounts(void) {
     ensure_dev_node("/dev/urandom", MEM_MAJOR, DEV_URANDOM_MINOR);
     ensure_dev_node("/dev/tty", TTY_ALTERNATE_MAJOR, DEV_TTY_MINOR);
     ensure_dev_node("/dev/ptmx", TTY_ALTERNATE_MAJOR, DEV_PTMX_MINOR);
+    ensure_dev_node("/dev/fuse", MISC_MAJOR, DEV_FUSE_MINOR);
+    // The swap area as a block device, so /proc/swaps has a real path to name.
+    // brw-rw---- like a Linux swap device, and present whether or not swap is
+    // enabled -- an unbound block node is an ordinary Linux state, and creating
+    // it from the enable path is not an option (generic_mknodat needs a valid
+    // `current` and takes filesystem locks, and swap_enable is reached from the
+    // app's preference path where `current` is not the caller you expect).
+    ensure_dev_node_typed("/dev/aokswap0", AOKSWAP_MAJOR, DEV_AOKSWAP_MINOR, 0660, S_IFBLK);
+    // The kernel log, which the driver has always implemented (fs/mem.c) and
+    // no root has ever had a node for: every syslog daemon starts by opening
+    // it, and busybox's klogd and rsyslog's imklog both want /dev/kmsg.
+    // 0644, matching Linux's 1:11 node: an unprivileged process may read the
+    // log but not write it, and a 0666 node would let it open for writing and
+    // only then be refused.
+    ensure_dev_node_mode("/dev/kmsg", MEM_MAJOR, DEV_KMSG_MINOR, 0644);
     // systemd's getty@tty1.service (and friends) carry
     // ConditionPathExists=/dev/tty0 -- the Linux "current VT" alias -- and
     // silently skip without it, so a systemd guest finishes booting with no
@@ -219,6 +253,9 @@ static void setup_host_mounts(void) {
     // The root is a device now (/proc/diskstats, /sys/block); say so where
     // userland looks for the list of filesystems. See kernel/init.c.
     ensure_root_fstab_entry();
+    // /dev/fd and the three std* links, without which bash process
+    // substitution -- `diff <(a) <(b)` -- is ENOENT in every guest.
+    ensure_dev_fd_links();
     ignore_eexist(generic_mkdirat(AT_PWD, "/dev/pts", 0755));
     // Not every bundled root's base tarball ships /dev/shm, and iSH has no
     // boot-time tmpfs auto-mount for it; create it unconditionally so POSIX
@@ -289,19 +326,44 @@ static void setup_host_mounts(void) {
 static void *quiesce_test_thread(void *arg) {
     (void) arg;
     // Let the guest get going and open some transactions first.
-    usleep(300 * 1000);
+    // ISH_TEST_QUIESCE_DELAY_MS moves the window: 300 ms is enough for
+    // filesystem traffic, but a swap test has to compile and run a program
+    // before there is any eviction to interrupt, and a gate that engages before
+    // the thing it gates has started proves nothing.
+    const char *delay_env = getenv("ISH_TEST_QUIESCE_DELAY_MS");
+    long delay_ms = delay_env != NULL ? strtol(delay_env, NULL, 10) : 300;
+    if (delay_ms < 0)
+        delay_ms = 0;
+    usleep((useconds_t) delay_ms * 1000);
     unsigned straggling = 0;
     bool drained = fakefs_quiesce_begin(2000, &straggling);
-    fprintf(stderr, "[quiesce] engaged: drained=%d straggling=%u\n", drained, straggling);
+    // The pager gets the same gate, for the same reason the app applies it: it
+    // writes guest memory to a file, and being mid-write when the process is
+    // frozen is not a state to be in. Exercised here so the CLI can test it.
+    bool swap_drained = swap_quiesce_begin(2000);
+    fprintf(stderr, "[quiesce] engaged: drained=%d straggling=%u swap=%d\n",
+            drained, straggling, swap_drained);
     // Hold it briefly: guest tasks wanting a transaction must park, not spin or
     // deadlock, and must not be holding fs->lock while they wait.
-    usleep(500 * 1000);
+    const char *hold_env = getenv("ISH_TEST_QUIESCE_HOLD_MS");
+    long hold_ms = hold_env != NULL ? strtol(hold_env, NULL, 10) : 500;
+    if (hold_ms < 0)
+        hold_ms = 0;
+    usleep((useconds_t) hold_ms * 1000);
     fakefs_quiesce_end();
+    swap_quiesce_end();
     fprintf(stderr, "[quiesce] lifted\n");
     return NULL;
 }
 
 int main(int argc, char *const argv[]) {
+    // The system's memory-pressure source, which outranks our own per-process
+    // headroom arithmetic; see host_mem_pressure_start() in platform/darwin.c.
+    host_mem_pressure_start();
+    // Before any lock is taken: the lock_t and wrlock_t hooks read this flag on
+    // every acquire, and a lock held from before it was armed would be dropped
+    // as an unmatched release.
+    lockstats_init();
     run_at_boot();
     configure_standalone_i386_safety(argc, argv);
     configure_standalone_amd64_jit();
@@ -368,6 +430,13 @@ int main(int argc, char *const argv[]) {
         if (fd >= 0)
             jit_timing_stats_fd = fd;
     }
+    // Same again for the fakefs lock stats.
+    if (getenv("ISH_FAKEFS_LOCKSTATS") != NULL || getenv("ISH_LOCKSTATS") != NULL) {
+        extern int lockstats_fd;
+        int fd = dup(STDERR_FILENO);
+        if (fd >= 0)
+            lockstats_fd = fd;
+    }
 
     char *envp = build_initial_envp();
     if (envp == NULL) {
@@ -401,8 +470,16 @@ int main(int argc, char *const argv[]) {
         if (quiesce_test)
             pthread_create(&quiesce_thread, NULL, quiesce_test_thread, NULL);
 
+        // With ISH_TEST_GUEST_USER also set, run as that account via the su
+        // path (run_guest_command_capture_user) -- the primitive behind "Open
+        // Everything as Default User" for the app's headless command surfaces.
+        // Optional ISH_TEST_GUEST_TIMEOUT_MS overrides the 10 s cap, for
+        // exercising the process-group timeout kill.
+        const char *test_user = getenv("ISH_TEST_GUEST_USER");
+        const char *timeout_str = getenv("ISH_TEST_GUEST_TIMEOUT_MS");
+        int timeout_ms = timeout_str != NULL ? atoi(timeout_str) : 10000;
         struct guest_command_result r;
-        int rc = run_guest_command_capture(test_cmd, NULL, 10000, 0, &r);
+        int rc = run_guest_command_capture_user(test_user, test_cmd, NULL, timeout_ms, 0, &r);
         if (quiesce_test)
             pthread_join(quiesce_thread, NULL);
         fprintf(stderr,
@@ -412,6 +489,13 @@ int main(int argc, char *const argv[]) {
         fprintf(stderr, "[guest-cmd] ---output---\n%s\n[guest-cmd] ---end---\n",
                 r.output != NULL ? r.output : "(null)");
         free(r.output);
+        // ISH_TEST_GUEST_LINGER_MS keeps the emulator alive after the capture
+        // returns, so a process that wrongly survived the timeout kill has time
+        // to leave observable evidence (e.g. touch a marker file) before
+        // everything dies with the host process.
+        const char *linger_str = getenv("ISH_TEST_GUEST_LINGER_MS");
+        if (linger_str != NULL)
+            usleep((useconds_t) atoi(linger_str) * 1000);
         _exit(0);
     }
 

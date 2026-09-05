@@ -5,6 +5,7 @@
 #include "kernel/calls.h"
 #include "kernel/resource.h"
 #include "kernel/fs.h"
+#include "kernel/inotify.h"
 #include "fs/poll.h"
 #include "fs/fd.h"
 #include "fs/inode.h"
@@ -22,11 +23,13 @@ struct fd *fd_create(const struct fd_ops *ops) {
     fd->refcount = 1;
     fd->flags = 0;
     fd->mount = NULL;
+    fd->mount_flags = 0;
     fd->offset = 0;
     fd->stat.ctime = (dword_t)time(NULL);
     list_init(&fd->poll_fds);
     lock_init(&fd->poll_lock, "fd_create_poll\0");
     lock_init(&fd->lock, "fd_create\0");
+    lock_init(&fd->dir_pos_lock, "fd_dirpos\0");
     cond_init(&fd->cond);
     return fd;
 }
@@ -48,6 +51,19 @@ struct fd *fd_retain_if_live(struct fd *fd) {
 int fd_close(struct fd *fd) {
     int err = 0;
     if (--fd->refcount == 0) {
+        // IN_CLOSE_WRITE / IN_CLOSE_NOWRITE, on the last reference to this
+        // open file description -- which is exactly what Linux reports on.
+        // Emitted before ops->close, while the path can still be resolved,
+        // and behind inotify_has_instances() because generic_getpath is a
+        // SQLite lookup on fakefs and this runs on every close in the system.
+        if (inotify_has_instances() && fd->mount != NULL &&
+                fd->mount->fs != &procfs && !S_ISSOCK(fd->type)) {
+            char path[MAX_PATH];
+            if (generic_getpath(fd, path) == 0) {
+                unsigned acc = fd_getflags(fd) & O_ACCMODE_;
+                inotify_notify_close(path, acc == O_WRONLY_ || acc == O_RDWR_);
+            }
+        }
         poll_cleanup_fd(fd);
         if (fd->inode != NULL) {
             flock_remove_owned_by(fd);
@@ -108,19 +124,38 @@ static int fdtable_close(struct fdtable *table, fd_t f);
 // So a concurrent retain either precedes teardown (its +1 keeps this release
 // from reaching 0) or sees task->files == NULL and skips. See the cross-task
 // *_task_files_retain wrappers in fs/proc, fs/sock, and kernel/signal.
+//
+// The decrement must NOT be taken under table->lock, even though it used to
+// be. Those cross-task wrappers exist to be callable from the signal-delivery
+// path, which runs holding sighand->lock and often pids_lock, and they are
+// carefully written to give up rather than block -- signalfd_wakeup_task()
+// trylocks files->lock and bails out when it is busy. But the bail-out
+// released the table, and a blocking lock() here meant it then waited for the
+// very lock whose trylock had just failed, with pids_lock still in hand. That
+// closed a three-lock cycle and wedged the whole emulator:
+//
+//   A exiting        pids_lock          -> waits for files->lock  (here)
+//   B in close(2)    files->lock        -> waits for poll->lock   (epoll_close)
+//   C in epoll_wait  poll->lock         -> waits for pids_lock    (pidfd_poll)
+//
+// Reproduced by tests/manual/pidfd_epoll_deadlock.c, which hammers exactly
+// this interleaving; every thread that later wants pids_lock (any fork, any
+// exit, any /proc/<pid> lookup) then queues behind A for ever.
+//
+// refcount is already atomic, so the lock was never what made the decrement
+// safe. Take it only for the teardown, which by definition runs when no other
+// reference -- and therefore no other lock holder -- is left.
 void fdtable_release(struct fdtable *table) {
+    if (atomic_fetch_sub(&table->refcount, 1) != 1)
+        return;
     lock(&table->lock, 0);
-    if (--table->refcount == 0) {
-        for (fd_t f = 0; (unsigned) f < table->size; f++) {
-            fdtable_close(table, f);
-        }
-        free(table->files);
-        free(table->cloexec);
-        unlock(&table->lock);
-        free(table);
-    } else {
-        unlock(&table->lock);
+    for (fd_t f = 0; (unsigned) f < table->size; f++) {
+        fdtable_close(table, f);
     }
+    free(table->files);
+    free(table->cloexec);
+    unlock(&table->lock);
+    free(table);
 }
 
 static int fdtable_resize(struct fdtable *table, unsigned size) {
@@ -251,23 +286,65 @@ fd_t f_install(struct fd *fd, int flags) {
     return f;
 }
 
-static int fdtable_close(struct fdtable *table, fd_t f) {
+// Take a descriptor out of the table without closing it, so the caller can
+// drop the reference with no table lock held. Caller holds table->lock.
+//
+// Splitting close into these two halves is load-bearing, and it is not a
+// tidiness change. fd_close runs the filesystem's ->close, and that is allowed
+// to BLOCK on something arbitrary -- for a FUSE file it is a round trip to a
+// guest daemon, since close(2) sends FUSE_FLUSH and waits for the answer so
+// the daemon can report a write error. If that daemon is a THREAD of this
+// process, it shares this fd table, and its next read of /dev/fuse wants the
+// very lock the closing thread is holding. Nobody answers and both threads
+// are stuck for good.
+//
+// That is not hypothetical: measured before this split, a program serving a
+// FUSE filesystem from one of its own threads -- which is what libfuse's
+// multi-threaded loop produces, and what anything that mounts a filesystem
+// for its own use looks like -- hung in close(2) of a second descriptor on
+// the mount and never came back. The daemon thread was seen answering the
+// READ and then never receiving the FLUSH.
+//
+// The rule this establishes: table->lock covers the SLOT, never the
+// filesystem work behind it.
+static struct fd *fdtable_detach(struct fdtable *table, fd_t f) {
     struct fd *fd = fdtable_get(table, f);
     if (fd == NULL)
-        return _EBADF;
-    if (fd->inode != NULL) // temporary hack for files like sockets that right now don't have inodes but will eventually
-        file_lock_remove_owned_by(fd, table);
-    int err = fd_close(fd);
+        return NULL;
     table->files[f] = NULL;
     bit_clear(f, table->cloexec);
-    return err;
+    return fd;
+}
+
+// Finish what fdtable_detach started. MUST run with no table lock held.
+static int fdtable_finish_close(struct fd *fd, struct fdtable *owner) {
+    if (fd->inode != NULL) // temporary hack for files like sockets that right now don't have inodes but will eventually
+        file_lock_remove_owned_by(fd, owner);
+    return fd_close(fd);
+}
+
+// Detach and close in one step, for the two callers where no other thread can
+// be sharing this table -- fdtable_release runs when the last reference is
+// gone, and fdtable_do_cloexec runs on execve, after the other threads have
+// already been reaped. Anywhere else, use fdtable_detach and close outside
+// the lock; see the note above.
+static int fdtable_close(struct fdtable *table, fd_t f) {
+    struct fd *fd = fdtable_detach(table, f);
+    if (fd == NULL)
+        return _EBADF;
+    return fdtable_finish_close(fd, table);
 }
 
 int f_close(fd_t f) {
-    lock(&current->files->lock, 0);
-    int err = fdtable_close(current->files, f);
-    unlock(&current->files->lock);
-    return err;
+    struct fdtable *table = current->files;
+    lock(&table->lock, 0);
+    struct fd *fd = fdtable_detach(table, f);
+    unlock(&table->lock);
+    if (fd == NULL)
+        return _EBADF;
+    // Outside the lock: ->close may block on a guest process, and a sibling
+    // thread must be able to keep using this table while it does.
+    return fdtable_finish_close(fd, table);
 }
 
 dword_t sys_close(fd_t f) {
@@ -398,13 +475,17 @@ dword_t sys_dup3(fd_t f, fd_t new_f, int_t flags) {
         return err;
     }
     fd_retain(fd);
-    if (table->files[new_f] != NULL)
-        fdtable_close(table, new_f);
+    // Whatever was on the target slot is replaced now and closed below, once
+    // the lock is gone -- its ->close may block. dup2 has already taken
+    // effect by then, which is what a caller expects.
+    struct fd *replaced = fdtable_detach(table, new_f);
     table->files[new_f] = fd;
     bit_clear(new_f, table->cloexec);
     if (flags & O_CLOEXEC_)
         bit_set(new_f, table->cloexec);
     unlock(&table->lock);
+    if (replaced != NULL)
+        fdtable_finish_close(replaced, table);
     return new_f;
 }
 
@@ -447,10 +528,25 @@ dword_t sys_close_range(dword_t first, dword_t last, dword_t flags) {
     for (fd_t f = (fd_t) first; (unsigned) f <= end; f++) {
         if (table->files[f] == NULL)
             continue;
-        if (flags & CLOSE_RANGE_CLOEXEC_)
+        if (flags & CLOSE_RANGE_CLOEXEC_) {
             bit_set(f, table->cloexec);
-        else
-            fdtable_close(table, f);
+            continue;
+        }
+        // One at a time, each closed with the lock released: a blocking
+        // ->close must not keep a sibling thread out of the table. Linux does
+        // not make close_range atomic either -- descriptors go away as it
+        // walks -- so the observable behaviour is the same.
+        struct fd *fd = fdtable_detach(table, f);
+        unlock(&table->lock);
+        fdtable_finish_close(fd, table);
+        lock(&table->lock, 0);
+        // The table can only have grown while unlocked (fdtable_expand never
+        // shrinks it), so `end` stays in range; re-clamp anyway rather than
+        // depend on that from here.
+        if (table->size == 0)
+            break;
+        if (end >= table->size)
+            end = table->size - 1;
     }
     unlock(&table->lock);
     return 0;

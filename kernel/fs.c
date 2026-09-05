@@ -14,6 +14,7 @@
 #include "fs/inode.h"
 #include "fs/real.h"
 #include "fs/path.h"
+#include "fs/poll.h"
 #include "fs/dev.h"
 #include "fs/devices.h"
 #include "fs/tty.h"
@@ -84,14 +85,47 @@ static void io_account_write(struct fd *fd, ssize_t res) {
     }
 }
 
-extern bool doEnableExtraLocking;
-extern pthread_mutex_t extra_lock;
 extern bool isGlibC;
 
 static struct fd *at_fd(fd_t f) {
     if (f == AT_FDCWD_)
         return AT_PWD;
     return f_get(f);
+}
+
+// Linux answers EBADF for I/O on an O_PATH descriptor: it is a handle to a
+// location, not to an open file. We were handing regular-file O_PATH opens a
+// fully working fd, and since generic_openat deliberately skips the access
+// check for O_PATH (correctly -- Linux skips it too), that made O_PATH the way
+// to read and write a file whose permissions had just refused a normal open.
+// The read/write/seek/getdents entry points resolve through this; fstat, dup,
+// fchdir and the *at() dirfd uses keep plain f_get, because Linux allows those.
+struct fd *f_get_io(fd_t f) {
+    struct fd *fd = f_get(f);
+    if (fd != NULL && (fd->flags & O_PATH_))
+        return NULL;
+    return fd;
+}
+
+// The *at() rule everyone forgets: "If the pathname given in pathname is
+// absolute, then dirfd is ignored" (openat(2), and POSIX says the same). So an
+// absolute path must NOT make us validate dirfd at all -- it can be -1, or a
+// descriptor closed long ago, and the call is still perfectly legal.
+//
+// Validating it anyway turned such calls into EBADF, and that is not a corner
+// case: it is how mariadbd died. glibc canonicalising an Aria temp table did
+// openat(-1, "/tmp", O_PATH|O_CLOEXEC|O_NOFOLLOW), got EBADF where Linux gives
+// a descriptor, and Aria carried the failure as far as ha_maria::drop_table
+// before dereferencing the NULL it had left behind -- a SIGSEGV three frames
+// away from the actual mistake, which is why it read as a MariaDB bug. It also
+// broke mysql_install_db, so no MariaDB install ever completed.
+//
+// AT_PWD is handed back for the absolute case because the resolver ignores the
+// base for a leading '/' -- it only has to be a valid pointer.
+struct fd *at_fd_for_path(fd_t f, const char *path) {
+    if (path != NULL && path[0] == '/')
+        return AT_PWD;
+    return at_fd(f);
 }
 
 static bool fs_trace_elogind(void) {
@@ -316,13 +350,50 @@ static void apply_umask(mode_t_ *mode) {
     unlock(&fs->lock);
 }
 
+// Linux's in_group_p(): the group class applies if the file's group is the
+// caller's primary group OR any of its supplementary groups. We only compared
+// the primary fsgid, so a user in a file's group via the supplementary set --
+// which is how group membership normally works, `usermod -aG` and friends --
+// fell through to the "other" bits and was denied. That breaks the ordinary
+// shared-group setup for both file access and directory search.
+static bool current_in_group(uid_t_ gid) {
+    if (current->fsgid == gid)
+        return true;
+    for (unsigned i = 0; current->groups != NULL && i < current->ngroups; i++)
+        if (current->groups[i] == gid)
+            return true;
+    return false;
+}
+
 int access_check(struct statbuf *stat, int check) {
-    if (superuser()) return 0;
+    // fsuid, not euid. Every permission decision below is made against fsuid,
+    // and so is Linux's -- the override has to agree with them or it is
+    // overriding a different question than the one being asked.
+    //
+    // access(2) is where the difference shows: it deliberately swaps fsuid to
+    // the REAL uid so a setuid-root program can ask "could the user who ran me
+    // read this?". Consulting euid there answered yes for everything, which is
+    // the opposite of what the caller wanted to know and exactly the check
+    // setuid programs use before opening a file on the user's behalf.
+    if (current != NULL && current->fsuid == 0) {
+        // Linux's generic_permission(): CAP_DAC_OVERRIDE does not conjure
+        // execute permission out of nothing. Root may read or write anything,
+        // but X_OK on a regular file still needs at least one execute bit --
+        // otherwise every file in the tree looks executable to root, and
+        // `test -x`, configure scripts and PATH searches all believe it.
+        // Directories are exempt: search permission is always root's.
+        // exec() enforces the same rule separately (kernel/exec.c), which is
+        // why this gap showed up in access(2) rather than as a way to run
+        // non-executable files.
+        if ((check & AC_X) && !S_ISDIR(stat->mode) && !(stat->mode & 0111))
+            return _EACCES;
+        return 0;
+    }
     if (check == 0) return 0;
     // Align check with the correct bits in mode
     if (current->fsuid == stat->uid) {
         check <<= 6;
-    } else if (current->fsgid == stat->gid) {
+    } else if (current_in_group(stat->gid)) {
         check <<= 3;
     }
     // All requested bits must be set, not merely overlap one of them: with a
@@ -379,7 +450,7 @@ static dword_t sys_faccessat_common(fd_t at_f, guest_addr_t path_addr, mode_t_ m
     int path_err = user_read_path(path_addr, path, sizeof(path));
     if (path_err)
         return path_err;
-    struct fd *at = at_fd(at_f);
+    struct fd *at = at_fd_for_path(at_f, path);
     if (at == NULL)
         return _EBADF;
     STRACE("faccessat(%d, \"%s\", 0x%x, %d)", at_f, path, mode, flags);
@@ -492,7 +563,13 @@ dword_t sys_faccessat(fd_t at_f, addr_t path_addr, mode_t_ mode, dword_t flags) 
     return sys_faccessat_guest(at_f, path_addr, mode, flags);
 }
 
+static fd_t sys_openat_norm(fd_t at_f, guest_addr_t path_addr, dword_t flags, mode_t_ mode, int extra_norm);
+
 fd_t sys_openat_guest(fd_t at_f, guest_addr_t path_addr, dword_t flags, mode_t_ mode) {
+    return sys_openat_norm(at_f, path_addr, flags, mode, 0);
+}
+
+static fd_t sys_openat_norm(fd_t at_f, guest_addr_t path_addr, dword_t flags, mode_t_ mode, int extra_norm) {
     char path[MAX_PATH];
     int path_err = user_read_path(path_addr, path, sizeof(path));
     if (path_err)
@@ -502,13 +579,17 @@ fd_t sys_openat_guest(fd_t at_f, guest_addr_t path_addr, dword_t flags, mode_t_ 
     if (flags & O_CREAT_)
         apply_umask(&mode);
 
-    struct fd *at = at_fd(at_f);
+    struct fd *at = at_fd_for_path(at_f, path);
     if (at == NULL)
         return _EBADF;
     struct fd *fd;
     TASK_MAY_BLOCK {
-        fd = generic_openat(at, path, flags, mode);
+        fd = generic_openat_norm(at, path, flags, mode, extra_norm);
     }
+    // SA_RESTART: open() is restartable, which matters for the one open that
+    // blocks -- a FIFO waiting to rendezvous with its opposite end.
+    if (IS_ERR(fd) && PTR_ERR(fd) == _EINTR && signal_should_restart_syscall())
+        fd = ERR_PTR(_ERESTART);
     if (IS_ERR(fd))
         goto out;
     fd_t installed = f_install(fd, flags);
@@ -563,8 +644,41 @@ fd_t sys_openat2_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_t how_addr,
 
     if ((how.flags >> 32) != 0 || (how.mode >> 32) != 0)
         return _EINVAL;
-    if (how.resolve != 0)
+
+    // Every RESOLVE_* bit was rejected outright, so openat2's whole reason for
+    // existing over openat -- constraining how the path is allowed to resolve
+    // -- was unusable.
+    //
+    // The two implemented here are the two AOK can enforce exactly.
+    // NO_SYMLINKS is answered inside path resolution itself, and CACHED's
+    // "only if this is already cached, else EAGAIN" is a promise about speed
+    // that is honest to decline: every caller of it has a slow path, because
+    // on Linux the answer depends on what happens to be in the dcache.
+    //
+    // BENEATH, IN_ROOT, NO_XDEV and NO_MAGICLINKS stay refused with EINVAL,
+    // which is what a kernel without them says and what every caller already
+    // handles -- openat2 itself is Linux 5.6+, so nothing may assume it. They
+    // are not refused for lack of effort: they are SANDBOXES, and the property
+    // they promise is that no intermediate step of the resolution escaped,
+    // which is a statement about the resolution as it happens. AOK resolves
+    // the path and then opens it in a second pass, so anything checked in
+    // between is checked against a path that could have changed underneath --
+    // exactly the time-of-check-to-time-of-use hole RESOLVE_BENEATH exists to
+    // close. A sandbox that reports success without holding is worse than one
+    // that says it is not available.
+#define RESOLVE_NO_XDEV_       0x01
+#define RESOLVE_NO_MAGICLINKS_ 0x02
+#define RESOLVE_NO_SYMLINKS_   0x04
+#define RESOLVE_BENEATH_       0x08
+#define RESOLVE_IN_ROOT_       0x10
+#define RESOLVE_CACHED_        0x20
+    static const qword_t resolve_implemented =
+        RESOLVE_NO_SYMLINKS_ | RESOLVE_CACHED_;
+    if (how.resolve & ~resolve_implemented)
         return _EINVAL;
+    if (how.resolve & RESOLVE_CACHED_)
+        return _EAGAIN;
+    int extra_norm = (how.resolve & RESOLVE_NO_SYMLINKS_) ? N_NO_SYMLINKS : 0;
 
     dword_t flags = (dword_t) how.flags;
     // The struct is read here rather than at the dispatch site, so plain
@@ -576,7 +690,7 @@ fd_t sys_openat2_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_t how_addr,
     if (current->abi == GUEST_ABI_ARM64)
         flags = arm64_open_flags_to_internal(flags);
 
-    return sys_openat_guest(at_f, path_addr, flags, (mode_t_) how.mode);
+    return sys_openat_norm(at_f, path_addr, flags, (mode_t_) how.mode, extra_norm);
 }
 
 fd_t sys_openat2(fd_t at_f, addr_t path_addr, addr_t how_addr, dword_t size) {
@@ -604,9 +718,15 @@ static dword_t sys_readlinkat_common(fd_t at_f, guest_addr_t path_addr, guest_ad
     if (path_err)
         return path_err;
     STRACE("readlinkat(%d, \"%s\", %#x, %#x)", at_f, path, buf_addr, bufsize);
-    struct fd *at = at_fd(at_f);
+    struct fd *at = at_fd_for_path(at_f, path);
     if (at == NULL)
         return _EBADF;
+    // Linux: bufsiz <= 0 is EINVAL, and nothing is written. The parameter
+    // arrives unsigned, so a negative size read as an enormous one, got
+    // clamped to MAX_PATH, and the whole target was written into a buffer the
+    // caller had said was not there -- past the end of whatever it did have.
+    if ((int) bufsize <= 0)
+        return _EINVAL;
     if (bufsize > MAX_PATH)
         bufsize = MAX_PATH;
     char buf[bufsize];
@@ -657,10 +777,10 @@ static dword_t sys_linkat_common(fd_t src_at_f, guest_addr_t src_addr, fd_t dst_
     if (path_err)
         return path_err;
     STRACE("linkat(%d, \"%s\", %d, \"%s\")", src_at_f, src, dst_at_f, dst);
-    struct fd *src_at = at_fd(src_at_f);
+    struct fd *src_at = at_fd_for_path(src_at_f, src);
     if (src_at == NULL)
         return _EBADF;
-    struct fd *dst_at = at_fd(dst_at_f);
+    struct fd *dst_at = at_fd_for_path(dst_at_f, dst);
     if (dst_at == NULL)
         return _EBADF;
     return generic_linkat(src_at, src, dst_at, dst);
@@ -686,7 +806,7 @@ static dword_t sys_unlinkat_common(fd_t at_f, guest_addr_t path_addr, int_t flag
     if (path_err)
         return path_err;
     STRACE("unlinkat(%d, \"%s\", %d)", at_f, path, flags);
-    struct fd *at = at_fd(at_f);
+    struct fd *at = at_fd_for_path(at_f, path);
     if (at == NULL)
         return _EBADF;
     if (flags & AT_REMOVEDIR_)
@@ -718,10 +838,10 @@ static dword_t sys_renameat2_common(fd_t src_at_f, guest_addr_t src_addr, fd_t d
     if (path_err)
         return path_err;
     STRACE("renameat2(%d, \"%s\", %d, \"%s\", %#x)", src_at_f, src, dst_at_f, dst, flags);
-    struct fd *src_at = at_fd(src_at_f);
+    struct fd *src_at = at_fd_for_path(src_at_f, src);
     if (src_at == NULL)
         return _EBADF;
-    struct fd *dst_at = at_fd(dst_at_f);
+    struct fd *dst_at = at_fd_for_path(dst_at_f, dst);
     if (dst_at == NULL)
         return _EBADF;
     return generic_renameat(src_at, src, dst_at, dst, flags);
@@ -757,7 +877,7 @@ static dword_t sys_symlinkat_common(guest_addr_t target_addr, fd_t at_f, guest_a
     if (path_err)
         return path_err;
     STRACE("symlinkat(\"%s\", %d, \"%s\")", target, at_f, link);
-    struct fd *at = at_fd(at_f);
+    struct fd *at = at_fd_for_path(at_f, link);
     if (at == NULL)
         return _EBADF;
     return generic_symlinkat(target, at, link);
@@ -812,7 +932,7 @@ static dword_t sys_mknodat_common(fd_t at_f, guest_addr_t path_addr, mode_t_ mod
                 return _EINVAL;
     }
     apply_umask(&mode);
-    struct fd *at = at_fd(at_f);
+    struct fd *at = at_fd_for_path(at_f, path);
     if (at == NULL)
         return _EBADF;
     int err = generic_mknodat(at, path, mode, dev);
@@ -837,7 +957,7 @@ dword_t sys_mknodat(fd_t at_f, addr_t path_addr, mode_t_ mode, dev_t_ dev) {
 }
 
 static ssize_t sys_read_buf(fd_t fd_no, void *buf, size_t size) {
-    struct fd *fd = f_get(fd_no);
+    struct fd *fd = f_get_io(fd_no);
     if (fd == NULL)
         return _EBADF;
     if (S_ISDIR(fd->type))
@@ -863,9 +983,17 @@ static ssize_t sys_read_buf(fd_t fd_no, void *buf, size_t size) {
         // lookup, and paying that on EVERY read made bulk I/O (e.g. nix
         // unpacking a channel tarball) run at syscall-trace speed while
         // looking like a hang at 100% CPU.
-        if (amd64_as_source_trace_enabled() || fs_trace_elogind()) {
+        // IN_ACCESS joins the same gate: an inotify instance that could
+        // receive it is the third consumer that makes the path worth
+        // computing. procfs is excluded like the write side -- its reads are
+        // constant and never interesting to a watcher.
+        bool notify_access = res > 0 && inotify_has_instances() &&
+            (fd->mount == NULL || fd->mount->fs != &procfs);
+        if (amd64_as_source_trace_enabled() || fs_trace_elogind() || notify_access) {
             char path[MAX_PATH];
             if (generic_getpath(fd, path) == 0) {
+                if (notify_access)
+                    inotify_notify_access(path);
                 amd64_as_source_trace_read(fd_no, path, buf, (size_t) res);
                 if (fs_trace_elogind() && fs_trace_interesting_path(path)) {
                     size_t print_size = res;
@@ -920,10 +1048,103 @@ dword_t sys_read_guest(fd_t fd_no, guest_addr_t buf_addr, dword_t size) {
     return sys_read_common(fd_no, buf_addr, size);
 }
 
+// RLIMIT_FSIZE, which was stored, reported through getrlimit and /proc, and
+// then never consulted -- so `ulimit -f` was decorative and a runaway process
+// filled the disk exactly as if no limit had been set.
+//
+// Linux applies it in generic_write_check_limits, and the shape is easy to get
+// wrong: a write that would CROSS the limit is not refused, it is truncated to
+// what fits and reports that shorter count (measured on Linux 6.12: a 4096-byte
+// write against a 64-byte limit returns 64 with no error and no signal). Only
+// a write starting at or past the limit fails, with EFBIG and a SIGXFSZ.
+//
+// Regular files only. A pipe, socket or device has no size for a size limit to
+// mean anything about, and Linux does not check them.
+static int generic_fsetattr(struct fd *fd, struct attr attr);
+
+// Linux's file_remove_privs: writing to a file drops its setuid bit, because a
+// setuid program whose contents just changed is a setuid program somebody else
+// wrote. Nothing did this, so a user with write access to a setuid-root binary
+// could replace its contents and keep the bit -- which is the whole attack the
+// rule exists to stop.
+//
+// The exact shape, measured on Linux 6.12 as an unprivileged user:
+//   4755 -> 0755   suid always goes
+//   4644 -> 0644   ...even with no execute bit at all
+//   2755 -> 0755   sgid goes when the group-execute bit is set
+//   2644 -> 2644   ...but NOT without it: that combination is a mandatory
+//                  locking marker, not a privilege, and Linux leaves it
+//   6755 -> 0755
+// and root keeps all of them, because CAP_FSETID skips the whole thing.
+// ftruncate counts as a write for this.
+//
+// Done once per descriptor rather than once per write: the fstat is not free
+// on a fakefs (a metadata lookup), and the case that matters opens a file that
+// is ALREADY setuid, so the first write through the fd is where it must land.
+// A file that gains the bits after this fd's first write keeps them, which
+// needs chmod on the file -- and anyone holding that does not need the write.
+static void file_remove_privs(struct fd *fd) {
+    if (fd->privs_checked)
+        return;
+    fd->privs_checked = true;
+    if (!S_ISREG(fd->type))
+        return;
+    // CAP_FSETID is the whole exemption: root writing a setuid file keeps it.
+    if (current_capable(CAP_FSETID_))
+        return;
+    if (fd->mount == NULL || fd->mount->fs == NULL || fd->mount->fs->fstat == NULL)
+        return;
+    struct statbuf stat;
+    if (fd->mount->fs->fstat(fd, &stat) < 0)
+        return;
+    mode_t_ strip = 0;
+    if (stat.mode & S_ISUID)
+        strip |= S_ISUID;
+    if ((stat.mode & S_ISGID) && (stat.mode & S_IXGRP))
+        strip |= S_ISGID;
+    if (strip == 0)
+        return;
+    generic_fsetattr(fd, make_attr(mode, stat.mode & ~strip & ~S_IFMT));
+}
+
+static int fsize_limit_check(struct fd *fd, size_t *size) {
+    // The default is unlimited, so nothing below is on the ordinary write
+    // path: only a process that actually set `ulimit -f` pays for the seek.
+    rlim_t_ limit = rlimit(RLIMIT_FSIZE_);
+    if (limit == RLIM_INFINITY_)
+        return 0;
+    if (!S_ISREG(fd->type))
+        return 0;
+    // fd->offset is not where a regular file's position lives -- the fd ops
+    // keep it on the host descriptor and sys_write_buf never writes it back
+    // for the ->write branch. Reading the stale copy meant every write
+    // believed it was starting at 0, so a limited file could be extended 64
+    // bytes at a time forever instead of refusing once it was full.
+    if (fd->ops->lseek == NULL)
+        return 0;
+    off_t_ pos = fd->ops->lseek(fd, 0, LSEEK_CUR);
+    if (pos < 0)
+        return 0;
+    off_t offset = (off_t) pos;
+    if ((uint64_t) offset >= limit) {
+        send_signal(current, SIGXFSZ_, SIGINFO_NIL);
+        return _EFBIG;
+    }
+    uint64_t room = limit - (uint64_t) offset;
+    if (*size > room)
+        *size = (size_t) room;
+    return 0;
+}
+
 static ssize_t sys_write_buf(fd_t fd_no, void *buf, size_t size) {
-    struct fd *fd = f_get(fd_no);
+    struct fd *fd = f_get_io(fd_no);
     if (fd == NULL)
         return _EBADF;
+
+    int limit_err = fsize_limit_check(fd, &size);
+    if (limit_err < 0)
+        return limit_err;
+    file_remove_privs(fd);
 
     ssize_t res;
     uint64_t delay_start = io_delay_start(fd);
@@ -986,6 +1207,7 @@ static dword_t sys_write_common(fd_t fd_no, guest_addr_t buf_addr, dword_t size)
     TASK_MAY_BLOCK {
         res = sys_write_buf(fd_no, buf, size);
     }
+    res = (dword_t) signal_restart_or_eintr((int_t) res);
     amd64_tty_stdio_trace("write", fd_no, buf_addr, size, res, buf, res > 0 ? (size_t) res : size);
 out:
     if (buf != stack_buf) free(buf);
@@ -1044,6 +1266,7 @@ static dword_t sys_readv_common(fd_t fd_no, guest_addr_t iovec_addr, dword_t iov
     TASK_MAY_BLOCK {
         res = sys_read_buf(fd_no, buf, io_size);
     }
+    res = signal_restart_or_eintr((int_t) res);
     if (res < 0)
         goto error;
 
@@ -1125,6 +1348,7 @@ static dword_t sys_writev_common(fd_t fd_no, guest_addr_t iovec_addr, dword_t io
     TASK_MAY_BLOCK {
         res = sys_write_buf(fd_no, buf, offset);
     }
+    res = signal_restart_or_eintr((int_t) res);
     amd64_tty_stdio_trace("writev", fd_no, iovec_addr, (dword_t) offset, res, buf,
             res > 0 ? (size_t) res : offset);
 error:
@@ -1172,7 +1396,7 @@ static dword_t sys_preadv_common(fd_t fd_no, guest_addr_t iovec_addr, dword_t io
             return _ENOMEM;
         }
     }
-    struct fd *fd = f_get(fd_no);
+    struct fd *fd = f_get_io(fd_no);
     ssize_t res;
     if (fd == NULL) {
         res = _EBADF;
@@ -1263,7 +1487,7 @@ static dword_t sys_pwritev_common(fd_t fd_no, guest_addr_t iovec_addr, dword_t i
         }
         offset += copy_len;
     }
-    struct fd *fd = f_get(fd_no);
+    struct fd *fd = f_get_io(fd_no);
     if (fd == NULL) {
         res = _EBADF;
         goto out;
@@ -1336,7 +1560,7 @@ dword_t sys_pwritev2_i386_guest(fd_t fd_no, guest_addr_t iovec_addr, dword_t iov
 }
 
 dword_t sys__llseek(fd_t f, dword_t off_high, dword_t off_low, addr_t res_addr, dword_t whence) {
-    struct fd *fd = f_get(f);
+    struct fd *fd = f_get_io(f);
     if (fd == NULL)
         return _EBADF;
     if (!fd->ops->lseek)
@@ -1369,7 +1593,7 @@ dword_t sys_lseek_amd64(fd_t f, dword_t off, dword_t whence) {
 }
 
 off_t_ sys_lseek_guest(fd_t f, off_t_ off, dword_t whence) {
-    struct fd *fd = f_get(f);
+    struct fd *fd = f_get_io(f);
     if (fd == NULL)
         return _EBADF;
     if (!fd->ops->lseek)
@@ -1389,7 +1613,7 @@ dword_t sys_pread_guest(fd_t f, guest_addr_t buf_addr, dword_t size, off_t_ off)
            (long long) off);
     if (size > MAX_RW_COUNT)
         size = MAX_RW_COUNT;
-    struct fd *fd = f_get(f);
+    struct fd *fd = f_get_io(f);
     if (fd == NULL)
         return _EBADF;
 
@@ -1434,12 +1658,32 @@ dword_t sys_pread_guest(fd_t f, guest_addr_t buf_addr, dword_t size, off_t_ off)
         }
         buf[res] = '\0';
         STRACE(" \"%.99s\"", buf);
-        if (user_write(buf_addr, buf, res))
-            res = _EFAULT;
     }
 out:
     unlock(&fd->lock);
     task_may_block_end();
+    // The copy-out happens AFTER fd->lock is dropped, and that is not tidiness.
+    //
+    // user_write takes the memory read lock, which is quiesce-aware: if a
+    // sibling thread is mid-munmap it has raised quiesce_requested, and this
+    // thread parks on a condvar until that finishes. Parking there while
+    // holding fd->lock deadlocks the whole emulator:
+    //
+    //   this thread   holds fd->lock, parked waiting for the quiesce
+    //   pread threads blocked on fd->lock, so they never reach a checkpoint
+    //   the munmap    waiting for every reader to drain, which they cannot
+    //
+    // Sampled exactly that on a hung pread_stack_thread_race: three threads in
+    // sys_pread_guest blocked on this mutex, one inside it parked in
+    // mem_quiesce_park, three more parked in task_wait_for_mem_quiesce, and
+    // sys_munmap_guest waiting on the structural lock. Nothing was running.
+    //
+    // sys_pwrite_guest had the ordering right all along -- it does its
+    // user_read before taking fd->lock -- so this was the one outlier. The
+    // data is already in a local buffer by now, so the lock buys nothing here
+    // anyway.
+    if (res >= 0 && user_write(buf_addr, buf, res))
+        res = _EFAULT;
     if (buf != stack_buf) free(buf);
     return res;
 }
@@ -1453,7 +1697,7 @@ dword_t sys_pwrite_guest(fd_t f, guest_addr_t buf_addr, dword_t size, off_t_ off
            (long long) off);
     if (size > MAX_RW_COUNT)
         size = MAX_RW_COUNT;
-    struct fd *fd = f_get(f);
+    struct fd *fd = f_get_io(f);
     if (fd == NULL)
         return _EBADF;
 
@@ -1717,7 +1961,21 @@ static struct fd *open_dir(const char *path) {
     if (!(stat.mode & S_IFDIR))
         return ERR_PTR(_ENOTDIR);
 
-    return generic_open(path, O_RDONLY_, 0);
+    // chdir() and chroot() need SEARCH permission on the directory, not read:
+    // Linux's SYSCALL_DEFINE1(chdir) does path_permission(MAY_EXEC) and
+    // nothing else. Opening it O_RDONLY asked for read as well, so an ordinary
+    // user could not cd into a 0711 directory -- the standard shape for a home
+    // directory or a shared drop-box, where traversal is granted and listing
+    // is not. `cd /some/0711/dir` simply failed with Permission denied.
+    //
+    // Checked here against the stat we already have, so the open below is only
+    // asked for the descriptor. A directory nobody may search still fails: the
+    // check is real, just the right one.
+    err = access_check(&stat, AC_X);
+    if (err < 0)
+        return ERR_PTR(err);
+
+    return generic_open(path, O_RDONLY_ | O_DIRECTORY_ | O_NOACCESS_CHECK_, 0);
 }
 
 void fs_chdir(struct fs_info *fs, struct fd *fd) {
@@ -1767,6 +2025,11 @@ dword_t sys_fchdir(fd_t f) {
 }
 
 static dword_t sys_chroot_common(guest_addr_t path_addr) {
+    // Linux requires CAP_SYS_CHROOT. Without this an unprivileged process could
+    // chroot itself, which is both unlike Linux and a way to escape a directory
+    // restriction rather than enter one.
+    if (!current_capable(CAP_SYS_CHROOT_))
+        return _EPERM;
     char path[MAX_PATH];
     int path_err = user_read_path(path_addr, path, sizeof(path));
     if (path_err)
@@ -1818,6 +2081,23 @@ int mount_statfs(struct mount *mount, struct statfsbuf *stat) {
     if (stat->type == 0)
         stat->type = mount->fs->magic;
     return err;
+}
+
+// statfs asks which filesystem a path is on, so it follows the final symlink
+// -- a link to /proc reports procfs, not the filesystem the link itself lives
+// on -- and the path has to exist. Neither was true: resolution used
+// N_SYMLINK_NOFOLLOW, and path_normalize does not require the last component
+// to be there (which is right for open(O_CREAT) and wrong here). So
+// `df /no/such/file` printed a filesystem and exited 0.
+static int statfs_resolve(const char *path_raw, char *path) {
+    // Existence is checked against the RAW path, not the normalized one: a
+    // normalized "/" is the empty string here, which generic_statat rejects,
+    // so checking the output instead made `df /` report ENOENT.
+    struct statbuf stat;
+    int err = generic_statat(AT_PWD, path_raw, &stat, 0);
+    if (err < 0)
+        return err;
+    return path_normalize(AT_PWD, path_raw, path, N_SYMLINK_FOLLOW);
 }
 
 static int_t statfs_mount(struct mount *mount, addr_t buf_addr) {
@@ -1896,7 +2176,7 @@ dword_t sys_statfs(addr_t path_addr, addr_t buf_addr) {
         return path_err;
     STRACE("statfs(\"%s\", %#x)", path_raw, buf_addr);
     char path[MAX_PATH];
-    int err = path_normalize(AT_PWD, path_raw, path, N_SYMLINK_NOFOLLOW);
+    int err = statfs_resolve(path_raw, path);
     if (err < 0)
         return err;
     struct mount *mount = mount_find(path);
@@ -1914,7 +2194,7 @@ static dword_t sys_statfs_amd64_common(guest_addr_t path_addr, guest_addr_t buf_
         return path_err;
     STRACE("statfs_amd64(\"%s\", %#x)", path_raw, buf_addr);
     char path[MAX_PATH];
-    int err = path_normalize(AT_PWD, path_raw, path, N_SYMLINK_NOFOLLOW);
+    int err = statfs_resolve(path_raw, path);
     if (err < 0)
         return err;
     struct mount *mount = mount_find(path);
@@ -1940,7 +2220,7 @@ dword_t sys_statfs64(addr_t path_addr, dword_t buf_size, addr_t buf_addr) {
     if (buf_size != sizeof(struct statfs64_))
         return _EINVAL;
     char path[MAX_PATH];
-    int err = path_normalize(AT_PWD, path_raw, path, N_SYMLINK_NOFOLLOW);
+    int err = statfs_resolve(path_raw, path);
     if (err < 0)
         return err;
     struct mount *mount = mount_find(path);
@@ -1978,19 +2258,66 @@ dword_t sys_fstatfs64(fd_t f, dword_t buf_size, addr_t buf_addr) {
 }
 
 dword_t sys_flock(fd_t f, dword_t operation) {
-    struct fd *fd = f_get(f);
+    // f_get_retain, not f_get: flock_lock() below can sleep indefinitely
+    // waiting for the lock, and the struct fd is recorded as the lock's OWNER.
+    // Without a reference a concurrent close() frees it mid-wait, and the lock
+    // is then granted and filed under a dangling pointer -- nothing can ever
+    // match it again, so it is held forever: not by a later close, not by
+    // LOCK_UN from a new fd, not by process exit. sys_fcntl_common already
+    // does this; flock was the odd one out. Linux's fdget/fput give the same
+    // guarantee.
+    struct fd *fd = f_get_retain(f);
     if (fd == NULL)
         return _EBADF;
-    if (fd->inode != NULL)
-        return flock_lock(fd, operation);
-    // TODO: POSIX doesn't allow flock to fail in this way. The check is here
-    // because a segfault is worse.
-    if (fd->mount->fs->flock == NULL)
-        return _EBADF;
-    return fd->mount->fs->flock(fd, operation);
+    dword_t err;
+    if (fd->inode != NULL) {
+        err = flock_lock(fd, operation);
+    } else if (fd->mount->fs->flock == NULL) {
+        // TODO: POSIX doesn't allow flock to fail in this way. The check is
+        // here because a segfault is worse.
+        err = _EBADF;
+    } else {
+        err = fd->mount->fs->flock(fd, operation);
+    }
+    fd_close(fd);
+    return (dword_t) signal_restart_or_eintr((int_t) err);   // SA_RESTART
+}
+
+// The two sentinels utimensat(2) puts in tv_nsec. Nothing below this function
+// understands them, so they have to be resolved here: passed through, the
+// sentinel is written as a literal nanosecond count, and UTIME_OMIT -- whose
+// whole job is to leave a timestamp alone -- instead set it to 1970-01-01
+// 00:00:01 (1073741822ns carried into 1s). That is what `touch -m`, `cp -p`,
+// tar and rsync all use to preserve the timestamp they are not setting.
+#define UTIME_NOW_  0x3fffffff
+#define UTIME_OMIT_ 0x3ffffffe
+
+static bool utime_nsec_valid(struct timespec ts) {
+    return ts.tv_nsec == UTIME_NOW_ || ts.tv_nsec == UTIME_OMIT_ ||
+        (ts.tv_nsec >= 0 && ts.tv_nsec < 1000000000L);
 }
 
 static dword_t sys_utime_common(fd_t at_f, guest_addr_t path_addr, struct timespec atime, struct timespec mtime, dword_t flags) {
+    // Linux's do_utimensat validates before touching anything: only
+    // AT_SYMLINK_NOFOLLOW is a legal flag, and each tv_nsec must be in range
+    // or one of the two sentinels. The older utime/utimes/futimesat entry
+    // points all pass flags == 0 and microsecond-derived nanoseconds, so this
+    // is a no-op for them.
+    if (flags & ~(dword_t) AT_SYMLINK_NOFOLLOW_)
+        return _EINVAL;
+    if (!utime_nsec_valid(atime) || !utime_nsec_valid(mtime))
+        return _EINVAL;
+    bool omit_atime = atime.tv_nsec == UTIME_OMIT_;
+    bool omit_mtime = mtime.tv_nsec == UTIME_OMIT_;
+    // Which permission rule applies is decided by the caller's REQUEST, not by
+    // the values, so it has to be recorded before the sentinels are resolved
+    // to a concrete time just below.
+    bool times_are_now = (atime.tv_nsec == UTIME_NOW_ || omit_atime) &&
+                         (mtime.tv_nsec == UTIME_NOW_ || omit_mtime);
+    if (atime.tv_nsec == UTIME_NOW_)
+        atime = timespec_now(CLOCK_REALTIME);
+    if (mtime.tv_nsec == UTIME_NOW_)
+        mtime = timespec_now(CLOCK_REALTIME);
     char path[MAX_PATH];
     if (path_addr != 0) {
         int path_err = user_read_path(path_addr, path, sizeof(path));
@@ -2001,9 +2328,64 @@ static dword_t sys_utime_common(fd_t at_f, guest_addr_t path_addr, struct timesp
     }
     STRACE("utimensat(%d, %s, {{%d, %d}, {%d, %d}}, %d)", at_f, path,
             atime.tv_sec, atime.tv_nsec, mtime.tv_sec, mtime.tv_nsec, flags);
-    struct fd *at = at_fd(at_f);
+    struct fd *at = at_fd_for_path(at_f, path);
     if (at == NULL)
         return _EBADF;
+
+    // Fill an omitted timestamp in from the file's current one. The mount ops
+    // below take both values or neither, so "leave this one alone" has to be
+    // expressed as "set it to what it already is". Not atomic the way Linux's
+    // single setattr is -- a concurrent write between the stat and the set
+    // would be overwritten -- but the alternative is threading an omit mask
+    // through every filesystem's utime op.
+    if (omit_atime || omit_mtime) {
+        struct statbuf cur = {};
+        int stat_err;
+        if (path_addr == 0)
+            stat_err = at == AT_PWD ? _EFAULT : generic_fstat(at, &cur);
+        else
+            stat_err = generic_statat(at, path, &cur,
+                    (flags & AT_SYMLINK_NOFOLLOW_) ? AT_SYMLINK_NOFOLLOW_ : 0);
+        if (stat_err < 0)
+            return stat_err;
+        if (omit_atime)
+            atime = (struct timespec) { .tv_sec = cur.atime, .tv_nsec = cur.atime_nsec };
+        if (omit_mtime)
+            mtime = (struct timespec) { .tv_sec = cur.mtime, .tv_nsec = cur.mtime_nsec };
+        // Both omitted is a legal call that changes nothing; Linux returns
+        // after the same permission check the stat above already did.
+        if (omit_atime && omit_mtime)
+            return 0;
+    }
+
+    // Timestamps are file metadata and are protected like any other, and
+    // nothing checked them at all -- generic_utime went straight to the
+    // filesystem, unlike generic_setattrat beside it. Any user could restamp
+    // any file on the system, including root-owned ones they could not write,
+    // which is enough on its own to mislead make, rsync, tar and every backup
+    // tool that trusts an mtime.
+    //
+    // Linux (setattr_prepare): setting EXPLICIT times requires ownership or
+    // CAP_FOWNER, and is EPERM otherwise; setting them to "now" requires
+    // ownership OR write permission, and is EACCES otherwise. Both measured.
+    if (!(current != NULL && current->fsuid == 0)) {
+        struct statbuf owner = {};
+        int owner_err;
+        if (path_addr == 0)
+            owner_err = at == AT_PWD ? _EFAULT : generic_fstat(at, &owner);
+        else
+            owner_err = generic_statat(at, path, &owner,
+                    (flags & AT_SYMLINK_NOFOLLOW_) ? AT_SYMLINK_NOFOLLOW_ : 0);
+        if (owner_err < 0)
+            return owner_err;
+        if (current->fsuid != owner.uid) {
+            if (!times_are_now)
+                return _EPERM;
+            int perm_err = access_check(&owner, AC_W);
+            if (perm_err < 0)
+                return perm_err;
+        }
+    }
 
     if (path_addr == 0) {
         // The futimens(fd) form: utimensat(fd, NULL, times, 0). Linux does no
@@ -2031,7 +2413,7 @@ dword_t sys_utimensat64(fd_t at_f, addr_t path_addr, addr_t times_addr, dword_t 
     struct timespec atime;
     struct timespec mtime;
     if (times_addr == 0) {
-        atime = mtime = timespec_now(CLOCK_REALTIME);
+        atime = mtime = (struct timespec) { .tv_nsec = UTIME_NOW_ };
     } else {
         size_t stride = sizeof(struct timespec64_);
         if (read_guest_timespec_abi(GUEST_ABI_AMD64, times_addr, &atime) ||
@@ -2045,7 +2427,7 @@ dword_t sys_utimensat_amd64_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_
     struct timespec atime;
     struct timespec mtime;
     if (times_addr == 0) {
-        atime = mtime = timespec_now(CLOCK_REALTIME);
+        atime = mtime = (struct timespec) { .tv_nsec = UTIME_NOW_ };
     } else {
         size_t stride = guest_timespec_size(GUEST_ABI_AMD64);
         if (read_guest_timespec_abi(GUEST_ABI_AMD64, times_addr, &atime) ||
@@ -2063,7 +2445,7 @@ dword_t sys_utimensat_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_t time
     struct timespec atime;
     struct timespec mtime;
     if (times_addr == 0) {
-        atime = mtime = timespec_now(CLOCK_REALTIME);
+        atime = mtime = (struct timespec) { .tv_nsec = UTIME_NOW_ };
     } else {
         size_t stride = guest_timespec_size(GUEST_ABI_I386);
         if (read_guest_timespec_abi(GUEST_ABI_I386, times_addr, &atime) ||
@@ -2080,7 +2462,7 @@ dword_t sys_utimes_amd64_guest(guest_addr_t path_addr, guest_addr_t times_addr) 
     struct timespec atime;
     struct timespec mtime;
     if (times_addr == 0) {
-        atime = mtime = timespec_now(CLOCK_REALTIME);
+        atime = mtime = (struct timespec) { .tv_nsec = UTIME_NOW_ };
     } else {
         size_t stride = guest_timeval_size(GUEST_ABI_AMD64);
         struct timeval time_a;
@@ -2104,7 +2486,7 @@ dword_t sys_utimes_guest(guest_addr_t path_addr, guest_addr_t times_addr) {
     struct timespec atime;
     struct timespec mtime;
     if (times_addr == 0) {
-        atime = mtime = timespec_now(CLOCK_REALTIME);
+        atime = mtime = (struct timespec) { .tv_nsec = UTIME_NOW_ };
     } else {
         size_t stride = guest_timeval_size(GUEST_ABI_I386);
         struct timeval time_a;
@@ -2127,7 +2509,7 @@ dword_t sys_futimesat_amd64_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_
     struct timespec atime;
     struct timespec mtime;
     if (times_addr == 0) {
-        atime = mtime = timespec_now(CLOCK_REALTIME);
+        atime = mtime = (struct timespec) { .tv_nsec = UTIME_NOW_ };
     } else {
         size_t stride = guest_timeval_size(GUEST_ABI_AMD64);
         struct timeval time_a;
@@ -2151,7 +2533,7 @@ dword_t sys_futimesat_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_t time
     struct timespec atime;
     struct timespec mtime;
     if (times_addr == 0) {
-        atime = mtime = timespec_now(CLOCK_REALTIME);
+        atime = mtime = (struct timespec) { .tv_nsec = UTIME_NOW_ };
     } else {
         size_t stride = guest_timeval_size(GUEST_ABI_I386);
         struct timeval time_a;
@@ -2174,7 +2556,7 @@ dword_t sys_utime_amd64_guest(guest_addr_t path_addr, guest_addr_t times_addr) {
     struct timespec atime;
     struct timespec mtime;
     if (times_addr == 0) {
-        atime = mtime = timespec_now(CLOCK_REALTIME);
+        atime = mtime = (struct timespec) { .tv_nsec = UTIME_NOW_ };
     } else {
         struct amd64_utimbuf_ {
             qword_t actime;
@@ -2198,7 +2580,7 @@ dword_t sys_utime_guest(guest_addr_t path_addr, guest_addr_t times_addr) {
     struct timespec atime;
     struct timespec mtime;
     if (times_addr == 0) {
-        atime = mtime = timespec_now(CLOCK_REALTIME);
+        atime = mtime = (struct timespec) { .tv_nsec = UTIME_NOW_ };
     } else {
         struct utimbuf_ {
             time_t_ actime;
@@ -2282,7 +2664,7 @@ static dword_t sys_fchmodat_common(fd_t at_f, guest_addr_t path_addr, dword_t mo
     } else {
         STRACE("fchmodat(%d, \"%s\", %o)", at_f, path, mode);
     }
-    struct fd *at = at_fd(at_f);
+    struct fd *at = at_fd_for_path(at_f, path);
     if (at == NULL)
         return _EBADF;
     mode &= ~S_IFMT;
@@ -2361,7 +2743,12 @@ static dword_t sys_fchownat_common(fd_t at_f, guest_addr_t path_addr, dword_t ow
     if (path_err)
         return path_err;
     STRACE("fchownat(%d, \"%s\", %d, %d, %d)", at_f, path, owner, group, flags);
-    struct fd *at = at_fd(at_f);
+    // Linux: only these two flags exist here, and anything else is EINVAL
+    // before any lookup. Accepting an unknown bit and ignoring it tells a
+    // caller its request was honoured when it was not.
+    if (flags & ~(AT_SYMLINK_NOFOLLOW_ | AT_EMPTY_PATH_))
+        return _EINVAL;
+    struct fd *at = at_fd_for_path(at_f, path);
     if (at == NULL)
         return _EBADF;
     int err;
@@ -2459,6 +2846,9 @@ dword_t sys_ftruncate64(fd_t f, dword_t size_low, dword_t size_high) {
     struct fd *fd = f_get(f);
     if (fd == NULL)
         return _EBADF;
+    // Truncation changes the contents too, so it drops the privilege bits the
+    // same way a write does.
+    file_remove_privs(fd);
     return generic_fsetattr(fd, make_attr(size, size));
 }
 
@@ -2478,16 +2868,154 @@ dword_t sys_ftruncate(fd_t f, dword_t size) {
     return generic_fsetattr(fd, make_attr(size, size));
 }
 
-dword_t sys_fallocate(fd_t f, dword_t UNUSED(mode), dword_t offset_low, dword_t offset_high, dword_t len_low, dword_t len_high) {
-    off_t_ offset = ((qword_t) offset_high << 32) | offset_low;
-    off_t_ len = ((qword_t) len_high << 32) | len_low;
+#define FALLOC_FL_KEEP_SIZE_      0x01
+#define FALLOC_FL_PUNCH_HOLE_     0x02
+#define FALLOC_FL_COLLAPSE_RANGE_ 0x08
+#define FALLOC_FL_ZERO_RANGE_     0x10
+#define FALLOC_FL_INSERT_RANGE_   0x20
+
+// Overwrite [offset, offset+len) with zeros. The file already extends that
+// far; this is the "make it read as a hole" half of PUNCH_HOLE and ZERO_RANGE.
+// AOK stores every regular file densely, so a hole is written zeros rather
+// than unallocated space -- indistinguishable through read(2), which is the
+// only thing the caller can observe.
+static int fallocate_zero_range(struct fd *fd, off_t_ offset, off_t_ len) {
+    static const size_t CHUNK = 64 * 1024;
+    char *zeros = calloc(1, CHUNK);
+    if (zeros == NULL)
+        return _ENOMEM;
+    int err = 0;
+    off_t_ pos = offset;
+    off_t_ end = offset + len;
+    while (pos < end) {
+        size_t n = (size_t) (end - pos);
+        if (n > CHUNK)
+            n = CHUNK;
+        ssize_t wrote;
+        if (fd->ops->pwrite != NULL) {
+            wrote = fd->ops->pwrite(fd, zeros, n, pos);
+        } else {
+            // No pwrite: seek and write, restoring the position afterwards so
+            // fallocate stays the side-effect-free call it is documented to be.
+            if (fd->ops->lseek == NULL) {
+                err = _EOPNOTSUPP;
+                break;
+            }
+            off_t_ saved = fd->ops->lseek(fd, 0, LSEEK_CUR);
+            if (saved < 0) { err = (int) saved; break; }
+            off_t_ sought = fd->ops->lseek(fd, pos, LSEEK_SET);
+            if (sought < 0) { err = (int) sought; break; }
+            wrote = fd->ops->write(fd, zeros, n);
+            fd->ops->lseek(fd, saved, LSEEK_SET);
+        }
+        if (wrote < 0) { err = (int) wrote; break; }
+        if (wrote == 0) { err = _EIO; break; }
+        pos += wrote;
+    }
+    free(zeros);
+    return err;
+}
+
+// mode was UNUSED: every fallocate did the same thing, which is "extend the
+// file if the range runs past the end". So FALLOC_FL_PUNCH_HOLE -- whose whole
+// purpose is to zero a range -- left the old bytes in place and reported
+// success, and FALLOC_FL_KEEP_SIZE, whose entire meaning is "do not change the
+// size", grew the file. Both are silent data bugs: a caller punching a hole to
+// erase something still had it, and a caller preallocating with KEEP_SIZE
+// found its file the wrong length.
+//
+// Argument order follows Linux's vfs_fallocate: range first, then the mode
+// combinations, then the fd's own capabilities.
+dword_t sys_fallocate(fd_t f, dword_t mode, dword_t offset_low, dword_t offset_high, dword_t len_low, dword_t len_high) {
+    off_t_ offset = (off_t_) (((qword_t) offset_high << 32) | offset_low);
+    off_t_ len = (off_t_) (((qword_t) len_high << 32) | len_low);
+    STRACE("fallocate(%d, %#x, %lld, %lld)", f, mode, (long long) offset, (long long) len);
+    if (offset < 0 || len <= 0)
+        return _EINVAL;
+
+    // Linux 6.12's vfs_fallocate treats the mode bits as an enum with
+    // KEEP_SIZE as the one modifier flag, and answers EOPNOTSUPP for every
+    // combination outside that -- EINVAL is reserved for the range above.
+    // (Measured, not assumed: older kernels used EINVAL for some of these and
+    // 6.12 does not.)
+    switch (mode & ~FALLOC_FL_KEEP_SIZE_) {
+        case 0:                        // plain allocation
+        case FALLOC_FL_ZERO_RANGE_:
+            break;
+        case FALLOC_FL_PUNCH_HOLE_:
+            // A punch that does not keep the size is not a punch.
+            if (!(mode & FALLOC_FL_KEEP_SIZE_))
+                return _EOPNOTSUPP;
+            break;
+        case FALLOC_FL_COLLAPSE_RANGE_:
+        case FALLOC_FL_INSERT_RANGE_:
+            // These move the file's contents; keeping the size is meaningless.
+            if (mode & FALLOC_FL_KEEP_SIZE_)
+                return _EOPNOTSUPP;
+            break;
+        default:
+            // Unknown bits, and any two modes at once.
+            return _EOPNOTSUPP;
+    }
+
     struct fd *fd = f_get(f);
     if (fd == NULL)
         return _EBADF;
+    // An fd opened for reading cannot be fallocated however valid the range.
+    if ((fd_getflags(fd) & O_ACCMODE_) == O_RDONLY_)
+        return _EBADF;
+    if (S_ISFIFO(fd->type))
+        return _ESPIPE;
+    if (S_ISDIR(fd->type))
+        return _EISDIR;
+    if (!S_ISREG(fd->type))
+        return _ENODEV;
+
+    // Shifting the file's contents around. Real filesystems disagree about
+    // these -- ext4 and xfs implement them, most others answer EOPNOTSUPP --
+    // so refusing is a state callers already handle, and far better than the
+    // silent wrong answer of treating them as a plain allocation.
+    if (mode & (FALLOC_FL_COLLAPSE_RANGE_ | FALLOC_FL_INSERT_RANGE_))
+        return _EOPNOTSUPP;
+
     struct statbuf statbuf;
     int err = fd->mount->fs->fstat(fd, &statbuf);
     if (err < 0)
         return err;
+
+    if (mode & FALLOC_FL_PUNCH_HOLE_) {
+        // Entirely past the end: there is nothing to punch, and the size must
+        // not move. Linux returns 0.
+        if ((uint64_t) offset >= statbuf.size)
+            return 0;
+        uint64_t end = (uint64_t) offset + (uint64_t) len;
+        if (end > statbuf.size)
+            end = statbuf.size;
+        return fallocate_zero_range(fd, offset, (off_t_) (end - (uint64_t) offset));
+    }
+
+    if (mode & FALLOC_FL_ZERO_RANGE_) {
+        // Unlike a punch, this one may extend the file -- unless KEEP_SIZE.
+        uint64_t end = (uint64_t) offset + (uint64_t) len;
+        if (end > statbuf.size && !(mode & FALLOC_FL_KEEP_SIZE_)) {
+            err = generic_fsetattr(fd, make_attr(size, (off_t_) end));
+            if (err < 0)
+                return err;
+        }
+        uint64_t zero_end = end;
+        if (mode & FALLOC_FL_KEEP_SIZE_) {
+            if ((uint64_t) offset >= statbuf.size)
+                return 0;
+            if (zero_end > statbuf.size)
+                zero_end = statbuf.size;
+        }
+        return fallocate_zero_range(fd, offset, (off_t_) (zero_end - (uint64_t) offset));
+    }
+
+    // Plain allocation. AOK reserves nothing, so the only observable part is
+    // the size -- which KEEP_SIZE says to leave alone.
+    if (mode & FALLOC_FL_KEEP_SIZE_)
+        return 0;
     if ((uint64_t) offset + (uint64_t) len > statbuf.size)
         return generic_fsetattr(fd, make_attr(size, offset + len));
     return 0;
@@ -2499,11 +3027,16 @@ static dword_t sys_mkdirat_common(fd_t at_f, guest_addr_t path_addr, mode_t_ mod
     if (path_err)
         return path_err;
     STRACE("mkdirat(%d, %s, 0%o)", at_f, path, mode);
-    struct fd *at = at_fd(at_f);
+    struct fd *at = at_fd_for_path(at_f, path);
     if (at == NULL)
         return _EBADF;
     apply_umask(&mode);
-    mode &= 0777;
+    // Keep S_ISVTX: mkdir("/tmp/x", 01777) must produce a sticky directory,
+    // as it does on Linux (verified). Masking to 0777 silently dropped it, so
+    // any single-call creation of a sticky directory produced a world-writable
+    // one instead. setuid/setgid stay masked off -- Linux clears S_ISGID here
+    // too (verified: mkdir 02755 gives 0755).
+    mode &= 0777 | S_ISVTX_;
     int err = generic_mkdirat(at, path, mode);
     if (fs_trace_elogind())
         printk("INFO: elogind mkdirat pid=%d comm=%s at=%d path=%s mode=%#o result=%d\n",
@@ -2697,6 +3230,19 @@ static dword_t fd_copy_range(fd_t in_no, off_t_ *in_off, fd_t out_no, off_t_ *ou
 // in_fd (read side); out_fd always uses its current position. off64 selects the
 // width of the guest *offset (i386 sendfile is 32-bit, sendfile64/amd64 64-bit).
 static dword_t do_sendfile(fd_t out_fd, fd_t in_fd, guest_addr_t offset_addr, uint64_t count, bool off64) {
+    // sendfile's input must be something mmap-like -- a regular file or a
+    // character device -- because Linux needs to seek it. A pipe, FIFO or
+    // socket is EINVAL, immediately. AOK checked nothing and went straight to
+    // a blocking read, so `sendfile(out, pipe_fd, ...)` sat there until
+    // somebody wrote enough bytes to the pipe, which for a caller expecting an
+    // immediate error is never. (The output end is unrestricted -- targeting a
+    // socket is sendfile's whole purpose.)
+    struct fd *in_f = f_get(in_fd);
+    if (in_f == NULL)
+        return _EBADF;
+    if (!S_ISREG(in_f->type) && !S_ISCHR(in_f->type))
+        return _EINVAL;
+
     off_t_ off = 0;
     off_t_ *off_ptr = NULL;
     if (offset_addr != 0) {
@@ -2738,8 +3284,207 @@ dword_t sys_sendfile_guest(fd_t out_fd, fd_t in_fd, guest_addr_t offset_addr, ui
            (unsigned long long) count);
     return do_sendfile(out_fd, in_fd, offset_addr, count, true); // amd64 off_t is 64-bit
 }
-dword_t sys_splice(fd_t UNUSED(in_fd), addr_t UNUSED(in_off_addr), fd_t UNUSED(out_fd), addr_t UNUSED(out_off_addr), dword_t UNUSED(count), dword_t UNUSED(flags)) {
-    return _EINVAL;
+#define SPLICE_F_MOVE_     0x01
+#define SPLICE_F_NONBLOCK_ 0x02
+#define SPLICE_F_MORE_     0x04
+#define SPLICE_F_GIFT_     0x08
+
+// splice(2) was an unconditional EINVAL, so every caller of it -- and of the
+// `cat < file > pipe`-shaped fast paths libraries build on it -- fell back or
+// failed.
+//
+// What splice guarantees to the caller is which bytes move where, not that
+// they move without being copied: the zero-copy is why it exists on Linux, but
+// it is not observable through the syscall. So this moves them through the
+// same buffered engine sendfile and copy_file_range use, which already handles
+// the short-write case that would otherwise lose data taken out of a pipe.
+//
+// tee(2) stays unimplemented on purpose -- see sys_tee below.
+static dword_t do_splice(fd_t in_no, guest_addr_t in_off_addr, fd_t out_no,
+        guest_addr_t out_off_addr, uint64_t count, dword_t flags) {
+    if (flags & ~(SPLICE_F_MOVE_ | SPLICE_F_NONBLOCK_ | SPLICE_F_MORE_ | SPLICE_F_GIFT_))
+        return _EINVAL;
+
+    struct fd *in_fd = f_get(in_no);
+    struct fd *out_fd = f_get(out_no);
+    if (in_fd == NULL || out_fd == NULL)
+        return _EBADF;
+
+    // At least one end must be a pipe: splice moves data *through* a pipe, and
+    // with neither end one there is nothing it does that read+write does not.
+    bool in_is_pipe = S_ISFIFO(in_fd->type);
+    bool out_is_pipe = S_ISFIFO(out_fd->type);
+    if (!in_is_pipe && !out_is_pipe)
+        return _EINVAL;
+    // A pipe has no seekable position, so naming an offset for one is a
+    // contradiction rather than an out-of-range value.
+    if (in_is_pipe && in_off_addr != 0)
+        return _ESPIPE;
+    if (out_is_pipe && out_off_addr != 0)
+        return _ESPIPE;
+
+    if (count == 0)
+        return 0;
+
+    off_t_ in_off = 0, out_off = 0;
+    off_t_ *in_ptr = NULL, *out_ptr = NULL;
+    if (in_off_addr != 0) {
+        if (user_get(in_off_addr, in_off))
+            return _EFAULT;
+        in_ptr = &in_off;
+    }
+    if (out_off_addr != 0) {
+        if (user_get(out_off_addr, out_off))
+            return _EFAULT;
+        out_ptr = &out_off;
+    }
+    if ((in_ptr != NULL && in_off < 0) || (out_ptr != NULL && out_off < 0))
+        return _EINVAL;
+
+    // SPLICE_F_NONBLOCK is about the pipe end, not about the file: with
+    // nothing to read the answer is EAGAIN rather than a blocking wait. The
+    // buffered engine below would block, so ask first.
+    if ((flags & SPLICE_F_NONBLOCK_) && in_is_pipe && in_fd->ops->poll != NULL) {
+        if (!(in_fd->ops->poll(in_fd) & (POLL_READ | POLL_HUP | POLL_ERR)))
+            return _EAGAIN;
+    }
+
+    dword_t res = fd_copy_range(in_no, in_ptr, out_no, out_ptr, count);
+    if ((sdword_t) res >= 0) {
+        if (in_ptr != NULL && user_put(in_off_addr, in_off))
+            return _EFAULT;
+        if (out_ptr != NULL && user_put(out_off_addr, out_off))
+            return _EFAULT;
+    }
+    return res;
+}
+
+dword_t sys_splice(fd_t in_fd, addr_t in_off_addr, fd_t out_fd, addr_t out_off_addr, dword_t count, dword_t flags) {
+    STRACE("splice(%d, %#x, %d, %#x, %u, %#x)", in_fd, in_off_addr, out_fd, out_off_addr, count, flags);
+    return do_splice(in_fd, in_off_addr, out_fd, out_off_addr, count, flags);
+}
+
+dword_t sys_splice_guest(fd_t in_fd, guest_addr_t in_off_addr, fd_t out_fd, guest_addr_t out_off_addr, uint64_t count, dword_t flags) {
+    STRACE("splice(%d, %#llx, %d, %#llx, %llu, %#x)", in_fd,
+           (unsigned long long) in_off_addr, out_fd,
+           (unsigned long long) out_off_addr, (unsigned long long) count, flags);
+    return do_splice(in_fd, in_off_addr, out_fd, out_off_addr, count, flags);
+}
+
+// vmsplice(2): move an iovec into a pipe, or out of one. Linux does it by
+// mapping the caller's pages into the pipe buffer, which is what makes it
+// worth having; the observable result is that the bytes are in the pipe (or in
+// the iovec), and that is what this does. SPLICE_F_GIFT is the caller offering
+// its pages, which is meaningless without the mapping and is ignored -- Linux
+// ignores it too unless the pages are page-aligned.
+static dword_t do_vmsplice(fd_t f, guest_addr_t iov_addr, uint64_t iov_count, dword_t flags,
+        enum guest_abi abi) {
+    if (flags & ~(SPLICE_F_MOVE_ | SPLICE_F_NONBLOCK_ | SPLICE_F_MORE_ | SPLICE_F_GIFT_))
+        return _EINVAL;
+    struct fd *fd = f_get(f);
+    if (fd == NULL)
+        return _EBADF;
+    // Not a pipe is EBADF here, not EINVAL: Linux decides this by looking at
+    // whether the file has pipe operations at all.
+    if (!S_ISFIFO(fd->type))
+        return _EBADF;
+    // Linux's UIO_MAXIOV.
+    if (iov_count > 1024)
+        return _EINVAL;
+    if (iov_count == 0)
+        return 0;
+
+    struct guest_iovec_ *iovec = user_read_iovecs_abi(current, abi, iov_addr, (dword_t) iov_count);
+    if (IS_ERR(iovec))
+        return (dword_t) PTR_ERR(iovec);
+
+    // Which direction depends on which end of the pipe this is: the write end
+    // takes data in, the read end hands it out.
+    bool writing = (fd_getflags(fd) & O_ACCMODE_) != O_RDONLY_;
+    size_t total_size = 0;
+    for (uint64_t i = 0; i < iov_count; i++)
+        total_size += iovec[i].len;
+    if (total_size > MAX_RW_COUNT)
+        total_size = MAX_RW_COUNT;
+    if (total_size == 0) {
+        free(iovec);
+        return 0;
+    }
+
+    char *buf = malloc(total_size);
+    if (buf == NULL) {
+        free(iovec);
+        return _ENOMEM;
+    }
+
+    dword_t res;
+    if (writing) {
+        size_t off = 0;
+        for (uint64_t i = 0; i < iov_count && off < total_size; i++) {
+            size_t n = iovec[i].len;
+            if (n > total_size - off)
+                n = total_size - off;
+            if (user_read(iovec[i].base, buf + off, n)) {
+                free(buf);
+                free(iovec);
+                return _EFAULT;
+            }
+            off += n;
+        }
+        ssize_t wrote;
+        TASK_MAY_BLOCK {
+            wrote = fd->ops->write(fd, buf, total_size);
+        }
+        res = (dword_t) wrote;
+    } else {
+        ssize_t got;
+        TASK_MAY_BLOCK {
+            got = fd->ops->read(fd, buf, total_size);
+        }
+        if (got > 0) {
+            size_t off = 0;
+            for (uint64_t i = 0; i < iov_count && off < (size_t) got; i++) {
+                size_t n = iovec[i].len;
+                if (n > (size_t) got - off)
+                    n = (size_t) got - off;
+                if (user_write(iovec[i].base, buf + off, n)) {
+                    free(buf);
+                    free(iovec);
+                    return _EFAULT;
+                }
+                off += n;
+            }
+        }
+        res = (dword_t) got;
+    }
+    free(buf);
+    free(iovec);
+    return res;
+}
+
+dword_t sys_vmsplice(fd_t f, addr_t iov_addr, dword_t iov_count, dword_t flags) {
+    STRACE("vmsplice(%d, %#x, %u, %#x)", f, iov_addr, iov_count, flags);
+    return do_vmsplice(f, iov_addr, iov_count, flags, GUEST_ABI_I386);
+}
+
+dword_t sys_vmsplice_guest(fd_t f, guest_addr_t iov_addr, uint64_t iov_count, dword_t flags) {
+    STRACE("vmsplice(%d, %#llx, %llu, %#x)", f, (unsigned long long) iov_addr,
+           (unsigned long long) iov_count, flags);
+    return do_vmsplice(f, iov_addr, iov_count, flags, current->abi);
+}
+
+// tee(2) duplicates between two pipes WITHOUT consuming the source, which is a
+// statement about the pipe's own buffer: Linux implements it by taking another
+// reference to the pages already sitting in it.
+//
+// AOK's pipes are host pipes -- the guest fd is a real pipe fd, and the buffer
+// belongs to the host kernel, which offers no way to read without consuming.
+// Emulating it by reading and writing the bytes back would reorder anything
+// else already queued, and would deadlock outright against a full pipe. So
+// this stays ENOSYS: a caller that gets it falls back to read+write, which is
+// what it must already do for the kernels that predate tee.
+dword_t sys_tee(fd_t UNUSED(in_fd), fd_t UNUSED(out_fd), dword_t UNUSED(count), dword_t UNUSED(flags)) {
+    return _ENOSYS;
 }
 // copy_file_range(fd_in, off_in, fd_out, off_out, len, flags). off_in/off_out
 // are loff_t* (64-bit on both ABIs) or NULL. flags must be 0.
@@ -2762,6 +3507,15 @@ static dword_t do_copy_file_range(fd_t in_fd, guest_addr_t in_off_addr, fd_t out
     struct fd *out_f = f_get(out_fd);
     if (in_f == NULL || out_f == NULL)
         return _EBADF;
+    // Linux's order, which matters because each errno tells the caller a
+    // different thing: a directory is EISDIR (it named the wrong object), an
+    // O_APPEND output is EBADF (the fd cannot honour an offset, so writing at
+    // the requested one would put the bytes somewhere else -- which is what
+    // happened, silently), and only then is anything else EINVAL.
+    if (S_ISDIR(in_f->type) || S_ISDIR(out_f->type))
+        return _EISDIR;
+    if (out_f->flags & O_APPEND_)
+        return _EBADF;
     if (!S_ISREG(in_f->type) || !S_ISREG(out_f->type))
         return _EINVAL;
     off_t_ in_off = 0, out_off = 0;
@@ -2776,6 +3530,10 @@ static dword_t do_copy_file_range(fd_t in_fd, guest_addr_t in_off_addr, fd_t out
             return _EFAULT;
         out_ptr = &out_off;
     }
+    // A negative offset is EOVERFLOW, not EINVAL: Linux distinguishes "this
+    // offset cannot be represented" from "these arguments do not go together".
+    if ((in_ptr != NULL && in_off < 0) || (out_ptr != NULL && out_off < 0))
+        return _EOVERFLOW;
     dword_t res = fd_copy_range(in_fd, in_ptr, out_fd, out_ptr, len);
     if ((sdword_t) res >= 0) {
         if (in_ptr != NULL && user_put(in_off_addr, in_off))

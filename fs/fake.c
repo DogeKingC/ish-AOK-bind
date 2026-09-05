@@ -143,11 +143,11 @@ static void fakefs_snapshot_fd_stat(struct fd *fd) {
     if (realfs.fstat(fd, &real_stat) < 0)
         return;
 
-    struct fakefs_db *fs = &fd->mount->fakefs;
-    sqlite3_mutex_enter(fs->lock);
+    struct fakefs_db *fs = fakefs_db_thread(&fd->mount->fakefs);
+    FAKEFS_LOCK_READ(fs);
     struct ish_stat ishstat;
     bool found = inode_read_stat(fs, fd->fake_inode, &ishstat);
-    sqlite3_mutex_leave(fs->lock);
+    FAKEFS_UNLOCK_READ(fs);
     if (!found)
         return;
 
@@ -228,8 +228,8 @@ static int fakefs_getpath(struct fd *fd, char *buf) {
         return 0;
     }
     if (fd->mount != NULL && fd->fake_inode != 0) {
-        struct fakefs_db *fs = &fd->mount->fakefs;
-        sqlite3_mutex_enter(fs->lock);
+        struct fakefs_db *fs = fakefs_db_thread(&fd->mount->fakefs);
+        FAKEFS_LOCK_READ(fs);
         sqlite3_stmt *stmt = fs->stmt.path_from_inode;
         sqlite3_bind_int64(stmt, 1, fd->fake_inode);
         bool found = db_exec(fs, stmt);
@@ -238,17 +238,21 @@ static int fakefs_getpath(struct fd *fd, char *buf) {
             int path_len = sqlite3_column_bytes(stmt, 0);
             if (path_len < 0 || path_len > MAX_PATH) {
                 db_reset(fs, stmt);
-                sqlite3_mutex_leave(fs->lock);
+                FAKEFS_UNLOCK_READ(fs);
                 return _ENAMETOOLONG;
             }
-            memcpy(buf, path_blob, (size_t) path_len);
+            // sqlite3_column_blob returns NULL for a zero-length blob, and
+            // memcpy from NULL is undefined even for zero bytes (UBSan flags
+            // it: "null pointer passed as argument 2").
+            if (path_len > 0)
+                memcpy(buf, path_blob, (size_t) path_len);
             buf[path_len] = '\0';
             db_reset(fs, stmt);
-            sqlite3_mutex_leave(fs->lock);
+            FAKEFS_UNLOCK_READ(fs);
             return 0;
         }
         db_reset(fs, stmt);
-        sqlite3_mutex_leave(fs->lock);
+        FAKEFS_UNLOCK_READ(fs);
     }
     int err = realfs_getpath(fd, buf);
     if (err >= 0)
@@ -294,10 +298,51 @@ static struct fd *fakefs_open_initctl(const char *path, int flags) {
     return fd;
 }
 
+// Linux's inode_init_owner: a newly created object takes the creating
+// process's group -- UNLESS the directory it is created in is setgid, in which
+// case it takes the DIRECTORY's group, and a new subdirectory inherits the
+// setgid bit as well.
+//
+// That rule is the whole mechanism behind a shared group directory: everything
+// created inside it belongs to the group whoever made it, so the next person
+// can read and write it. AOK stamped the creator's own egid on every new
+// object and never copied the bit down, so a shared directory stopped being
+// shared the moment anybody with a different primary group created something
+// in it -- and the subdirectory they made was not shared either, so the damage
+// spread downwards.
+//
+// `path` is the mount-relative path of the object about to be created; the
+// parent is everything before its last slash. Caller is inside the same db
+// transaction, so this is a read against uncommitted-but-consistent state.
+static void fakefs_inherit_group(struct fakefs_db *fs, const char *path,
+                                 uint32_t *mode, uint32_t *gid) {
+    const char *slash = strrchr(path, '/');
+    if (slash == NULL)
+        return;
+    char parent[MAX_PATH];
+    size_t len = (size_t) (slash - path);
+    // A child of the mount root: the parent path is "", which is how this
+    // filesystem spells its own root.
+    if (len >= sizeof(parent))
+        return;
+    memcpy(parent, path, len);
+    parent[len] = '\0';
+
+    struct ish_stat parent_stat;
+    if (!path_read_stat(fs, parent, &parent_stat, NULL))
+        return;
+    if (!S_ISDIR(parent_stat.mode) || !(parent_stat.mode & S_ISGID))
+        return;
+
+    *gid = parent_stat.gid;
+    if (S_ISDIR(*mode))
+        *mode |= S_ISGID;
+}
+
 static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, int mode) {
     if (fakefs_initctl_info(path, NULL, NULL))
         return fakefs_open_initctl(path, flags);
-    struct fakefs_db *fs = &mount->fakefs;
+    struct fakefs_db *fs = fakefs_db_thread(&mount->fakefs);
     host_path_t host_path;
     int name_err = fakefs_host_path(path, host_path);
     if (name_err < 0)
@@ -358,6 +403,7 @@ retry:
         ishstat.mode = mode | S_IFREG;
         ishstat.uid = current->euid;
         ishstat.gid = current->egid;
+        fakefs_inherit_group(fs, path, &ishstat.mode, &ishstat.gid);
         ishstat.rdev = 0;
         if (fd->fake_inode == 0)
             fd->fake_inode = path_create(fs, path, &ishstat);
@@ -380,7 +426,7 @@ retry:
 
 // WARNING: giant hack, just for file providerws
 struct fd *fakefs_open_inode(struct mount *mount, ino_t inode) {
-    struct fakefs_db *fs = &mount->fakefs;
+    struct fakefs_db *fs = fakefs_db_thread(&mount->fakefs);
     db_begin_read(fs);
     sqlite3_stmt *stmt = fs->stmt.path_from_inode;
     sqlite3_bind_int64(stmt, 1, inode);
@@ -413,7 +459,7 @@ step:
 }
 
 static int fakefs_link(struct mount *mount, const char *src, const char *dst) {
-    struct fakefs_db *fs = &mount->fakefs;
+    struct fakefs_db *fs = fakefs_db_thread(&mount->fakefs);
     host_path_t host_src, host_dst;
     int name_err = fakefs_host_path(src, host_src);
     if (name_err >= 0)
@@ -438,7 +484,7 @@ static int fakefs_link(struct mount *mount, const char *src, const char *dst) {
 }
 
 static int fakefs_unlink(struct mount *mount, const char *path) {
-    struct fakefs_db *fs = &mount->fakefs;
+    struct fakefs_db *fs = fakefs_db_thread(&mount->fakefs);
     host_path_t host_path;
     int name_err = fakefs_host_path(path, host_path);
     if (name_err < 0)
@@ -461,7 +507,7 @@ static int fakefs_unlink(struct mount *mount, const char *path) {
 }
 
 static int fakefs_rmdir(struct mount *mount, const char *path) {
-    struct fakefs_db *fs = &mount->fakefs;
+    struct fakefs_db *fs = fakefs_db_thread(&mount->fakefs);
     host_path_t host_path;
     int name_err = fakefs_host_path(path, host_path);
     if (name_err < 0)
@@ -506,7 +552,7 @@ static int fakefs_rmdir(struct mount *mount, const char *path) {
 }
 
 static int fakefs_rename(struct mount *mount, const char *src, const char *dst) {
-    struct fakefs_db *fs = &mount->fakefs;
+    struct fakefs_db *fs = fakefs_db_thread(&mount->fakefs);
     host_path_t host_src, host_dst;
     int name_err = fakefs_host_path(src, host_src);
     if (name_err >= 0)
@@ -525,7 +571,7 @@ static int fakefs_rename(struct mount *mount, const char *src, const char *dst) 
 }
 
 static int fakefs_symlink(struct mount *mount, const char *target, const char *link) {
-    struct fakefs_db *fs = &mount->fakefs;
+    struct fakefs_db *fs = fakefs_db_thread(&mount->fakefs);
     host_path_t host_link;
     int name_err = fakefs_host_path(link, host_link);
     if (name_err < 0)
@@ -560,6 +606,7 @@ static int fakefs_symlink(struct mount *mount, const char *target, const char *l
     ishstat.mode = S_IFLNK | 0777; // symlinks always have full permissions
     ishstat.uid = current->euid;
     ishstat.gid = current->egid;
+    fakefs_inherit_group(fs, link, &ishstat.mode, &ishstat.gid);
     ishstat.rdev = 0;
     if (path_create(fs, link, &ishstat) == 0) {
         // Without its metadata row the host file is not a symlink at all, just
@@ -574,7 +621,7 @@ static int fakefs_symlink(struct mount *mount, const char *target, const char *l
 }
 
 static int fakefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev_t_ dev) {
-    struct fakefs_db *fs = &mount->fakefs;
+    struct fakefs_db *fs = fakefs_db_thread(&mount->fakefs);
     mode_t_ real_mode = 0666;
     if (S_ISBLK(mode) || S_ISCHR(mode) || S_ISSOCK(mode))
         real_mode |= S_IFREG;
@@ -594,6 +641,7 @@ static int fakefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev
     stat.mode = mode;
     stat.uid = current->euid;
     stat.gid = current->egid;
+    fakefs_inherit_group(fs, path, &stat.mode, &stat.gid);
     stat.rdev = 0;
     if (S_ISBLK(mode) || S_ISCHR(mode))
         stat.rdev = dev;
@@ -673,20 +721,27 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
         fakefs_initctl_statbuf(fake_stat, initctl_inode);
         return 0;
     }
-    struct fakefs_db *fs = &mount->fakefs;
-    sqlite3_mutex_enter(fs->lock);
+    struct fakefs_db *fs = fakefs_db_thread(&mount->fakefs);
+    FAKEFS_LOCK_READ(fs);
     struct ish_stat ishstat;
     ino_t inode;
-    if (!path_read_stat(fs, path, &ishstat, &inode)) {
+    bool have_stat = path_read_stat(fs, path, &ishstat, &inode);
+    FAKEFS_UNLOCK_READ(fs);
+    if (!have_stat) {
         // No metadata. Either the path really does not exist, or it was put
         // into the data directory from outside iSH; adopt it if so.
+        //
+        // Deliberately OUTSIDE the read region, which is why this is not the
+        // old body with the unlock macro swapped in. FAKEFS_LOCK_READ takes no
+        // mutex at all on a pooled connection -- it is a WAL read snapshot on a
+        // separate handle -- while adopting WRITES, via path_create on the
+        // PRIMARY handle. Issuing that write from inside a reader's snapshot is
+        // the bug this ordering avoids. ishstat and inode are already copies,
+        // so nothing here still needs the region.
         inode = fakefs_adopt_foreign(mount, path, &ishstat);
-        if (inode == 0) {
-            sqlite3_mutex_leave(fs->lock);
+        if (inode == 0)
             return _ENOENT;
-        }
     }
-    sqlite3_mutex_leave(fs->lock);
 
     host_path_t host_path;
     int err = fakefs_host_path(path, host_path);
@@ -704,14 +759,14 @@ static int fakefs_fstat(struct fd *fd, struct statbuf *fake_stat) {
         *fake_stat = fd->stat;
         return 0;
     }
-    struct fakefs_db *fs = &fd->mount->fakefs;
+    struct fakefs_db *fs = fakefs_db_thread(&fd->mount->fakefs);
     int err = realfs.fstat(fd, fake_stat);
     if (err < 0)
         return err;
-    sqlite3_mutex_enter(fs->lock);
+    FAKEFS_LOCK_READ(fs);
     struct ish_stat ishstat;
     bool found = inode_read_stat(fs, fd->fake_inode, &ishstat);
-    sqlite3_mutex_leave(fs->lock);
+    FAKEFS_UNLOCK_READ(fs);
     if (!found) {
         // Linux still allows fstat() on an unlinked-but-open file.
         // Preserve the most recent fake metadata snapshot on the fd.
@@ -739,7 +794,7 @@ static void fake_stat_setattr(struct ish_stat *ishstat, struct attr attr) {
 }
 
 static int fakefs_setattr(struct mount *mount, const char *path, struct attr attr) {
-    struct fakefs_db *fs = &mount->fakefs;
+    struct fakefs_db *fs = fakefs_db_thread(&mount->fakefs);
     if (attr.type == attr_size) {
         host_path_t host_path;
         int name_err = fakefs_host_path(path, host_path);
@@ -761,7 +816,7 @@ static int fakefs_setattr(struct mount *mount, const char *path, struct attr att
 }
 
 static int fakefs_fsetattr(struct fd *fd, struct attr attr) {
-    struct fakefs_db *fs = &fd->mount->fakefs;
+    struct fakefs_db *fs = fakefs_db_thread(&fd->mount->fakefs);
     if (attr.type == attr_size)
         return realfs.fsetattr(fd, attr);
     db_begin_write(fs);
@@ -790,7 +845,7 @@ static int fakefs_fsetattr(struct fd *fd, struct attr attr) {
 }
 
 static int fakefs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
-    struct fakefs_db *fs = &mount->fakefs;
+    struct fakefs_db *fs = fakefs_db_thread(&mount->fakefs);
     host_path_t host_path;
     int name_err = fakefs_host_path(path, host_path);
     if (name_err < 0)
@@ -805,6 +860,7 @@ static int fakefs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
     ishstat.mode = mode | S_IFDIR;
     ishstat.uid = current->euid;
     ishstat.gid = current->egid;
+    fakefs_inherit_group(fs, path, &ishstat.mode, &ishstat.gid);
     ishstat.rdev = 0;
     if (path_create(fs, path, &ishstat) == 0) {
         // See fakefs_mknod: a host entry with no metadata row behind it is
@@ -830,7 +886,7 @@ static ssize_t file_readlink(struct mount *mount, const char *path, char *buf, s
 }
 
 static ssize_t fakefs_readlink(struct mount *mount, const char *path, char *buf, size_t bufsize) {
-    struct fakefs_db *fs = &mount->fakefs;
+    struct fakefs_db *fs = fakefs_db_thread(&mount->fakefs);
     db_begin_read(fs);
     struct ish_stat ishstat;
     if (!path_read_stat(fs, path, &ishstat, NULL)) {
@@ -888,7 +944,7 @@ retry:
     fake_path_from_host(entry_path);
     fake_path_from_host(entry->name);
 
-    struct fakefs_db *fs = &fd->mount->fakefs;
+    struct fakefs_db *fs = fakefs_db_thread(&fd->mount->fakefs);
     db_begin_read(fs);
     struct ish_stat ishstat;
     ino_t inode;
@@ -974,7 +1030,7 @@ static int fakefs_umount(struct mount *mount) {
 }
 
 static void fakefs_inode_orphaned(struct mount *mount, ino_t inode) {
-    struct fakefs_db *fs = &mount->fakefs;
+    struct fakefs_db *fs = fakefs_db_thread(&mount->fakefs);
     db_begin_write(fs);
     sqlite3_bind_int64(fs->stmt.try_cleanup_inode, 1, inode);
     db_exec_reset(fs, fs->stmt.try_cleanup_inode);

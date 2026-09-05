@@ -82,7 +82,21 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
                 res = mount->fs->readlink(mount, possible_symlink, c, MAX_PATH - (c - out));
             if (res >= 0) {
                 mount_release(mount);
-                if (levels >= 5)
+                // RESOLVE_NO_SYMLINKS: the caller asked for a resolution with
+                // no symlink in it at all, so finding one is the answer, not
+                // something to follow.
+                if (flags & N_NO_SYMLINKS)
+                    return _ELOOP;
+                // Linux's MAXSYMLINKS. Five was low enough that ordinary
+                // /etc/alternatives-style chains hit ELOOP: `levels` counts
+                // every link followed across the whole resolution, including
+                // symlinked directory components, so a handful of them in a
+                // path exhausted it. Measured: Linux resolves 8 fine, AOK
+                // failed from 6.
+                //
+                // The recursion is one 4KB frame per level, so 40 costs about
+                // 170KB against a 4MB task stack.
+                if (levels >= MAX_SYMLINKS)
                     return _ELOOP;
                 // readlink does not null terminate
                 c[res] = '\0';
@@ -115,18 +129,29 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
                 return __path_normalize(root_path, next_at_path, expanded_path, out, flags, levels + 1);
             }
 
-            // if there's a slash after this component, ensure that if it
-            // exists, it's a directory and that we have execute perms on it
+            // A slash after this component means it must be a directory. It
+            // means we need SEARCH permission on it only if there is something
+            // after it to reach: a trailing slash asks "is this a directory",
+            // not "let me traverse into it".
+            //
+            // p has already been advanced past the run of slashes, so the
+            // final component of "dir/" satisfies this test too, and used to
+            // collect an execute check Linux never applies -- stat("/root/")
+            // was EACCES for an ordinary user where stat("/root") succeeded,
+            // and `test -d /root/` and `ls -d /root/` failed with it.
             if (*(p - 1) == '/') {
+                bool traversing = *p != '\0';
                 struct statbuf stat;
                 int err = mount->fs->stat(mount, possible_symlink, &stat);
                 mount_release(mount);
                 if (err >= 0) {
                     if (!S_ISDIR(stat.mode))
                         return _ENOTDIR;
-                    err = access_check(&stat, AC_X);
-                    if (err < 0)
-                        return err;
+                    if (traversing) {
+                        err = access_check(&stat, AC_X);
+                        if (err < 0)
+                            return err;
+                    }
                 } else if (*p != '\0') {
                     // A non-final component must exist and be a directory. Don't
                     // silently skip a missing one, or a following ".." would pop
@@ -182,7 +207,8 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
     // resolution at the true root instead of the chroot.
     if (flags & N_REALROOT)
         root = NULL;
-    if (path[0] == '/')
+    bool absolute = path[0] == '/';
+    if (absolute)
         at = root;
     else if (at == AT_PWD)
         at = current->fs->pwd;
@@ -199,6 +225,44 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
         // stress-ng --sockabuse passed a socket fd to utimensat).
         if (!path_is_normalized(at_path))
             return _ENOTDIR;
+        // The starting directory's OWN search bit is never a component of
+        // `path`, so the component loop in __path_normalize never checks it --
+        // it only checks what follows. Without this, openat(dirfd, "file")
+        // read files inside a directory the caller had no search permission
+        // on, and the same held for a cwd whose search bit was removed after
+        // the chdir. The dirfd is reachable because O_PATH on a directory
+        // correctly performs no permission check of its own, so the check has
+        // to happen here, at use time -- an fd opened while permissions
+        // allowed it must not keep working after they change.
+        //
+        // fstat on the fd rather than stat by path: the path lookup above is
+        // already the expensive part on fakefs, and this adds no second one.
+        // Only for a RELATIVE path. An absolute one starts at the process's
+        // own root, and Linux does not require search permission on that --
+        // it checks the components it descends into, which __path_normalize
+        // already does. Checking it here cost an fstat on every absolute-path
+        // resolution and measured ~9% on open/stat-heavy work, for a check
+        // Linux does not perform. The case this exists to stop -- openat()
+        // through a dirfd on a directory with no search permission, and a cwd
+        // whose search bit was removed -- is exactly the relative case.
+        if (!absolute) {
+            struct statbuf at_stat;
+            if (at->mount != NULL && at->mount->fs->fstat != NULL &&
+                    at->mount->fs->fstat(at, &at_stat) >= 0) {
+                // What KIND of thing it is comes before whether we may search
+                // it. A regular file as the dirfd of an *at() call is ENOTDIR
+                // on Linux, decided before any lookup; falling straight into
+                // the search check reported EACCES instead, because a 0644
+                // file has no execute bit -- a plausible-looking errno for
+                // entirely the wrong reason, and one that sends a caller
+                // looking at permissions rather than at the fd it passed.
+                if (!S_ISDIR(at_stat.mode))
+                    return _ENOTDIR;
+                int perm_err = access_check(&at_stat, AC_X);
+                if (perm_err < 0)
+                    return perm_err;
+            }
+        }
     }
     // root_path anchors any *absolute symlink target* encountered while
     // resolving (see __path_normalize): it must always be the process's
@@ -258,8 +322,53 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
         if (stat_err < 0)
             return stat_err;
         int access_err = access_check(&stat, AC_W | AC_X);
-        if (access_err < 0)
+        if (access_err < 0) {
+            if (flags & (N_CREATE_EEXIST_FIRST | N_REMOVE_ENOENT_FIRST)) {
+            // Linux looks the final component up BEFORE checking whether the
+            // parent may be written: filename_create() returns -EEXIST for a
+            // name that is already there, and only vfs_mkdir/vfs_link/etc.
+            // then ask may_create() for permission. So a caller that cannot
+            // write the parent still gets EEXIST, not EACCES, when the target
+            // exists -- and `mkdir -p` depends on exactly that, since it calls
+            // mkdir on every component and treats EEXIST as success. Reporting
+            // EACCES here made `mkdir -p /tmp/foo` fail outright for any
+            // unprivileged user, because "/" is not writable by them and /tmp
+            // already exists.
+            //
+            // Nothing is granted by deferring: the caller's own existence
+            // check reports EEXIST, and if the target does NOT exist the
+            // permission error below still stands.
+                //
+                // The REMOVE family needs the same lookup for the opposite
+                // reason: Linux's do_unlinkat()/do_rmdir() reject a negative
+                // dentry before may_delete() ever runs, so a name that is not
+                // there is ENOENT and not EACCES. `rm -f` suppresses ENOENT
+                // and nothing else, which is why `rm -f /unwritable/gone`
+                // failed here and succeeds on Linux -- and why one such rm in
+                // a `set -e` script (tests/manual/setup-regressions.sh's cache
+                // store) killed the whole run with no diagnostic.
+                //
+                // fs->stat is an lstat (AT_SYMLINK_NOFOLLOW), so a dangling
+                // symlink still counts as a name that exists and is removable.
+                bool target_exists = false;
+                char out_copy[MAX_PATH];   // find_mount_and_trim_path mutates it
+                strcpy(out_copy, out);
+                struct mount *target_mount = find_mount_and_trim_path(out_copy);
+                if (target_mount != NULL) {
+                    struct statbuf target_stat;
+                    int target_err = target_mount->fs->stat(target_mount, out_copy, &target_stat);
+                    mount_release(target_mount);
+                    target_exists = target_err == 0;
+                }
+                if ((flags & N_CREATE_EEXIST_FIRST) && target_exists)
+                    return 0;           // caller's own check reports EEXIST
+                if ((flags & N_REMOVE_ENOENT_FIRST) && !target_exists)
+                    return _ENOENT;
+            }
+            // The target's existence does not rescue this caller: the
+            // permission error stands.
             return access_err;
+        }
     }
 
     return 0;

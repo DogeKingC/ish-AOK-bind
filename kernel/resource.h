@@ -34,6 +34,11 @@ struct rlimit32_ {
 #define RLIMIT_RTTIME_ 15
 #define RLIMIT_NLIMITS_ 16
 
+// Peak resident size of a task's address space, in KB. Updates the mm's
+// high-water mark as a side effect of sampling.
+struct task;
+size_t task_maxrss_kb(struct task *task);
+
 dword_t sys_getrlimit32(dword_t resource, addr_t rlim_addr);
 dword_t sys_getrlimit64(dword_t resource, addr_t rlim_addr);
 dword_t sys_getrlimit64_guest(dword_t resource, guest_addr_t rlim_addr);
@@ -88,6 +93,8 @@ struct tgroup;
 struct rusage_ rusage_get_current(void);
 struct rusage_ rusage_get_group(void);
 struct rusage_ rusage_get_group_of(struct tgroup *group);
+// One live thread's usage, for the per-thread CPU clocks (kernel/time.c).
+struct rusage_ rusage_get_task(struct task *task);
 void rusage_add(struct rusage_ *dst, struct rusage_ *src);
 int write_guest_rusage_abi(enum guest_abi abi, guest_addr_t addr, const struct rusage_ *rusage);
 #define RUSAGE_SELF_ 0

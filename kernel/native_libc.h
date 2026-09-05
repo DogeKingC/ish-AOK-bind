@@ -32,6 +32,7 @@
  * tools/check-native-libc.py fails the build on anything missed here.
  */
 
+#include <stdbool.h>
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -72,6 +73,12 @@
  * is why this never mattered here. */
 #include <sys/file.h>
 #include <sys/mount.h>
+/* Included for the same reason as sys/mount.h above: the redirect block below
+ * rewrites `statvfs`, and a system header that declares it must be seen BEFORE
+ * the macro exists -- once its include guard has fired, a later #include is a
+ * no-op and its declaration is never macro-expanded into a conflicting one.
+ * OpenSSH's sftp.c includes it late and found exactly that conflict. */
+#include <sys/statvfs.h>
 #if defined(__linux__)
 /* struct statfs is declared by <sys/mount.h> on Darwin and by <sys/vfs.h> on
  * glibc, where <sys/mount.h> gives only the mount(2) flags. Without this the
@@ -110,6 +117,7 @@ extern "C" {
 int nlibc_open(const char *path, int flags, ...);
 int nlibc_openat(int dirfd, const char *path, int flags, ...);
 int nlibc_close(int fd);
+int nlibc_close_raw(int fd);
 ssize_t nlibc_read(int fd, void *buf, size_t n);
 ssize_t nlibc_write(int fd, const void *buf, size_t n);
 off_t nlibc_lseek(int fd, off_t off, int whence);
@@ -124,6 +132,8 @@ int nlibc_unlinkat(int dirfd, const char *path, int flags);
 
 /* --- directories -------------------------------------------------------- */
 DIR *nlibc_opendir(const char *path);
+DIR *nlibc_fdopendir(int fd);
+int nlibc_readdir_r(DIR *handle, struct dirent *entry, struct dirent **result);
 struct dirent *nlibc_readdir(DIR *dir);
 int nlibc_closedir(DIR *dir);
 /* The descriptor behind a DIR. Ours, necessarily: nlibc_opendir hands back a
@@ -135,6 +145,21 @@ int nlibc_dirfd(DIR *dir);
 int nlibc_unlink(const char *path);
 int nlibc_rmdir(const char *path);
 int nlibc_mkdir(const char *path, mode_t mode);
+/* The *at forms. Rust's std and rustix prefer them -- they are the ones
+ * without a race between resolving a path and acting on it. */
+int nlibc_mkdirat(int dirfd, const char *path, mode_t mode);
+int nlibc_symlinkat(const char *target, int dirfd, const char *linkpath);
+ssize_t nlibc_readlinkat(int dirfd, const char *path, char *buf, size_t bufsize);
+int nlibc_fchmodat(int dirfd, const char *path, mode_t mode, int flags);
+int nlibc_fchownat(int dirfd, const char *path, uid_t uid, gid_t gid, int flags);
+int nlibc_lutimes(const char *path, const struct timeval times[2]);
+int nlibc_fstatfs(int fd, void *buf);
+int nlibc_statvfs(const char *path, struct statvfs *out);
+int nlibc_fstatvfs(int fd, struct statvfs *out);
+int nlibc_tcflow(int fd, int action);
+int nlibc_tcsendbreak(int fd, int duration);
+int nlibc_tcgetsid(int fd);
+int nlibc_ttyname_r(int fd, char *buf, size_t buflen);
 int nlibc_rename(const char *from, const char *to);
 int nlibc_symlink(const char *target, const char *linkpath);
 int nlibc_link(const char *from, const char *to);
@@ -214,6 +239,10 @@ int nlibc_setgroups(int size, const gid_t *list);
 int nlibc_initgroups(const char *user, gid_t group);
 struct passwd *nlibc_getpwuid(uid_t uid);
 struct passwd *nlibc_getpwnam(const char *name);
+int nlibc_getpwuid_r(uid_t uid, struct passwd *out, char *buf, size_t buflen,
+                     struct passwd **result);
+int nlibc_getpwnam_r(const char *name, struct passwd *out, char *buf,
+                     size_t buflen, struct passwd **result);
 struct group *nlibc_getgrgid(gid_t gid);
 struct group *nlibc_getgrnam(const char *name);
 int nlibc_getgrouplist(const char *name, int basegid, int *groups, int *ngroups);
@@ -235,6 +264,16 @@ int nlibc_sigpending(sigset_t *set);
 int nlibc_sigwait(const sigset_t *set, int *sig);
 /* Runs whatever handlers are pending. Called from native_checkpoint. */
 void nlibc_deliver_signals(void);
+// True while the calling thread is inside a host-stdio funopen callback with
+// a FILE lock held, meaning native_checkpoint must defer fatal delivery and
+// handler delivery rather than risk abandoning the lock. Carries its own
+// give-up limit; see the callbacks in native_libc.c.
+bool nlibc_stdio_defer_fatal(void);
+// The same question asked without answering it -- no give-up counter bumped,
+// no state changed. For deciding whether a RESTART is worth issuing: a restart
+// re-runs the syscall on the assumption the handler ran first, and inside
+// stdio it did not.
+bool nlibc_delivery_deferred(void);
 /* The same, reporting how many handlers ran -- see nlibc_sigsuspend. */
 int nlibc_deliver_signals_count(void);
 
@@ -294,6 +333,14 @@ int nlibc_pipe(int fds[2]);
 int nlibc_fcntl(int fd, int cmd, ...);
 int nlibc_ioctl(int fd, unsigned long request, ...);
 int nlibc_poll(void *fds, unsigned nfds, int timeout);
+/* Deliberately NOT redirected from `ppoll`, and not ppoll's signature: POSIX
+ * ppoll takes a sigmask this has no use for, and OpenSSH's openbsd-compat
+ * ships its own ppoll -- Darwin has none -- which a redirect would rename into
+ * a second definition of this. Nothing on an Apple target calls ppoll by name
+ * for the same reason, so there is no host to escape to; the gate would say so
+ * if that changed. kernel/native_kqueue.c calls it by name. */
+struct timespec;
+int nlibc_ppoll(void *fds, unsigned nfds, const struct timespec *timeout);
 int nlibc_select(int nfds, void *r, void *w, void *e, void *timeout);
 int nlibc_fork(void);
 int nlibc_execl(const char *path, const char *arg0, ...);
@@ -373,6 +420,8 @@ int nlibc_shutdown(int fd, int how);
 ssize_t nlibc_sendmsg(int fd, const struct msghdr *msg, int flags);
 ssize_t nlibc_recvmsg(int fd, struct msghdr *msg, int flags);
 int nlibc_setsockopt(int fd, int level, int option, const void *value, socklen_t len);
+int nlibc_sendfile(int in_fd, int out_fd, off_t offset, off_t *len,
+                   void *hdtr, int flags);
 int nlibc_getsockopt(int fd, int level, int option, void *value, socklen_t *len);
 /* The peer's credentials on a guest AF_UNIX socket, over the guest's
  * SO_PEERCRED (fs/sock.c). The host's getpeereid answers about a host
@@ -670,6 +719,22 @@ int nlibc_msync(void *addr, size_t len, int flags);
  * guest answer available to give, so this reports failure -- see the .c for why
  * that is the right answer rather than a gap, and what a caller falls back to. */
 int nlibc_NSGetExecutablePath(char *buf, uint32_t *bufsize);
+/* Darwin has no linkable `environ`/`argv` symbols: <crt_externs.h> hands out
+ * these accessors, and a runtime built for Apple calls them instead. Same
+ * per-task storage as nlibc_environ. */
+char ***nlibc_NSGetEnviron(void);
+char ***nlibc_NSGetArgv(void);
+int *nlibc_NSGetArgc(void);
+int nlibc_mkfifo(const char *path, mode_t mode);
+int nlibc_linkat(int oldfd, const char *from, int newfd, const char *to, int flags);
+/* Darwin's copy fast paths, which std::fs::copy uses in place of read/write. */
+int nlibc_fclonefileat(int srcfd, int dstdirfd, const char *dst, int flags);
+int nlibc_fcopyfile(int from_fd, int to_fd, void *state, uint32_t flags);
+void *nlibc_copyfile_state_alloc(void);
+int nlibc_copyfile_state_free(void *state);
+int nlibc_copyfile_state_get(void *state, uint32_t flag, void *dst);
+int nlibc_setattrlist(const char *path, void *attrs, void *buf, size_t size, unsigned long options);
+int nlibc_fsetattrlist(int fd_no, void *attrs, void *buf, size_t size, unsigned long options);
 
 void *nlibc_dlopen(const char *path, int mode);
 void *nlibc_dlsym(void *handle, const char *symbol);
@@ -709,6 +774,8 @@ const char *nlibc_dlerror(void);
 #define fstatat     nlibc_fstatat
 #define unlinkat    nlibc_unlinkat
 
+#define fdopendir   nlibc_fdopendir
+#define readdir_r   nlibc_readdir_r
 #define opendir     nlibc_opendir
 #define readdir     nlibc_readdir
 #define closedir    nlibc_closedir
@@ -717,6 +784,20 @@ const char *nlibc_dlerror(void);
 #define unlink      nlibc_unlink
 #define rmdir       nlibc_rmdir
 #define mkdir       nlibc_mkdir
+#define mkdirat     nlibc_mkdirat
+#define symlinkat   nlibc_symlinkat
+#define readlinkat  nlibc_readlinkat
+#define fchmodat    nlibc_fchmodat
+#define fchownat    nlibc_fchownat
+#define lutimes     nlibc_lutimes
+#define fstatfs     nlibc_fstatfs
+/* Function-like for the same reason statfs is: `statvfs` is a struct tag too. */
+#define statvfs(a, b)  nlibc_statvfs((a), (b))
+#define fstatvfs(a, b) nlibc_fstatvfs((a), (b))
+#define tcflow      nlibc_tcflow
+#define tcsendbreak nlibc_tcsendbreak
+#define tcgetsid    nlibc_tcgetsid
+#define ttyname_r   nlibc_ttyname_r
 #define rename      nlibc_rename
 #define symlink     nlibc_symlink
 #define link        nlibc_link
@@ -769,6 +850,11 @@ const char *nlibc_dlerror(void);
 #define fcntl       nlibc_fcntl
 #define ioctl       nlibc_ioctl
 #define poll        nlibc_poll
+/* kqueue and kevent, for a runtime built for Apple. See kernel/native_kqueue.h.
+ * kevent is function-like on purpose: `kevent` is a STRUCT tag as well as a
+ * function, and an object-like macro would rewrite `struct kevent` too. */
+#define kqueue      nlibc_kqueue
+#define kevent(a, b, c, d, e, f) nlibc_kevent((a), (b), (c), (d), (e), (f))
 #define select      nlibc_select
 #define fork        nlibc_fork
 #define execl       nlibc_execl
@@ -844,6 +930,7 @@ char *nlibc_strchrnul(const char *s, int c);
  * sharing one environment. */
 #define socket                   nlibc_socket
 #define socketpair               nlibc_socketpair
+#define sendfile                 nlibc_sendfile
 #define bind                     nlibc_bind
 #define connect                  nlibc_connect
 #define listen                   nlibc_listen
@@ -921,6 +1008,8 @@ char *nlibc_strchrnul(const char *s, int c);
 #define putenv                   nlibc_putenv
 #define getpwuid                 nlibc_getpwuid
 #define getpwnam                 nlibc_getpwnam
+#define getpwuid_r               nlibc_getpwuid_r
+#define getpwnam_r               nlibc_getpwnam_r
 #define getgrgid                 nlibc_getgrgid
 #define getgrnam                 nlibc_getgrnam
 #define getgrouplist             nlibc_getgrouplist
@@ -1036,6 +1125,18 @@ char *nlibc_strchrnul(const char *s, int c);
 #define munmap                   nlibc_munmap
 #define msync                    nlibc_msync
 #define _NSGetExecutablePath     nlibc_NSGetExecutablePath
+#define _NSGetEnviron            nlibc_NSGetEnviron
+#define _NSGetArgv               nlibc_NSGetArgv
+#define _NSGetArgc               nlibc_NSGetArgc
+#define mkfifo                   nlibc_mkfifo
+#define linkat                   nlibc_linkat
+#define fclonefileat             nlibc_fclonefileat
+#define fcopyfile                nlibc_fcopyfile
+#define copyfile_state_alloc     nlibc_copyfile_state_alloc
+#define copyfile_state_free      nlibc_copyfile_state_free
+#define copyfile_state_get       nlibc_copyfile_state_get
+#define setattrlist              nlibc_setattrlist
+#define fsetattrlist             nlibc_fsetattrlist
 
 /* Option parsing. The five variables become accessor calls the way `environ`
  * does, and the scanning functions become ours -- routing only the

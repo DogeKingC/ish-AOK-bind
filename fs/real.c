@@ -18,6 +18,7 @@
 #include "kernel/errno.h"
 #include "kernel/calls.h"
 #include "kernel/fs.h"
+#include "kernel/native.h"
 #include "fs/dev.h"
 #include "fs/real.h"
 #include "fs/mmap_cache.h"
@@ -40,11 +41,33 @@ static inline void realfs_count_write(ssize_t res) {
     }
 }
 
+// Is there a signal that entitles a blocking read/write here to give up?
+//
+// task_wake_blocked() rather than ->blocked, because a native program's
+// handled signals are BLOCKED in the kernel and run at a syscall checkpoint
+// instead -- a wait has to end for them or the handler never gets its turn.
+//
+// The exception is a checkpoint that is not going to happen. Inside a host
+// stdio callback, delivery is deliberately deferred (native_delivery_deferred)
+// so a handler cannot longjmp out of stdio's frames with its FILE lock held.
+// A signal the program asked to be RESTARTED through -- SA_RESTART, recorded
+// in native_restart -- must not cut the transfer short there: the handler will
+// not run, so the interruption buys nothing, and the caller sees an EINTR that
+// Linux would never have shown it. Waiting is what SA_RESTART asked for, and
+// the handler runs at the first checkpoint after stdio unwinds.
+//
+// Everything else still interrupts, which is the half that matters for safety:
+// a fatal signal is never shim-held, so a native program blocked writing to a
+// full pipe still fails its callback, unwinds stdio and dies -- the behaviour
+// the deferral was built around.
 static bool realfs_guest_signal_pending(void) {
     lock(&current->sighand->lock, 0);
-    bool signal_pending = !!((current->pending | current->sighand->pending) & ~task_wake_blocked(current));
+    sigset_t_ pending = (current->pending | current->sighand->pending) &
+            ~task_wake_blocked(current);
+    if (native_delivery_deferred())
+        pending &= ~__atomic_load_n(&current->native_restart, __ATOMIC_ACQUIRE);
     unlock(&current->sighand->lock);
-    return signal_pending;
+    return !!pending;
 }
 
 // Diagnostic for realfs_wait_readable/writable's EINTR paths, added while
@@ -74,10 +97,12 @@ static void realfs_log_signal_eintr(const char *where) {
     sigset_t_ group_pending = current->sighand->pending;
     sigset_t_ blocked = current->blocked;
     unlock(&current->sighand->lock);
-    dprintf(2, "[signal-eintr] %s comm=%s pid=%d unblocked_pending=%#llx task_pending=%#llx group_pending=%#llx blocked=%#llx\n",
+    dprintf(2, "[signal-eintr] %s comm=%s pid=%d unblocked_pending=%#llx task_pending=%#llx group_pending=%#llx blocked=%#llx native_held=%#llx native_restart=%#llx\n",
             where, current->comm, current->pid,
             (unsigned long long) pending, (unsigned long long) task_pending,
-            (unsigned long long) group_pending, (unsigned long long) blocked);
+            (unsigned long long) group_pending, (unsigned long long) blocked,
+            (unsigned long long) current->native_held,
+            (unsigned long long) current->native_restart);
 }
 
 static bool realfs_trace_comm(void) {
@@ -398,6 +423,7 @@ static int realfs_wait_writable(int real_fd) {
             // one must not interrupt the write either.
             if (!realfs_guest_signal_pending())
                 continue;
+            realfs_log_signal_eintr("write/sigunwind");
             errno = EINTR;
             return errno_map();
         }
@@ -405,6 +431,7 @@ static int realfs_wait_writable(int real_fd) {
         if (realfs_guest_signal_pending()) {
             sigunwind_end();
             pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
+            realfs_log_signal_eintr("write/presleep");
             errno = EINTR;
             return errno_map();
         }
@@ -416,6 +443,7 @@ static int realfs_wait_writable(int real_fd) {
             return res;
         if (res == 0) {
             if (realfs_guest_signal_pending()) {
+                realfs_log_signal_eintr("write/timeout");
                 errno = EINTR;
                 return errno_map();
             }
@@ -584,12 +612,18 @@ ssize_t realfs_read(struct fd *fd, void *buf, size_t bufsize) {
     // pipeherd hang (every stuck thread's backtrace stopped right here).
     (void) fcntl(fd->real_fd, F_SETFL, fcntl(fd->real_fd, F_GETFL, 0) | O_NONBLOCK);
 
+    // ATTEMPT FIRST, wait second. The loop used to call realfs_wait_readable()
+    // before ever touching the fd, and that wait reports EINTR the moment a
+    // guest signal is pending -- so a read that had data sitting there and
+    // would not have blocked for a microsecond came back EINTR anyway. Linux
+    // never does that: a signal is only allowed to cut short an operation that
+    // actually blocks, and one which can be satisfied immediately is satisfied.
+    // The fd is already non-blocking (just above), so the attempt is free to
+    // make and tells us which case we are in; only EAGAIN means "would block",
+    // and only then does the signal question arise at all. See the matching
+    // comment in realfs_write().
     for (;;) {
         realfs_trace_io_enter("read", fd, read_size);
-        int wait_res = realfs_wait_readable(fd->real_fd);
-        if (wait_res < 0)
-            return wait_res;
-
         ssize_t res = read(fd->real_fd, buf, read_size);
         if (res >= 0) {
             if (res > 0 && is_adhoc_fd(fd) && S_ISFIFO(fd->stat.mode))
@@ -598,11 +632,14 @@ ssize_t realfs_read(struct fd *fd, void *buf, size_t bufsize) {
             realfs_count_read(res);
             return res;
         }
-        if ((errno == EAGAIN || errno == EWOULDBLOCK) ||
-                (errno == EINTR && !realfs_guest_signal_pending())) {
+        if (errno == EINTR && !realfs_guest_signal_pending())
             continue;
-        }
-        return errno_map();
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            return errno_map();
+
+        int wait_res = realfs_wait_readable(fd->real_fd);
+        if (wait_res < 0)
+            return wait_res;
     }
 }
 
@@ -626,11 +663,28 @@ ssize_t realfs_write(struct fd *fd, const void *buf, size_t bufsize) {
     // sibling tasks sharing this same open file description (fork()).
     (void) fcntl(fd->real_fd, F_SETFL, fcntl(fd->real_fd, F_GETFL, 0) | O_NONBLOCK);
 
+    // ATTEMPT FIRST, wait second -- the fix for a native shell intermittently
+    // reporting "echo: write error: Interrupted system call" (build 554).
+    //
+    // This loop used to ask realfs_wait_writable() before ever attempting the
+    // write, and that wait answers EINTR as soon as a guest signal is pending.
+    // So three bytes going into an empty 64 KiB pipe -- a write that cannot
+    // block -- were failed outright because a SIGCHLD happened to be queued.
+    // Linux only lets a signal cut short an operation that genuinely blocks
+    // and has transferred nothing; anything it can complete, it completes.
+    //
+    // The window is not a narrow race. A native program's handled signals are
+    // held blocked by the shim and run at a syscall checkpoint instead, and
+    // that checkpoint is deliberately SKIPPED while the program is inside a
+    // host stdio callback (nlibc_stdio_defer_fatal, kernel/native_libc.c) --
+    // so bash's echo, which flushes and then checks ferror, spans the whole
+    // deferral with the signal still sitting pending. Reproduced on demand
+    // with `bash -c 'trap : USR1; kill -USR1 $$; echo x' | cat`.
+    //
+    // The fd is already non-blocking, so attempting first costs nothing and
+    // answers the only question that matters: EAGAIN means it would have
+    // blocked, and only then is a pending signal entitled to interrupt.
     for (;;) {
-        int wait_res = realfs_wait_writable(fd->real_fd);
-        if (wait_res < 0)
-            return wait_res;
-
         ssize_t res = realfs_write_host(fd->real_fd, buf, bufsize);
         if (res >= 0) {
             if (res > 0)
@@ -639,11 +693,14 @@ ssize_t realfs_write(struct fd *fd, const void *buf, size_t bufsize) {
             realfs_count_write(res);
             return res;
         }
-        if ((errno == EAGAIN || errno == EWOULDBLOCK) ||
-                (errno == EINTR && !realfs_guest_signal_pending())) {
+        if (errno == EINTR && !realfs_guest_signal_pending())
             continue;
-        }
-        return errno_map();
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            return errno_map();
+
+        int wait_res = realfs_wait_writable(fd->real_fd);
+        if (wait_res < 0)
+            return wait_res;
     }
 }
 
@@ -733,11 +790,47 @@ void realfs_seekdir(struct fd *fd, unsigned long ptr) {
 }
 
 off_t realfs_lseek(struct fd *fd, off_t offset, int whence) {
-    if (fd->dir != NULL && whence == LSEEK_SET) {
-        realfs_seekdir(fd, offset);
-        return offset;
+    // A directory's position is a COOKIE, not a byte offset: it is whatever
+    // the last getdents d_off said, and the only thing it is good for is
+    // being handed back. SEEK_SET already did that; SEEK_CUR fell through to
+    // the host lseek on the underlying descriptor, which knows nothing about
+    // the DIR stream and answered with a byte offset (INT32_MAX in practice).
+    //
+    // A caller that saves its place with lseek(dirfd, 0, SEEK_CUR) and
+    // restores it later -- which is how a directory walk is resumed, and what
+    // seekdir(3) is built on -- got a number that meant nothing, and restoring
+    // it moved the stream somewhere unrelated.
+    if (fd->dir != NULL) {
+        if (whence == LSEEK_SET) {
+            realfs_seekdir(fd, offset);
+            return offset;
+        }
+        if (whence == LSEEK_CUR) {
+            off_t cur = (off_t) realfs_telldir(fd);
+            if (offset == 0)
+                return cur;
+            // A nonzero SEEK_CUR is only meaningful against a cookie the
+            // caller already has; arithmetic on one is not, so it is refused
+            // rather than silently landing somewhere.
+            return _EINVAL;
+        }
     }
 
+    if (whence == LSEEK_DATA || whence == LSEEK_HOLE) {
+        // Darwin has no SEEK_DATA/SEEK_HOLE, so answer as a filesystem with
+        // no holes does: past EOF is ENXIO for both, DATA is the offset
+        // itself, and the only HOLE is the one at EOF. Conservative and
+        // truthful -- a caller told "no holes here" copies every byte, which
+        // is correct; one told EINVAL cannot use the interface at all.
+        struct stat st;
+        if (fstat(fd->real_fd, &st) < 0)
+            return errno_map();
+        if (offset < 0)
+            return _EINVAL;
+        if (offset >= st.st_size)
+            return _ENXIO;
+        return whence == LSEEK_DATA ? offset : st.st_size;
+    }
     if (whence == LSEEK_SET)
         whence = SEEK_SET;
     else if (whence == LSEEK_CUR)
@@ -753,6 +846,20 @@ off_t realfs_lseek(struct fd *fd, off_t offset, int whence) {
 }
 
 int realfs_poll(struct fd *fd) {
+    // Linux has no ->poll operation for a regular file or a directory, so both
+    // are polled through DEFAULT_POLLMASK: always readable and always
+    // writable, never POLLPRI, whatever the open access mode (measured on
+    // Linux 6.12 -- an O_RDONLY file still reports POLLOUT and an O_WRONLY one
+    // still reports POLLIN). Asking the host gets a different answer to a
+    // different question: Darwin reports a spurious POLLPRI on a regular file,
+    // and poll(2) only ever returns bits that were requested, so the
+    // access-mode gating below turned an O_RDONLY file into "readable but not
+    // writable" and an O_WRONLY one into "writable but not readable". Answer
+    // these ourselves. (Host poll bits, like every other return below --
+    // POLLIN/POLLOUT and POLL_READ/POLL_WRITE are the same values.)
+    if (S_ISREG(fd->stat.mode) || S_ISDIR(fd->stat.mode))
+        return POLLIN | POLLOUT;
+
     struct pollfd p = {.fd = fd->real_fd, .events = 0};
 #if defined(__APPLE__)
     // Anonymous pipes (adhoc fds) and named FIFOs (realfs-backed, e.g. a GNU
@@ -805,12 +912,34 @@ int realfs_poll(struct fd *fd) {
         // separately and ignore a POLLNVAL.
         // This is no longer atomic but I don't really know what to do about that.
         int events = 0;
+        bool nval[3] = {false, false, false};
         static const int pollbits[] = {POLLIN, POLLOUT, POLLPRI};
         for (unsigned i = 0; i < sizeof(pollbits)/sizeof(pollbits[0]); i++) {
             p.events = pollbits[i];
-            if (poll(&p, 1, 0) > 0 && !(p.revents & POLLNVAL))
-                events |= p.revents;
+            if (poll(&p, 1, 0) > 0) {
+                if (p.revents & POLLNVAL)
+                    nval[i] = true;
+                else
+                    events |= p.revents;
+            }
         }
+        // Darwin has no poll implementation at all for some host objects --
+        // character devices other than ttys, so /dev/null, /dev/zero and
+        // /dev/random -- and every single-bit probe above comes back POLLNVAL
+        // rather than a readiness answer. Linux polls those through
+        // DEFAULT_POLLMASK, the same always-ready answer the regular-file case
+        // above takes (measured on Linux 6.12: /dev/null, /dev/zero and
+        // /dev/full are all POLLIN|POLLOUT). Reporting "not ready" here made a
+        // guest poll on such an fd block until its timeout, and, together with
+        // the registration error real_poll_check_receipts used to pass on,
+        // made musl's AT_SECURE startup -- which polls fds 0, 1 and 2 --
+        // a_crash() in any setuid binary whose stdio was a host device node.
+        //
+        // Only when *both* the read and write probes were refused: an object
+        // Darwin can poll answers "not ready" (0), not POLLNVAL, and must keep
+        // that answer.
+        if (nval[0] && nval[1])
+            events |= POLLIN | POLLOUT;
         assert(!(events & POLLNVAL));
         return events;
     }
@@ -878,6 +1007,21 @@ int host_fd_mmap(int host_fd, struct mem *mem, page_t start, pages_t pages, off_
     if (memory == MAP_FAILED && try_prot != mmap_prot)
         memory = mmap(NULL, map_len, mmap_prot, mmap_flags, host_fd, real_offset);
     int err = pt_map(mem, start, pages, memory, correction, prot);
+    if (err < 0) {
+        // pt_map takes ownership of `memory` only when it succeeds, and every
+        // one of its error returns happens before it publishes a single entry
+        // (emu/memory.h), so nothing anywhere is pointing at this mapping.
+        // Releasing it here is what keeps a failed mmap from leaking the host
+        // range for the life of the process -- the old code returned straight
+        // out and the range was never reachable again to be unmapped.
+        //
+        // The length is map_len, NOT pages * PAGE_SIZE: the host mapping
+        // starts at the page-aligned real_offset and carries `correction`
+        // bytes of slack in front of the guest's first page.
+        if (memory != MAP_FAILED)
+            munmap(memory, map_len);
+        return err;
+    }
     // Never-writable file-backed mappings can't be COW-broken or otherwise
     // mutated by the guest (write faults check P_WRITE before touching
     // anything), so it's always safe to register them: the underlying host

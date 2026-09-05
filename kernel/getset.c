@@ -6,8 +6,6 @@
 #define _LINUX_CAPABILITY_VERSION_1_ 0x19980330
 #define _LINUX_CAPABILITY_VERSION_2_ 0x20071026
 #define _LINUX_CAPABILITY_VERSION_3_ 0x20080522
-#define CAP_SETGID_ 6
-#define CAP_SETUID_ 7
 
 struct cap_user_header_ {
     dword_t version;
@@ -44,6 +42,31 @@ static bool current_has_cap(uint_t cap) {
     if (current == NULL || cap >= 64)
         return false;
     return (current->cap_effective[cap / 32] & (1u << (cap % 32))) != 0;
+}
+
+// Shared with the privileged syscalls elsewhere in the tree; see task.h.
+bool current_capable(unsigned cap) {
+    return superuser() || current_has_cap(cap);
+}
+
+bool current_may_access_task_mem(struct task *target) {
+    if (current == NULL || target == NULL)
+        return false;
+    if (target == current)
+        return true;
+    if (current_capable(CAP_SYS_PTRACE_))
+        return true;
+    // Linux requires the caller's euid to equal ALL THREE of the target's
+    // uids, and the same for gids. Comparing only the effective ids would let
+    // a process that has temporarily dropped privilege be read by one that
+    // never held any -- it could regain that privilege later, so its memory is
+    // still privileged memory.
+    return current->euid == target->uid &&
+           current->euid == target->euid &&
+           current->euid == target->suid &&
+           current->egid == target->gid &&
+           current->egid == target->egid &&
+           current->egid == target->sgid;
 }
 
 static bool current_can_setuids(void) {
@@ -215,7 +238,23 @@ int_t sys_getresuid_guest(guest_addr_t ruid_addr, guest_addr_t euid_addr, guest_
 }
 
 int_t sys_setreuid(uid_t_ ruid, uid_t_ euid) {
-    return sys_setresuid(ruid, euid, -1);
+    // setreuid(2): "If the real user ID is set, or the effective user ID is
+    // set to a value not equal to the previous real user ID, the saved
+    // set-user-ID will be set to the new effective user ID."
+    //
+    // Passing -1 left the saved id at its OLD value, so a process that dropped
+    // privilege with setreuid(1000, 1000) kept suid 0 and could call setuid(0)
+    // to become root again. Making the drop permanent is the entire reason to
+    // call setreuid, so this was worth more than its severity suggests.
+    //
+    // The computed saved value is always the NEW euid, which sys_setresuid's
+    // own euid check has already validated, so passing it explicitly cannot
+    // turn a permitted call into EPERM.
+    uid_t_ new_euid = (euid == (uid_t_) -1) ? current->euid : euid;
+    uid_t_ suid = (uid_t_) -1;
+    if (ruid != (uid_t_) -1 || new_euid != current->uid)
+        suid = new_euid;
+    return sys_setresuid(ruid, euid, suid);
 }
 
 uid_t_ sys_setfsuid(uid_t_ uid) {
@@ -307,7 +346,12 @@ int_t sys_getresgid_guest(guest_addr_t rgid_addr, guest_addr_t egid_addr, guest_
 }
 
 int_t sys_setregid(uid_t_ rgid, uid_t_ egid) {
-    return sys_setresgid(rgid, egid, -1);
+    // The gid half of the same rule; see sys_setreuid.
+    uid_t_ new_egid = (egid == (uid_t_) -1) ? current->egid : egid;
+    uid_t_ sgid = (uid_t_) -1;
+    if (rgid != (uid_t_) -1 || new_egid != current->gid)
+        sgid = new_egid;
+    return sys_setresgid(rgid, egid, sgid);
 }
 
 uid_t_ sys_setfsgid(uid_t_ gid) {
@@ -347,10 +391,22 @@ int_t sys_setgroups_guest(dword_t size, guest_addr_t list) {
         return _EPERM;
     if (size > MAX_GROUPS)
         return _EINVAL;
-    if (user_read(list, current->groups, size * sizeof(uid_t_)))
-        return _EFAULT;
+    // Built to the side and swapped in, so a faulting list leaves the current
+    // group set intact rather than half-overwritten.
+    uid_t_ *groups = NULL;
+    if (size != 0) {
+        groups = malloc((size_t) size * sizeof(uid_t_));
+        if (groups == NULL)
+            return _ENOMEM;
+        if (user_read(list, groups, (size_t) size * sizeof(uid_t_))) {
+            free(groups);
+            return _EFAULT;
+        }
+    }
     for (unsigned i = 0; i < size; i++)
-        STRACE(" %d", current->groups[i]);
+        STRACE(" %d", groups[i]);
+    free(current->groups);
+    current->groups = groups;
     current->ngroups = size;
     return 0;
 }
@@ -461,15 +517,26 @@ int_t sys_capset_guest(guest_addr_t header_addr, guest_addr_t data_addr) {
 }
 
 // minimal version according to Linux sys/personality.h
+// personality() sets the execution domain and returns the PREVIOUS value.
+// Linux accepts whatever it is given -- the low byte is the domain, the upper
+// bits are flags -- and 0xffffffff is the conventional "just tell me" query
+// because it sets nothing anybody uses.
+//
+// This used to refuse everything except ADDR_NO_RANDOMIZE with EINVAL,
+// including personality(0), which is the single most common call: it is what
+// `setarch --uname-2.6`, ancient-binary wrappers and every "restore the
+// default domain" path do. They all failed.
 int_t sys_personality(dword_t persona) {
     STRACE("personality(%#x)", persona);
-    // Get the personality
+    dword_t previous = current->group->personality;
     if (persona == 0xffffffff)
-        return current->group->personality;
+        return previous;
 
-    // ADDR_NO_RANDOMIZE is the only thing we support, and you can't turn it off
-    if (persona != ADDR_NO_RANDOMIZE_)
-        return _EINVAL;
-
-    return current->group->personality;
+    // ADDR_NO_RANDOMIZE stays set whatever the caller asks for. AOK does not
+    // randomize the address space at all, so reporting the bit clear would
+    // claim a randomization that does not happen -- and a program that checks
+    // it before deciding whether to re-exec itself under setarch would then
+    // loop. Everything else is stored as given and reported back.
+    current->group->personality = persona | ADDR_NO_RANDOMIZE_;
+    return previous;
 }

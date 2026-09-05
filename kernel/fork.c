@@ -26,6 +26,11 @@
 #define CLONE_DETACHED_ 0x00400000
 #define CLONE_UNTRACED_ 0x00800000
 #define CLONE_CHILD_SETTID_ 0x01000000
+// Time namespaces. Note the value: 0x80 lies INSIDE CSIGNAL, so plain
+// clone(2) cannot express this flag at all -- its low byte is the exit
+// signal. Only unshare(2) and clone3(2) can ask for one, which is why this
+// appears in sys_unshare's flag sets and not in the clone path's.
+#define CLONE_NEWTIME_ 0x00000080
 #define CLONE_NEWCGROUP_ 0x02000000
 #define CLONE_NEWUTS_ 0x04000000
 #define CLONE_NEWIPC_ 0x08000000
@@ -82,6 +87,40 @@ static struct tgroup *tgroup_copy(struct tgroup *old_group) {
     group->doing_group_exit = false;
     group->continued = false;
     group->children_rusage = (struct rusage_) {};
+    // Everything below is per-PROCESS state that Linux does not hand to a
+    // child: copy_signal() builds the new signal_struct from zeroed memory and
+    // copies only the few fields it names. The shallow copy above handed the
+    // child all of it, and each one is wrong in its own way.
+    //
+    // group->rusage is the rolled-up usage of threads that have ALREADY
+    // exited (kernel/exit.c), which rusage_get_group_of tops up with the live
+    // threads. Inherited, a process that had joined threads before forking
+    // gave its child a getrusage(RUSAGE_SELF) and CLOCK_PROCESS_CPUTIME_ID
+    // baseline that was the parent's -- and do_wait then reported those same
+    // inflated numbers back to the parent, both as the child's rusage and
+    // into the parent's own children_rusage (RUSAGE_CHILDREN).
+    group->rusage = (struct rusage_) {};
+    // Same shape one level down: io_dead is the exited threads' I/O totals,
+    // so an inherited copy made the child's /proc/<pid>/io open at the
+    // parent's numbers.
+    memset(&group->io_dead, 0, sizeof(group->io_dead));
+    // Group-stop state is per-process too, and stopped/group_exit_code are
+    // exactly the pair notify_if_stopped() reads. A clone racing another
+    // thread's SIGSTOP delivery copied both, so wait(WUNTRACED) reported a
+    // stop for a child that had never stopped -- and the child came up in
+    // state T, in a group nothing had stopped.
+    group->stopped = false;
+    group->group_exit_code = 0;
+    // PR_SET_CHILD_SUBREAPER is per-process and is NOT inherited by fork or
+    // clone (prctl(2): "The setting of the 'child subreaper' attribute is not
+    // inherited by children created by fork(2) and clone(2)"). Linux's
+    // copy_signal propagates only the has_child_subreaper *hint*, never
+    // is_child_subreaper itself. Inherited, every descendant of a subreaper
+    // was a subreaper, so find_new_parent() stopped its walk at the nearest
+    // ancestor instead of at the process that actually asked to be the
+    // reaper: a service manager saw the orphans of its immediate children
+    // only, and everything deeper was collected one level down.
+    group->child_subreaper = false;
     cond_init(&group->child_exit);
     cond_init(&group->stopped_cond);
     lock_init(&group->lock, "tgroup_copy\0");
@@ -402,8 +441,17 @@ static void vfork_info_release(struct vfork_info *vfork) {
     }
 }
 
-static dword_t sys_clone_common(dword_t flags, guest_addr_t stack, guest_addr_t ptid,
+static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t ptid,
+        guest_addr_t tls, guest_addr_t ctid, bool clear_sighand);
+
+// plain clone(2) has no way to ask for it
+static dword_t sys_clone_common_wrap(dword_t flags, guest_addr_t stack, guest_addr_t ptid,
         guest_addr_t tls, guest_addr_t ctid) {
+    return sys_clone_common_(flags, stack, ptid, tls, ctid, false);
+}
+
+static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t ptid,
+        guest_addr_t tls, guest_addr_t ctid, bool clear_sighand) {
     STRACE("clone(0x%x, 0x%x, 0x%x, 0x%x, 0x%x)", flags, stack, ptid, tls, ctid);
     if (flags & CLONE_NEW_FLAGS_)
         return _EPERM;
@@ -440,6 +488,21 @@ static dword_t sys_clone_common(dword_t flags, guest_addr_t stack, guest_addr_t 
         return _EINVAL;
     if (flags & CLONE_PIDFD_ && flags & CLONE_THREAD_)
         return _EINVAL;
+
+    // RLIMIT_NPROC caps how many processes ONE USER may have, so a runaway
+    // fork loop cannot take the whole system down with it. It was stored and
+    // reported and never consulted, so `ulimit -u` was decorative. Threads do
+    // not count against it -- Linux charges the limit in copy_process, which
+    // CLONE_THREAD reaches too, but the count it compares against is of
+    // processes; keeping threads out of both sides is the same answer with
+    // less bookkeeping. root is exempt, as there.
+    if (!(flags & CLONE_THREAD_)) {
+        rlim_t_ nproc = rlimit(RLIMIT_NPROC_);
+        if (nproc != RLIM_INFINITY_ && !current_capable(CAP_SYS_RESOURCE_) &&
+                !current_capable(CAP_SYS_ADMIN_) &&
+                task_count_for_uid(current->uid) >= nproc)
+            return _EAGAIN;
+    }
 
     struct task *task = task_create_(current);
     if (task == NULL)
@@ -534,6 +597,27 @@ static dword_t sys_clone_common(dword_t flags, guest_addr_t stack, guest_addr_t 
             ptrace_attach_fork_child(task, current);
             trace_child = true;
         }
+    }
+
+    // CLONE_CLEAR_SIGHAND: the child's dispositions start at SIG_DFL rather
+    // than as a copy of the parent's. Done here, before the task runs, so no
+    // signal can be delivered against an inherited handler.
+    //
+    // SIG_IGN survives. Linux's flush_signal_handlers is called with
+    // force_default 0, which resets a handler only when it is not SIG_IGN --
+    // "ignored" is an inherited property a child is meant to keep, and the
+    // measurement agrees. Flags, mask and restorer are cleared either way.
+    if (clear_sighand && task->sighand != NULL) {
+        lock(&task->sighand->lock, 0);
+        for (int sig = 0; sig < NUM_SIGS; sig++) {
+            struct sigaction_ *ka = &task->sighand->action[sig];
+            if (ka->handler != SIG_IGN_)
+                ka->handler = SIG_DFL_;
+            ka->flags = 0;
+            ka->restorer = 0;
+            ka->mask = 0;
+        }
+        unlock(&task->sighand->lock);
     }
 
     if (task_start(task) < 0) {
@@ -654,14 +738,14 @@ struct task *task_fork_for_exec(void) {
 }
 
 dword_t sys_clone(dword_t flags, addr_t stack, addr_t ptid, addr_t tls, addr_t ctid) {
-    return sys_clone_common(flags, stack, ptid, tls, ctid);
+    return sys_clone_common_wrap(flags, stack, ptid, tls, ctid);
 }
 
 dword_t sys_clone_guest(qword_t flags, guest_addr_t stack, guest_addr_t ptid,
         guest_addr_t tls, guest_addr_t ctid) {
     if ((flags >> 32) != 0)
         return _ENOSYS;
-    return sys_clone_common((dword_t) flags, stack, ptid, tls, ctid);
+    return sys_clone_common_wrap((dword_t) flags, stack, ptid, tls, ctid);
 }
 
 struct clone_args_ {
@@ -688,14 +772,25 @@ dword_t sys_clone3_guest(guest_addr_t uargs_addr, dword_t size) {
         return _EFAULT;
 
     // CLONE_CLEAR_SIGHAND (bit 32, Linux 5.5+) asks the kernel to reset the
-    // child's signal handlers to SIG_DFL as part of the clone, instead of
-    // glibc iterating and resetting each one itself after the fact. We
-    // already give every new task a fresh (non-shared, unless CLONE_SIGHAND)
-    // sighand via copy_task, so honoring this is a no-op: nothing forces the
-    // handlers to non-default that this would need to undo. glibc's
-    // posix_spawn sets it unconditionally on every clone3 call (used by
-    // systemd's posix_spawn_wrapper for every service start), so rejecting
-    // it as ENOSYS made every service spawn via clone3 fail outright.
+    // child's signal handlers to SIG_DFL as part of the clone, instead of the
+    // caller iterating and resetting each one itself afterwards. glibc's
+    // posix_spawn sets it unconditionally (used by systemd's
+    // posix_spawn_wrapper for every service start) and relies on it
+    // ENTIRELY -- the spawned child issues no rt_sigaction of its own.
+    //
+    // This was accepted and treated as a no-op, on the reasoning that a new
+    // task gets a fresh sighand anyway. It does, but a fresh sighand is a
+    // COPY of the parent's dispositions, which is the very thing this flag
+    // exists to undo: a child spawned from a process with handlers installed
+    // inherited them and ran the parent's handler code with none of the
+    // parent's state behind it.
+    // Bit 32; clone3's flags field is 64 bits wide precisely so this fits.
+    #define CLONE_CLEAR_SIGHAND_ (1ULL << 32)
+    bool clear_sighand = (args.flags & CLONE_CLEAR_SIGHAND_) != 0;
+    // Clearing dispositions that the child SHARES with its parent would
+    // clobber the parent's; Linux refuses the combination.
+    if (clear_sighand && (args.flags & CLONE_SIGHAND_))
+        return _EINVAL;
     if ((args.flags >> 32) != 0 && (args.flags >> 32) != 1)
         return _ENOSYS;
     if (args.set_tid != 0 || args.set_tid_size != 0 || args.cgroup != 0)
@@ -721,7 +816,7 @@ dword_t sys_clone3_guest(guest_addr_t uargs_addr, dword_t size) {
     // start) probes clone3+CLONE_PIDFD support before ever calling it for
     // real, so an unconditional ENOSYS here made every service spawn fail.
     guest_addr_t ptid = (flags & CLONE_PIDFD_) ? (guest_addr_t) args.pidfd : (guest_addr_t) args.parent_tid;
-    return sys_clone_common(flags, child_stack, ptid, args.tls, args.child_tid);
+    return sys_clone_common_(flags, child_stack, ptid, args.tls, args.child_tid, clear_sighand);
 }
 
 dword_t sys_clone3(addr_t uargs_addr, dword_t size) {
@@ -732,8 +827,22 @@ dword_t sys_unshare(dword_t flags) {
     STRACE("unshare(%#x)", flags);
 
     const dword_t supported = CLONE_FILES_ | CLONE_FS_ | CLONE_SYSVSEM_ | CLONE_NEWUTS_;
+    // Recognized, and not provided. The distinction from the ~known case
+    // below is the whole point: a flag listed here is a real thing this
+    // kernel does not have (ENOSYS), while one that is not listed at all is a
+    // malformed request (EINVAL). CLONE_NEWTIME was missing from both lists,
+    // so `unshare -T` -- and therefore any command including it -- came back
+    // "Invalid argument", which reads as "you typed something wrong" rather
+    // than "this kernel has no time namespaces". Reported from a device
+    // running exactly that:
+    //
+    //   unshare -U -u -m -i -n -p -C -T --map-auto --fork /bin/bash
+    //   unshare: unshare failed: Invalid argument
+    //
+    // Six of those eight namespaces already answered ENOSYS; the odd one out
+    // decided the message.
     const dword_t known_unsupported = CLONE_VM_ | CLONE_SIGHAND_ | CLONE_THREAD_ |
-        CLONE_NEWNS_ | CLONE_NEWCGROUP_ | CLONE_NEWIPC_ |
+        CLONE_NEWNS_ | CLONE_NEWCGROUP_ | CLONE_NEWIPC_ | CLONE_NEWTIME_ |
         CLONE_NEWUSER_ | CLONE_NEWPID_ | CLONE_NEWNET_ | CLONE_IO_;
     const dword_t known = supported | known_unsupported;
 

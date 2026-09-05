@@ -294,6 +294,34 @@ PURE = {
     # Darwin's strmode differs from openbsd's on 4096 of 65536 modes. It is
     # compiled from openbsd-compat now (HAVE_STRMODE undefined) and so is no
     # longer a host symbol at all.
+    # Rust's two pieces of runtime plumbing.
+    #
+    # __assert_rtn is Darwin's assert-failure handler: it prints and aborts, so
+    # it qualifies on the same terms as abort() below -- a crash either way, and
+    # no way to observe or change the host.
+    #
+    # rust_eh_personality is the unwinder's personality routine. It is called
+    # by the unwind machinery while walking frames and reads only the tables
+    # the compiler emitted alongside the code. The crate is built panic=abort,
+    # so nothing here should reach it at all; it is referenced because std is
+    # compiled once for both panic strategies.
+    "__assert_rtn", "rust_eh_personality",
+    # sysctlbyname, and only as Rust's std_detect uses it.
+    #
+    # This is the one name in the routed Rust archive that llvm-objcopy cannot
+    # rewrite -- it reports success and leaves the undefined symbol alone -- so
+    # std_detect reaches the host whatever the header says. Allowed because it
+    # is asking the RIGHT machine: a native program is host arm64 code, and
+    # std_detect asks hw.optional.arm.FEAT_* to decide which instructions the
+    # silicon really supports. A guest answer there would be wrong in both
+    # directions.
+    #
+    # The scheduling keys are a different question and are NOT left to the
+    # host: nlibc_sysctlbyname answers hw.ncpu and friends from AOK's own
+    # policy, because a program sizing a thread pool must see the cores AOK is
+    # prepared to give it. The split is what makes this entry safe; without it
+    # this would be a hole.
+    "sysctlbyname",
     # abort() raises SIGABRT on the calling thread. It ends the app rather than
     # the task, which is wrong, but it is a crash either way and not a way to
     # observe or change the host -- routing it would be an improvement, not a
@@ -321,7 +349,13 @@ PURE = {
 # (A second reading of "the gate cannot see this": it can. It reads undefined
 # symbols, which covers data as readily as calls -- __progname is a variable
 # and would have been caught. Nothing here needs to learn about variables.)
-INTERNAL_PREFIXES = ("_tlv_", "_os_", "_platform_")
+# Rust's name mangling (RFC 2603): every symbol it generates for its own code
+# starts _R. These are Rust calling Rust -- the archive's internal edges -- and
+# no more a host call than a static C function is. The libc names Rust DOES
+# import are ordinary C symbols and still face the allowlist, which is the
+# point: routing rewrites them to nlibc_* (tools/gen-nlibc-renames.py), so one
+# left unrewritten still shows up here by its real name.
+INTERNAL_PREFIXES = ("_tlv_", "_os_", "_platform_", "_R")
 INTERNAL = {
     "dyld_stub_binder",
     # Stack protector and stack probes.
@@ -349,6 +383,19 @@ INTERNAL = {
     # yet. It is written down so that it is a known gap with somewhere to hang
     # the fix, which is precisely what it was not while "__" hid it.
     "__mb_cur_max",
+    # The same gap as __mb_cur_max, reached the same way. Darwin's <ctype.h>
+    # defines tolower()/toupper() as macros over these, and it does so AFTER
+    # the shim header has been force-included -- so its own redirect, if there
+    # were one, would be overridden by the system header rather than the other
+    # way round. They consult the HOST's locale table, which for a native
+    # program is the app's.
+    #
+    # Bounded, and in the one caller that reaches them it does not bite at all:
+    # tree-sitter's grammar scanners use them to fold ASCII keywords, and ASCII
+    # case is the same answer in every locale. Written down rather than
+    # allowed silently, so that a caller who does depend on the locale has
+    # somewhere to find out why it was wrong.
+    "__tolower", "__toupper",
 }
 
 # Provided by AOK itself, by the shim, or by the program.
@@ -363,7 +410,10 @@ OURS = re.compile(r"^(nlibc_|native_|task_|do_|f_get|f_install|f_close|"
                   # There is no host in them; the file that indexes a guest
                   # terminfo entry with them is the same file that defines
                   # them, which is the point.
-                  r"boolcodes$|numcodes$|strcodes$)")
+                  # AOK's own build identifier, which SmallCLUE's `version`
+                  # applet reads weakly so the three places that report a
+                  # build -- version, uname -v and /AOK/VERSION -- agree.
+                  r"boolcodes$|numcodes$|strcodes$|copyBuildVersion$)")
 
 
 def _symbols(path, args):
@@ -421,10 +471,78 @@ SHIM_TO_HOST = {
     "curl_slist_append", "curl_slist_free_all",
 }
 
+# The host machinery a foreign runtime uses because a native program IS a host
+# thread. These are not a gap to close later: a native program runs on its
+# guest task's own pthread, with a host stack and host-scheduled time, so its
+# runtime's threading, unwinding and clocks must reach the host or they would
+# be describing a thread that does not exist. Kept apart from PURE because
+# these DO observe the host -- deliberately, and only about the host side of
+# the program, never about files, processes or identity.
+#
+# The line: anything that could answer a question about the SYSTEM -- what
+# files exist, who the user is, what is on the network -- belongs in the shim,
+# and getpwuid_r was on this list until it turned out to be reading the Mac's
+# /etc/passwd for Rust's home_dir().
+HOST_THREAD_RUNTIME = {
+    # Unwinding, over host frames on a host stack.
+    "_Unwind_Backtrace", "_Unwind_GetCFA", "_Unwind_GetDataRelBase",
+    "_Unwind_GetIP", "_Unwind_GetIPInfo", "_Unwind_GetLanguageSpecificData",
+    "_Unwind_GetRegionStart", "_Unwind_GetTextRelBase", "_Unwind_Resume",
+    "_Unwind_SetGR", "_Unwind_SetIP",
+    # Symbolicating a backtrace means naming loaded host images.
+    "_dyld_get_image_header", "_dyld_get_image_name",
+    "_dyld_get_image_vmaddr_slide", "_dyld_image_count",
+    # Rust parks threads on GCD semaphores on Apple.
+    "dispatch_release", "dispatch_semaphore_create",
+    "dispatch_semaphore_signal", "dispatch_semaphore_wait", "dispatch_time",
+    # Monotonic time and sleeping. The guest has no separate clock.
+    "mach_error_string", "mach_timebase_info", "mach_wait_until",
+    # Thread attributes and naming, on the host thread the program is running
+    # on. The pthread family the shim does not route is here for that reason.
+    "pthread_cond_timedwait_relative_np", "pthread_mutexattr_destroy",
+    "pthread_mutexattr_init", "pthread_mutexattr_settype",
+    "pthread_setname_np", "pthread_threadid_np",
+    # Guard pages and the alternate signal stack for stack-overflow detection,
+    # both on the host stack this program was called on.
+    "mprotect", "sigaltstack", "pause",
+    # Pure bit operations on a sigset the caller owns.
+    "sigaddset", "sigemptyset",
+    # errno is already the guest's error translated to a host value (see
+    # __error above), so the host's message for it is the right message.
+    "strerror_r",
+    # The system CSPRNG. There is no guest entropy source to prefer.
+    "CCRandomGenerateBytes",
+    # Advice and pinning for the program's OWN address space. memmap2 reaches
+    # these after mapping memory it allocated here; the guest has no say in a
+    # host mapping, and routing them would be asking the wrong kernel about
+    # the wrong pages. Note this is only true because a native program has no
+    # guest address space of its own to confuse them with -- see
+    # docs/TODO.md on why that stayed the case.
+    "madvise", "mlock", "munlock",
+}
+
 DEFAULT_TARGETS = ("build/libsmallclue.a", "build/libnextvi.a",
                    "build/libbash.a", "build/libzsh.a", "build/libopenssh.a",
                    "build/libopenssh_scp.a", "build/libopenssh_stubs.a",
-                   "build/libopenssh_smult_curve25519_ref.a")
+                   "build/libopenssh_smult_curve25519_ref.a",
+                   # AOK's own single-file native programs. Each is built into
+                   # its own archive purely so it can carry the native_libc.h
+                   # force-include (meson.build), which is exactly the property
+                   # this checks -- so they belong here as much as the vendored
+                   # trees above. motepad had been missing since it was added;
+                   # both pass today, so this is a gate against the next edit,
+                   # not a backlog.
+                   "build/libmotepad.a", "build/libktop.a",
+                   # Optional -- present only when the Rust native program is
+                   # configured. main() drops targets that do not exist, so a
+                   # build without cargo checks the rest and says nothing.
+                   # It has to be named: the object is linked INTO libish.a,
+                   # which is not on this list, so nothing else would look at
+                   # it, and the whole point of a foreign toolchain is that it
+                   # is the one AOK's #defines cannot reach. (It was
+                   # rust_native_probe_routed.o before the crate merge; the
+                   # old name sat here silently checking nothing.)
+                   "build/aok_native_routed.o")
 
 
 # The libc names kernel/native_libc.h already rewrites. Read from the header
@@ -460,7 +578,7 @@ def report(targets, root):
     routed = _routed(root)
     already = sorted(external & routed)
     pure = sorted((external & PURE) - routed)
-    todo = sorted(external - routed - PURE - SHIM_TO_HOST)
+    todo = sorted(external - routed - PURE - SHIM_TO_HOST - HOST_THREAD_RUNTIME)
 
     print(f"referenced from outside: {len(external)}")
     print(f"\n  already routed by native_libc.h ({len(already)}):")
@@ -501,7 +619,7 @@ def main():
         if not s.startswith(INTERNAL_PREFIXES) and s not in INTERNAL
         and not OURS.match(s)
     }
-    offenders = sorted(external - PURE - SHIM_TO_HOST)
+    offenders = sorted(external - PURE - SHIM_TO_HOST - HOST_THREAD_RUNTIME)
 
     if not offenders:
         print(f"check-native-libc: clean "

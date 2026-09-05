@@ -65,6 +65,13 @@ static void ptrace_resume_child_locked(struct task *child, int resume_sig,
         send_signal(child, resume_sig, SIGINFO_NIL);
 }
 
+// A failed lookup here means one of: the pid does not exist, it is not a
+// tracee of ours, or it is not stopped when the request needs it to be.
+// Linux answers ESRCH to all three -- ptrace's EPERM is reserved for
+// PTRACE_ATTACH being refused. Reporting EPERM told a tracer it lacked
+// permission for a process that had simply exited, and debuggers act on that
+// difference: one retries or reports a permission problem to the user, the
+// other reaps the child and moves on.
 static struct task *find_tracee(pid_t_ pid, bool require_stopped) {
     complex_lockt(&pids_lock, 0);
     struct task *tracee = pid_get_task_zombie(pid);
@@ -727,10 +734,19 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             current->ptrace.tracer = current->parent;
             return 0;
 
+        // PTRACE_ATTACH is what gdb uses; it differs from SEIZE in two ways.
+        // It takes no options, and it STOPS the tracee -- the tracer's first
+        // wait() must report a SIGSTOP signal-delivery-stop. It was missing
+        // entirely and fell through to the default arm's EPERM, so attaching a
+        // debugger to a running guest process simply could not be done.
+        case PTRACE_ATTACH_:
         case PTRACE_SEIZE_: {
-            STRACE("ptrace(PTRACE_SEIZE, %d, %#llx, %#llx)", pid,
+            bool seize = request == PTRACE_SEIZE_;
+            STRACE("ptrace(PTRACE_%s, %d, %#llx, %#llx)", seize ? "SEIZE" : "ATTACH", pid,
                     (unsigned long long) addr, (unsigned long long) data);
-            if (addr != 0)
+            // SEIZE takes its options in `data` and rejects a nonzero `addr`.
+            // ATTACH ignores both, as Linux does.
+            if (seize && addr != 0)
                 return _EIO;
 
             complex_lockt(&pids_lock, 0);
@@ -752,10 +768,10 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             }
 
             child->ptrace.traced = true;
-            child->ptrace.seized = true;
+            child->ptrace.seized = seize;
             child->ptrace.tracer = current;
-            child->ptrace.options = data;
-            child->ptrace.sysgood = !!(data & PTRACE_O_TRACESYSGOOD_);
+            child->ptrace.options = seize ? data : 0;
+            child->ptrace.sysgood = seize && !!(data & PTRACE_O_TRACESYSGOOD_);
             child->ptrace.stop_at_syscall = false;
             child->ptrace.syscall_stopped = false;
             child->ptrace.trap_event = 0;
@@ -763,6 +779,30 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             if (child->parent == NULL || child->parent->group != current->group)
                 list_add(&current->ptracees, &child->ptrace_siblings);
             unlock(&child->ptrace.lock);
+            // A tracee that was ALREADY group-stopped when we seized it is
+            // parked in handle_interrupt's job-control wait with nothing left
+            // to wake it, so it would never notice it is now traced and never
+            // report the stop -- our wait4 would hang forever. Wake it; the
+            // loop there re-checks ptrace.traced on every pass. This is the
+            // race ptrace_group_stop() loses when the tracee reaches
+            // raise(SIGSTOP) before the tracer reaches ptrace(). Linux does
+            // the same in ptrace_attach(), which wakes a __TASK_STOPPED tracee
+            // for exactly this reason.
+            //
+            // pids_lock is still held: it keeps `child` alive across the
+            // notify, and pids_lock -> group->lock is the established order
+            // (see handle_interrupt's own comment on taking pids_lock only
+            // after dropping group->lock).
+            lock(&child->group->lock, 0);
+            if (child->group->stopped)
+                notify(&child->group->stopped_cond);
+            unlock(&child->group->lock);
+            // ATTACH, unlike SEIZE, stops the tracee: Linux sends it a SIGSTOP
+            // that the tracer then sees as a signal-delivery-stop. Sent after
+            // ptrace.traced is set, so the tracee reports the stop to us
+            // rather than just entering an ordinary job-control stop.
+            if (!seize)
+                send_signal(child, SIGSTOP_, SIGINFO_NIL);
             unlock(&pids_lock);
             return 0;
         }
@@ -772,7 +812,7 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             STRACE("ptrace(PTRACE_PEEKDATA, %d, %#llx, %#llx)", pid,
                     (unsigned long long) addr, (unsigned long long) data);
             struct task *child = find_child(pid);
-            if (!child) return _EPERM;
+            if (!child) return _ESRCH;
 
             if (guest_abi_is_64bit(child->abi)) {
                 qword_t peek;
@@ -796,7 +836,7 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             STRACE("ptrace(PTRACE_PEEKUSER, %d, %#llx, %#llx)", pid,
                     (unsigned long long) addr, (unsigned long long) data);
             struct task *child = find_child(pid);
-            if (!child) return _EPERM;
+            if (!child) return _ESRCH;
 
             // Neither the real arm64 nor riscv64 kernel has PEEKUSER/GETREGS-
             // family requests (regsets only); don't hand either tracee the
@@ -874,7 +914,7 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             STRACE("ptrace(PTRACE_POKEDATA, %d, %#llx, %#llx)", pid,
                     (unsigned long long) addr, (unsigned long long) data);
             struct task *child = find_child(pid);
-            if (!child) return _EPERM;
+            if (!child) return _ESRCH;
 
             if (user_write_task_ptrace(child, addr, &data, ptrace_word_size(child))) {
                 unlock(&child->ptrace.lock);
@@ -889,7 +929,7 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             STRACE("ptrace(PTRACE_CONT, %d, %#llx, %#llx)", pid,
                     (unsigned long long) addr, (unsigned long long) data);
             struct task *child = find_child(pid);
-            if (!child) return _EPERM;
+            if (!child) return _ESRCH;
             int resume_sig = ptrace_resume_signal(data);
             if (resume_sig < 0) {
                 unlock(&child->ptrace.lock);
@@ -904,7 +944,7 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             STRACE("ptrace(PTRACE_KILL, %d, %#llx, %#llx)", pid,
                     (unsigned long long) addr, (unsigned long long) data);
             struct task *child = find_child(pid);
-            if (!child) return _EPERM;
+            if (!child) return _ESRCH;
 
             child->ptrace.stopped = false;
             send_signal(child, SIGKILL_, SIGINFO_NIL);
@@ -917,7 +957,7 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             STRACE("ptrace(PTRACE_SINGLESTEP, %d, %#llx, %#llx)", pid,
                     (unsigned long long) addr, (unsigned long long) data);
             struct task *child = find_child(pid);
-            if (!child) return _EPERM;
+            if (!child) return _ESRCH;
             int resume_sig = ptrace_resume_signal(data);
             if (resume_sig < 0) {
                 unlock(&child->ptrace.lock);
@@ -937,6 +977,12 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             struct task *child = find_tracee(pid, false);
             if (!child)
                 return _EPERM;
+            // Linux: only a SEIZE'd tracee can be interrupted; an ATTACH'd one
+            // gets EIO. Measured on 6.12.
+            if (!child->ptrace.seized) {
+                unlock(&child->ptrace.lock);
+                return _EIO;
+            }
             if (!child->ptrace.stopped) {
                 child->ptrace.trap_event = PTRACE_EVENT_STOP_;
                 child->ptrace.eventmsg = 0;
@@ -952,7 +998,7 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             STRACE("ptrace(PTRACE_GETREGS, %d, %#llx, %#llx)", pid,
                     (unsigned long long) addr, (unsigned long long) data);
             struct task *child = find_child(pid);
-            if (!child) return _EPERM;
+            if (!child) return _ESRCH;
 
             if (child->abi == GUEST_ABI_ARM64 || child->abi == GUEST_ABI_RISCV64) {
                 unlock(&child->ptrace.lock);
@@ -984,7 +1030,7 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             STRACE("ptrace(PTRACE_SETREGS, %d, %#llx, %#llx)", pid,
                     (unsigned long long) addr, (unsigned long long) data);
             struct task *child = find_child(pid);
-            if (!child) return _EPERM;
+            if (!child) return _ESRCH;
 
             if (child->abi == GUEST_ABI_ARM64 || child->abi == GUEST_ABI_RISCV64) {
                 unlock(&child->ptrace.lock);
@@ -1016,7 +1062,7 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             STRACE("ptrace(PTRACE_GETFPREGS, %d, %#llx, %#llx)", pid,
                     (unsigned long long) addr, (unsigned long long) data);
             struct task *child = find_child(pid);
-            if (!child) return _EPERM;
+            if (!child) return _ESRCH;
 
             if (child->abi == GUEST_ABI_ARM64 || child->abi == GUEST_ABI_RISCV64) {
                 unlock(&child->ptrace.lock);
@@ -1047,7 +1093,7 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             STRACE("ptrace(PTRACE_SETFPREGS, %d, %#llx, %#llx)", pid,
                     (unsigned long long) addr, (unsigned long long) data);
             struct task *child = find_child(pid);
-            if (!child) return _EPERM;
+            if (!child) return _ESRCH;
 
             if (child->abi == GUEST_ABI_ARM64 || child->abi == GUEST_ABI_RISCV64) {
                 unlock(&child->ptrace.lock);
@@ -1079,7 +1125,7 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             STRACE("ptrace(PTRACE_SYSCALL, %d, %#llx, %#llx)", pid,
                     (unsigned long long) addr, (unsigned long long) data);
             struct task *child = find_child(pid);
-            if (!child) return _EPERM;
+            if (!child) return _ESRCH;
             int resume_sig = ptrace_resume_signal(data);
             if (resume_sig < 0) {
                 unlock(&child->ptrace.lock);
@@ -1094,7 +1140,7 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             STRACE("ptrace(PTRACE_DETACH, %d, %#llx, %#llx)", pid,
                     (unsigned long long) addr, (unsigned long long) data);
             struct task *child = find_child(pid);
-            if (!child) return _EPERM;
+            if (!child) return _ESRCH;
             int resume_sig = ptrace_resume_signal(data);
             if (resume_sig < 0) {
                 unlock(&child->ptrace.lock);
@@ -1109,7 +1155,7 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             STRACE("ptrace(PTRACE_SETOPTIONS, %d, %#llx, %#llx)", pid,
                     (unsigned long long) addr, (unsigned long long) data);
             struct task *child = find_tracee(pid, false);
-            if (!child) return _EPERM;
+            if (!child) return _ESRCH;
             // Ideally we would have this condition, but strace annonyingly
             // uses PTRACE_O_SYSGOOD | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT
             // (we don't support the other two). Since this isn't a big deal we
@@ -1130,7 +1176,7 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             STRACE("ptrace(PTRACE_GETSIGINFO, %d, %#llx, %#llx)", pid,
                     (unsigned long long) addr, (unsigned long long) data);
             struct task *child = find_child(pid);
-            if (!child) return _EPERM;
+            if (!child) return _ESRCH;
 
             if (data && siginfo_to_user(current, data, &child->ptrace.info)) {
                 unlock(&child->ptrace.lock);
@@ -1145,7 +1191,7 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             STRACE("ptrace(PTRACE_GETEVENTMSG, %d, %#llx, %#llx)", pid,
                     (unsigned long long) addr, (unsigned long long) data);
             struct task *child = find_child(pid);
-            if (!child) return _EPERM;
+            if (!child) return _ESRCH;
 
             qword_t eventmsg = child->ptrace.eventmsg;
             if (data && ptrace_put_eventmsg(current, data, eventmsg)) {
@@ -1160,7 +1206,7 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             STRACE("ptrace(PTRACE_GETREGSET, %d, %#llx, %#llx)", pid,
                     (unsigned long long) addr, (unsigned long long) data);
             struct task *child = find_child(pid);
-            if (!child) return _EPERM;
+            if (!child) return _ESRCH;
 
             int err = ptrace_getregset(current, child, data, addr);
             unlock(&child->ptrace.lock);
@@ -1171,7 +1217,7 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             STRACE("ptrace(PTRACE_SETREGSET, %d, %#llx, %#llx)", pid,
                     (unsigned long long) addr, (unsigned long long) data);
             struct task *child = find_child(pid);
-            if (!child) return _EPERM;
+            if (!child) return _ESRCH;
 
             int err = ptrace_setregset(current, child, data, addr);
             unlock(&child->ptrace.lock);

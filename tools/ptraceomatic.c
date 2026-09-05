@@ -3,6 +3,7 @@
 // working the same.
 // Many apologies for the messy code.
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
@@ -35,13 +36,57 @@
 // ptrace utility functions
 
 // returns 1 for a signal stop
+// Why this exists rather than printk.
+//
+// A divergence report is the only output this tool produces that anyone wants,
+// and it went to printk -- which writes to file descriptor 555 (kernel/log.c),
+// the convention the emulator uses for its own log. Nobody redirects 555 when
+// running this by hand, so writev failed with EBADF and the report vanished.
+// Then `debugger` fired an int3, and the whole session was a shell reporting
+// "Trace/breakpoint trap" with not one line explaining what had differed.
+// Divergences go to stderr.
+static void reportf(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fflush(stderr);
+}
+
+// int3 with no debugger attached is not a breakpoint, it is a crash. The trap
+// is what a person single-stepping this in gdb wants and it is exactly wrong
+// for everyone else, so it is opt-in: PTRACEOMATIC_TRAP=1 to keep the old
+// behaviour, and by default the report on stderr is the answer.
+static bool trap_wanted(void) {
+    static int want = -1;
+    if (want < 0) {
+        const char *v = getenv("PTRACEOMATIC_TRAP");
+        want = (v != NULL && *v != '\0' && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return want == 1;
+}
+
+// A syscall the interception switch does not know about still gets its return
+// value synced, so a missing case is invisible until the guest reads the buffer
+// the syscall was supposed to fill -- at which point the report blames whatever
+// innocent instruction did the reading. This trace names the syscalls that went
+// through with no memory sync, which is where to look first.
+static bool trace_syscalls(void) {
+    static int want = -1;
+    if (want < 0) {
+        const char *v = getenv("PTRACEOMATIC_TRACE_SYSCALLS");
+        want = (v != NULL && *v != '\0' && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return want == 1;
+}
+
 static inline int step(int pid) {
     trycall(ptrace(PTRACE_SINGLESTEP, pid, NULL, 0), "ptrace step");
     int status;
     trycall(waitpid(pid, &status, 0), "wait step");
     if (WIFSTOPPED(status) && WSTOPSIG(status) != SIGTRAP) {
         int signal = WSTOPSIG(status);
-        printk("child received signal %d\n", signal);
+        reportf("ptraceomatic: tracee received signal %d (%s)\n", signal, strsignal(signal));
         // a signal arrived, we now have to actually deliver it
         trycall(ptrace(PTRACE_SINGLESTEP, pid, NULL, signal), "ptrace step");
         trycall(waitpid(pid, &status, 0), "wait step");
@@ -89,8 +134,8 @@ static int compare_cpus(struct cpu_state *cpu, struct tlb *tlb, int pid, int und
     collapse_flags(cpu);
 #define CHECK(real, fake, fmt, ...) do { \
     if ((real) != (fake)) { \
-        printk(fmt ": real 0x%llx, fake 0x%llx\n", ##__VA_ARGS__, (unsigned long long) (real), (unsigned long long) (fake)); \
-        debugger; \
+        reportf(fmt ": real 0x%llx, fake 0x%llx\n", ##__VA_ARGS__, (unsigned long long) (real), (unsigned long long) (fake)); \
+        if (trap_wanted()) debugger; \
         return -1; \
     } \
 } while (0)
@@ -135,7 +180,7 @@ static int compare_cpus(struct cpu_state *cpu, struct tlb *tlb, int pid, int und
 #undef f
 #define f(x,n) ((cpu->eflags & (1 << n)) ? #x : "-"),
                 cpu->eflags, f(o,11)f(d,10)f(i,9)f(t,8)f(s,7)f(z,6)f(a,4)f(p,2)f(c,0)0);
-        debugger;
+        if (trap_wanted()) debugger;
         return -1;
     }
 
@@ -154,8 +199,8 @@ static int compare_cpus(struct cpu_state *cpu, struct tlb *tlb, int pid, int und
         uint64_t f_signif =  cpu->fp[ii].signif;
         uint64_t expected = *(uint64_t *) &fpregs.st_space[i * 4];
         if (f_signif != expected && mm != expected) {
-            printk("mm/st(%d) signif: real %#llx, fake fp %#llx, fake mm %#llx\n", i, (unsigned long long) expected, (unsigned long long) f_signif, (unsigned long long) mm);
-            debugger;
+            reportf("mm/st(%d) signif: real %#llx, fake fp %#llx, fake mm %#llx\n", i, (unsigned long long) expected, (unsigned long long) f_signif, (unsigned long long) mm);
+            if (trap_wanted()) debugger;
             return -1;
         }
         if (f_signif == expected && mm != expected) {
@@ -175,8 +220,8 @@ static int compare_cpus(struct cpu_state *cpu, struct tlb *tlb, int pid, int und
         void *fake_page = entry.data->data + entry.offset;
 
         if (memcmp(real_page, fake_page, PAGE_SIZE) != 0) {
-            printk("page %x doesn't match\n", dirty_page);
-            debugger;
+            reportf("page %x doesn't match\n", dirty_page);
+            if (trap_wanted()) debugger;
             return -1;
         }
         tlb->dirty_page = TLB_PAGE_EMPTY;
@@ -322,6 +367,7 @@ static void step_tracing(struct cpu_state *cpu, struct tlb *tlb, int pid, int se
     // step fake cpu
     bool is_amd64 = current->abi == GUEST_ABI_AMD64;
     cpu->tf = 1;
+    uint64_t pre_eip = is_amd64 ? cpu->amd64_rip : cpu->eip;
     int interrupt = cpu_run_to_interrupt(cpu, tlb);
     // hack to clean up before the exit syscall
     if (interrupt == INT_SYSCALL &&
@@ -332,8 +378,37 @@ static void step_tracing(struct cpu_state *cpu, struct tlb *tlb, int pid, int se
             exit(1);
         }
     }
-    if (interrupt != INT_DEBUG)
+    if (interrupt != INT_DEBUG) {
         handle_interrupt(interrupt);
+        // A fault the emulator resolves itself -- growing the stack, faulting in
+        // a page -- leaves the faulting instruction UN-RETIRED, to be retried on
+        // the next run. Stepping the real CPU anyway puts the two one instruction
+        // out of phase, and the next compare then blames whatever innocent
+        // instruction happens to be next. The syscall interrupts are not this
+        // case: handle_interrupt runs the syscall and advances past it, and the
+        // interception below needs to see the int $0x80 in the real process.
+        int syscall_int = is_amd64 ? INT_AMD64_SYSCALL : INT_SYSCALL;
+        uint64_t post_eip = is_amd64 ? cpu->amd64_rip : cpu->eip;
+        if (interrupt != syscall_int && post_eip == pre_eip) {
+            // If handle_interrupt cannot make progress, holding the real CPU
+            // back forever turns a false divergence report into a silent hang,
+            // which is worse. Bound it and say so instead.
+            static uint64_t held_eip;
+            static int held_times;
+            held_times = (pre_eip == held_eip) ? held_times + 1 : 0;
+            held_eip = pre_eip;
+            if (held_times >= 16) {
+                reportf("ptraceomatic: fake cpu stuck on interrupt %d at eip %#llx, "
+                        "not retiring it after %d attempts\n",
+                        interrupt, (unsigned long long) pre_eip, held_times);
+                exit(1);
+            }
+            if (trace_syscalls())
+                reportf("ptraceomatic: fake cpu took interrupt %d at eip %#llx without retiring it; "
+                        "holding the real cpu back a step\n", interrupt, (unsigned long long) pre_eip);
+            return;
+        }
+    }
 
     // step real cpu
     // intercept cpuid, rdtsc, and int $0x80, though
@@ -371,6 +446,7 @@ static void step_tracing(struct cpu_state *cpu, struct tlb *tlb, int pid, int se
     } else if (!is_amd64 && (inst & 0xff) == 0xcd && ((inst & 0xff00) >> 8) == 0x80) {
         // int $0x80, intercept the syscall unless it's one of a few actually important ones
         dword_t syscall_num = (dword_t) regs.rax;
+        bool synced_memory = true;
         switch (syscall_num) {
             // put syscall result from fake process into real process
             case 3: // read
@@ -438,6 +514,9 @@ static void step_tracing(struct cpu_state *cpu, struct tlb *tlb, int pid, int se
             case 186: // sigaltstack
                 if (regs.rcx != 0) pt_copy(pid, regs.rcx, sizeof(struct stack_t_));
                 break;
+            case 76:  // old_getrlimit
+            case 191: // ugetrlimit
+                pt_copy(pid, regs.rcx, sizeof(struct rlimit32_)); break;
             case 195: // stat64
             case 196: // lstat64
             case 197: // fstat64
@@ -479,7 +558,14 @@ static void step_tracing(struct cpu_state *cpu, struct tlb *tlb, int pid, int se
             case 243: // set_thread_area
                 //regs.rax = cpu->eax;
                 goto do_step;
+
+            default:
+                synced_memory = false;
+                break;
         }
+        if (trace_syscalls())
+            reportf("ptraceomatic: syscall %u -> %#x%s\n", (unsigned) syscall_num,
+                    (unsigned) cpu->eax, synced_memory ? "" : "   [no memory sync]");
         regs.rax = cpu->eax;
         regs.rip += 2;
     } else {
@@ -648,11 +734,37 @@ int main(int argc, char *const argv[]) {
     int i = 0;
     check_tracee_alive(pid, "pre-loop");
     while (true) {
-        while (compare_cpus(cpu, &tlb, pid, undefined_flags) < 0) {
-            printk("failure: resetting cpu\n");
-            *cpu = old_cpu;
-            __asm__("int3");
-            cpu_run_to_interrupt(cpu, &tlb);
+        if (compare_cpus(cpu, &tlb, pid, undefined_flags) < 0) {
+            // Resetting and re-running the instruction is a debugging aid: it
+            // is useful when a person is sitting in gdb at the int3 above and
+            // wants to step the same instruction again. Without a debugger it
+            // is an infinite loop printing the same divergence, so the default
+            // is to report once and stop with a status that says so.
+            // The instruction that did it is the one just stepped, so its
+            // address is the eip we saved BEFORE the step. Without this the
+            // report says two registers differ and leaves you to find out
+            // where, which for a divergence 422 instructions into libc start-up
+            // is most of the work.
+            reportf("ptraceomatic: emulated and real CPU diverged after %d instruction(s)\n", i);
+            reportf("  last instruction at eip 0x%x, now at 0x%x\n",
+                    old_cpu.eip, cpu->eip);
+            reportf("  bytes at 0x%x:", old_cpu.eip);
+            for (addr_t a = old_cpu.eip; a < old_cpu.eip + 12; a += sizeof(dword_t)) {
+                dword_t word = pt_read(pid, a);
+                for (unsigned b = 0; b < sizeof(word); b++)
+                    reportf(" %02x", (unsigned) ((word >> (b * 8)) & 0xff));
+            }
+            reportf("\n");
+            if (!trap_wanted()) {
+                reportf("ptraceomatic: set PTRACEOMATIC_TRAP=1 to break into a debugger here\n");
+                return 1;
+            }
+            do {
+                reportf("failure: resetting cpu\n");
+                *cpu = old_cpu;
+                debugger;
+                cpu_run_to_interrupt(cpu, &tlb);
+            } while (compare_cpus(cpu, &tlb, pid, undefined_flags) < 0);
         }
         undefined_flags = undefined_flags_mask(cpu, &tlb);
         old_cpu = *cpu;

@@ -61,6 +61,7 @@ enum amd64_jit_mem_meta {
     AMD64_JIT_MEM_RIP_REL = 1ul << 32,
     AMD64_JIT_MEM_FS = 1ul << 33,
     AMD64_JIT_MEM_REX_PRESENT = 1ul << 34,
+    AMD64_JIT_MEM_LOCK = 1ul << 35,
 };
 
 static inline byte_t amd64_modrm_mod(byte_t modrm) {
@@ -4570,9 +4571,9 @@ int gen_step_arm64(struct gen_state *state, struct tlb *tlb) {
     // pages, which have already happened by the time the cache ops run,
     // so these are architecturally safe no-ops — same self-modifying-code
     // model as the x86 guests, no gadget emitted (hint-space precedent
-    // above). Whitelisted CRm values only: DC ZVA (CRm=4, same op1/CRn/
-    // op2 space) must keep faulting because DCZID_EL0 advertises DZP=1
-    // (see the MRS below), and unallocated encodings stay UNDEFINED.
+    // above). Whitelisted CRm values only; unallocated encodings stay
+    // UNDEFINED. DC ZVA (CRm=4) shares this op1/CRn/op2 space but is a
+    // real memory write, not a hint, so it gets a gadget of its own below.
     // EL1-only maintenance ops have op1!=3 and never match this mask.
     if ((insn & 0xfffff0e0) == 0xd50b7020) {
         unsigned crm = (insn >> 8) & 0xf;
@@ -4594,11 +4595,24 @@ int gen_step_arm64(struct gen_state *state, struct tlb *tlb) {
             }
             return 1;
         }
+        if (crm == 0x4) {
+            // DC ZVA: zero the naturally-aligned block containing the VA
+            // in Xt. This used to fall through to SIGILL, which was only
+            // defensible while DCZID_EL0 advertised DZP=1 — it no longer
+            // does (see the MRS below), so the guest is entitled to
+            // execute this and needs a real gadget. Xt=31 is XZR (VA 0),
+            // an ordinary faulting write, handled inside the gadget.
+            extern void gadget_arm64_dc_zva(void);
+            gen(state, (unsigned long) gadget_arm64_dc_zva);
+            gen(state, insn & 0x1f);
+            gen(state, state->arm64_orig_ip); // fault-restart address (see memory.S's segfault paths)
+            return 1;
+        }
         if (crm == 0xa || crm == 0xb ||  // DC CVAC, DC CVAU
             crm == 0xc || crm == 0xd ||  // DC CVAP, DC CVADP
             crm == 0xe)                  // DC CIVAC
             return 1;
-        // fall through: DC ZVA / EL1-only ops reject below
+        // fall through: EL1-only ops reject below
     }
 
     // MRS/MSR TPIDR_EL0 — the TLS base register (see cpu_state.arm64_tpidr).
@@ -4644,15 +4658,28 @@ int gen_step_arm64(struct gen_state *state, struct tlb *tlb) {
 
     // MRS of constant system registers, via the generic mrs_const gadget:
     // CTR_EL0 (cache-line geometry: 64-byte I/D lines, PIPT, the standard
-    // QEMU-user value) and DCZID_EL0 with DZP=1 (DC ZVA prohibited, so
-    // libc memset never tries the zeroing instruction and no DC ZVA
-    // emulation is needed).
+    // QEMU-user value) and DCZID_EL0.
+    //
+    // DCZID_EL0 reads 0x4: DZP=0 (DC ZVA permitted) and BS=4, i.e. a
+    // 64-byte block — BS is log2 of the block size in 4-byte words, and
+    // 64 bytes is what every real AArch64 core reports. It must stay in
+    // sync with ARM64_DCZVA_BYTES (jit/guest-arm64/gadgets.h), which is
+    // what the DC ZVA gadget actually zeroes.
+    //
+    // This used to report DZP=1 to avoid implementing DC ZVA at all.
+    // Linux sets SCTLR_EL1.DZE, so DZP reads 0 at EL0 on every aarch64
+    // Linux box, and software is entitled to assume it never sees the
+    // other value: HotSpot leaves VM_Version::_zva_length at 0 when DZP
+    // is set but still honours UseBlockZeroing (default on), then emits
+    // `and Xd, Xn, #(zva_length - 1)` — a mask of all ones, which is not
+    // an encodable AArch64 logical immediate. The JVM died in its own
+    // assembler before reaching any Java code (issue #542).
     if ((insn & 0xffffffe0) == 0xd53b0020 || (insn & 0xffffffe0) == 0xd53b00e0) {
         extern void gadget_arm64_mrs_const(void);
         bool is_ctr = (insn & 0xffffffe0) == 0xd53b0020;
         gen(state, (unsigned long) gadget_arm64_mrs_const);
         gen(state, insn & 0x1f);
-        gen(state, is_ctr ? 0x8444c004ULL : 0x10ULL);
+        gen(state, is_ctr ? 0x8444c004ULL : 0x4ULL);
         return 1;
     }
 
@@ -9837,10 +9864,27 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
             state->amd64_fallback_to_interp = true;
             return false;
         }
+        // This block is the one amd64 JIT path that accepts a LOCK prefix --
+        // every other predicate rejects it (amd64_jit_plain_prefixes and its
+        // siblings) and bridges to the interpreter. It has to, because the
+        // helper it emits is the only implementation of `<alu> [mem], reg`
+        // the JIT has; but until 553 the prefix was simply dropped on the
+        // floor and the helper did a plain read/compute/write, so `lock addl
+        // %reg, (mem)` was not atomic against anything at all. Carry it in
+        // the meta word and let the helper do a host atomic.
+        //
+        // Only the seven RMW directions take it. LOCK on cmp/test/mov/lea, or
+        // on a reg-destination direction, is #UD on hardware; this path has
+        // always executed those and keeps doing so rather than introducing a
+        // new SIGILL for something no correct program emits.
+        if (insn.lock_prefix &&
+                (insn.opcode & 7) <= 1 && insn.opcode < 0x38)
+            meta |= AMD64_JIT_MEM_LOCK;
         state->amd64_ip = next_ip;
-        amd64_jit_debug("mem-op-helper ip=%llx opcode=%02x meta=%lx disp=%lx next=%llx",
+        amd64_jit_debug("mem-op-helper ip=%llx opcode=%02x%s meta=%lx disp=%lx next=%llx",
                 (unsigned long long) insn.start_ip,
                 insn.opcode,
+                (meta & AMD64_JIT_MEM_LOCK) ? " lock" : "",
                 meta,
                 disp,
                 (unsigned long long) next_ip);
@@ -10245,6 +10289,22 @@ typedef void (*gadget_t)(void);
 #define ht_retint(h) gg(helper_tlb_0_retint, h)
 #define h_read(h, z) do { g_addr(); ggg(helper_read##z, state->orig_ip, h##z); } while (0)
 #define h_write(h, z) do { g_addr(); ggg(helper_write##z, state->orig_ip, h##z); } while (0)
+// Same, for a memory operand whose width is fixed by the INSTRUCTION rather
+// than by the operand-size suffix on the helper's name. `z` still names the
+// helper (fpu_save32); `bits` is the real width of the access, and it is what
+// picks the read_prep/write_prep gadget -- so the TLB check, the page
+// permission check, the COW break and the crosspage staging all cover the
+// bytes the helper is actually going to touch.
+//
+// Passing the helper's own suffix here (the h_read/h_write shorthand) is only
+// correct when the two agree. The FPU state instructions are where they do
+// not, and getting a 4-byte check in front of a 512-byte store meant FXSAVE
+// wrote 512 bytes through a pointer validated for four: no permission check
+// and no COW break past the first dword, an overrun off the end of the host
+// region, and -- when the 4-byte check said "crosspage" -- all 512 bytes into
+// a 32-byte staging buffer, with 4 of them flushed back out.
+#define h_read_bits(h, z, bits) do { g_addr(); ggg(helper_read##bits, state->orig_ip, h##z); } while (0)
+#define h_write_bits(h, z, bits) do { g_addr(); ggg(helper_write##bits, state->orig_ip, h##z); } while (0)
 #define UNDEFINED do { gggg(interrupt, INT_UNDEFINED, state->orig_ip, state->orig_ip); return false; } while (0)
 #define SEGFAULT do { gggg(interrupt, INT_GPF, state->orig_ip, tlb->segfault_addr); return false; } while (0)
 #define SYSCALL_AMD64 do { gggg(interrupt, INT_AMD64_SYSCALL, state->ip, 0); return false; } while (0)
@@ -11117,10 +11177,31 @@ void helper_rdtsc(struct cpu_state *cpu);
 #define FSTSW(dst) if (arg_##dst == arg_reg_a) g(fstsw_ax); else h_write(fpu_stsw, 16)
 #define FSTCW(dst) if (arg_##dst == arg_reg_a) UNDEFINED; else h_write(fpu_stcw, 16)
 #define FLDCW(dst) if (arg_##dst == arg_reg_a) UNDEFINED; else h_read(fpu_ldcw, 16)
-#define FSTENV(val,z) h_write(fpu_stenv, z)
-#define FLDENV(val,z) h_write(fpu_ldenv, z)
-#define FSAVE(val,z) h_write(fpu_save, z)
-#define FRESTORE(val,z) h_write(fpu_restore, z)
+// The x87 state-area instructions. The width in the third argument is the
+// architectural size of the memory operand -- 28 bytes for the environment
+// (struct fpu_env32), 108 for the full state (struct fpu_state32) -- and NOT
+// the 32 in the helper's name, which is the FPU-mode suffix. The decoder only
+// ever reaches the 32-bit forms (emu/decode.h passes a literal 32), so `z` is
+// always 32 and the two used to look interchangeable; they never were.
+//
+// The load forms are h_read, not h_write. They were h_write, which asked for
+// write permission on memory the instruction only reads -- so FLDENV/FRSTOR
+// from a read-only mapping raised a spurious #GP, and one from a private
+// clean page broke COW and dirtied it -- and then flushed the staging buffer
+// back out over the source bytes on the crosspage path.
+#define FSTENV(val,z) h_write_bits(fpu_stenv, z, 224)
+#define FLDENV(val,z) h_read_bits(fpu_ldenv, z, 224)
+#define FSAVE(val,z) h_write_bits(fpu_save, z, 864)
+#define FRESTORE(val,z) h_read_bits(fpu_restore, z, 864)
+// The 0f ae memory forms. The helper suffix is a literal 32 rather than `oz`
+// because these instructions have no operand-size form and decode.h is
+// compiled once per OP_SIZE, so both passes must reach the same helper.
+// FXSAVE/FXRSTOR move 512 bytes; LDMXCSR/STMXCSR move four, which is the one
+// case here where the helper suffix and the access width do coincide.
+#define FXSAVE()  h_write_bits(fpu_fxsave, 32, 4096)
+#define FXRSTOR() h_read_bits(fpu_fxrestore, 32, 4096)
+#define STMXCSR() h_write(fpu_stmxcsr, 32)
+#define LDMXCSR() h_read(fpu_ldmxcsr, 32)
 #define FINIT() h(fpu_init)
 #define FCLEX() h(fpu_clex)
 #define FPOP h(fpu_pop)

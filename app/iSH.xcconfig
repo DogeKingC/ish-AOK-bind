@@ -11,6 +11,30 @@ ISH_LOGGER_iphoneos = nslog
 ISH_LOGGER_iphonesimulator = nslog
 ISH_LOGGER_macosx = dprintf
 
+// helix as a native program, at /AOK/native/hx, with syntax highlighting for
+// fifteen languages and 219 themes under /AOK/native/libs/helix.
+//
+// ON by default: a native editor that only appears when you know to ask for it
+// is not shipped, it is hidden, and this one is the reason the native-program
+// work exists. The two costs are real and taken deliberately -- it is MPL-2.0,
+// so the shipped binary carries MPL code, and it is roughly 45MB against an
+// app binary that is 14MB without it.
+//
+// Needs the Rust toolchain (cargo + llvm-objcopy) and the deps/helix
+// submodule. Missing either is a hard build error naming the fix, not a quiet
+// skip: an editor that silently vanished from a build would be found by users,
+// not by us. Clear this to build without it.
+AOK_NATIVE_HELIX = YES
+// AOK_NATIVE_HELIX = 
+
+// Cargo features for the Rust native program (/AOK/native/rust-probe).
+// Empty for a normal build -- the probe's tokio test pulls in a dependency
+// tree that has no business in a shipping app. Set it to "tokio-probe" to
+// make the probe exercise the async runtime, which is what proves the kqueue
+// front end (kernel/native_kqueue.h) works on device.
+AOK_RUST_FEATURES = 
+// AOK_RUST_FEATURES = tokio-probe
+
 // Guest architectures the emulator supports (comma-separated; at least one).
 // Default is everything. Trim to e.g. "arm64" for a smaller/faster build.
 ISH_GUEST_ARCHS = i386,amd64,arm64,riscv64

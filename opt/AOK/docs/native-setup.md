@@ -4,6 +4,12 @@
 why it is fast. This page is the practical half: getting them onto your `PATH`,
 making one your login shell, and backing out again.
 
+There is a near neighbour with a different job. `/AOK/tools/persist-links.sh`
+has the same shape — same `--list`, `--remove`, `--force`, same per-root
+caveat — but it links **your own** programs out of `/AOK/persist/bin`, so it can
+never shadow a distro command you did not choose to shadow. See
+[persist.md](persist.md). This page is only about the app's programs.
+
 Nothing here is required. `/AOK/native` is always present, and you can always
 run a native program by its full path without setting anything up at all:
 
@@ -26,8 +32,17 @@ someone else, prefix it.
 
 That creates a symlink per applet in `/usr/local/native-bin`, puts that
 directory first on your `PATH`, and switches the UID 1000 user's login shell to
-a native one. On a current build it links about 105 applets and skips 28 it
-knows do not work.
+a native one. On a current build it links about 110 applets and skips a couple
+of dozen it knows do not work.
+
+It links the **standalone** native programs too, not only SmallCLUE's applets —
+`bash`, `zsh`, [`motepad`](motepad.md), `hx` and the `bmm`/`bmt` benchmarks each
+get a link pointing at their own file. It enumerates `/AOK/native` rather than
+naming them, so a program this build does not have is simply absent. Three names
+are deliberately left out: `smallclue` itself (its applets are linked by name,
+so a bare `smallclue` link would only print the banner), `zsh-multio` (an
+internal helper, not a second shell), and `rust-probe` (a diagnostic nobody
+types). Exclusion there is not a judgement about whether the program works.
 
 Look before you leap — `--list` changes nothing and prints exactly what would
 happen:
@@ -39,8 +54,10 @@ sh /AOK/tools/native-links.sh --list
 The last lines are the summary worth reading:
 
 ```
-would link 105, leave 0 in place, skip 28 excluded, 0 already linked, unlink 0 now-excluded
+would link 110 applet(s) and 6 program(s), leave 0 in place, skip 20 excluded, 0 already linked, unlink 0 now-excluded
   would put /usr/local/native-bin first on PATH via /etc/profile.d/05-aok-native-bin.sh
+  would make zsh read it too, via /etc/zprofile
+  nu already uses /AOK/native/bash
 ```
 
 **Do this once per root.** The links live in the root's own `/usr/local`, and
@@ -104,6 +121,39 @@ sh /AOK/tools/native-links.sh /usr/local/bin
 That puts the links ahead of your distro's own `/usr/local/bin` entries too,
 which is more shadowing than the default, not less.
 
+## Colour
+
+The applets that paint their output — `ls`, `grep`, `ps`, `top`, `df`, `cal`,
+`watch`, `rm`'s confirmation prompt, the usage listing, and
+[md](md.md) — share one colour policy, so they all answer to the same
+switches:
+
+```sh
+NO_COLOR=1 ls          # no escape sequences from any of them
+TERM=dumb ls           # likewise; an unset TERM counts too
+```
+
+Colour is also dropped automatically when output is piped or redirected rather
+than going to a terminal, which is what you want inside a script without having
+to set anything.
+
+`ls` and `grep` take `--color` on top of that, and it is the stronger signal:
+
+| form | behaviour |
+|---|---|
+| `--color=never` | never colour — wins over everything |
+| `--color=always` | always colour — outranks `NO_COLOR` and `TERM` |
+| `--color=auto` | colour only on a terminal, and only if `NO_COLOR`/`TERM` allow |
+
+**`auto` is the default here**, unlike GNU `ls`, which defaults to no colour
+until you ask. A script that wants bytes rather than escapes should redirect,
+set `NO_COLOR=1`, or pass `--color=never` — and one that wants colour *through*
+a pipe needs `--color=always`.
+
+Screen clears, cursor positioning and terminal resets are not colour, and
+`NO_COLOR` does not disable them. That is what the variable means: a program
+should stop colouring, not stop drawing.
+
 ## Backing out
 
 ```sh
@@ -111,11 +161,17 @@ sh /AOK/tools/native-links.sh --remove
 ```
 
 That removes every link it owns, restores the login shell it saved, and deletes
-`/etc/profile.d/05-aok-native-bin.sh`. It only touches symlinks that resolve to
-`/AOK/native/smallclue` specifically, so anything of your own in the same
-directory — including a link you made to `/AOK/native/bash` by hand — is left
-alone. Pass the same directory you installed into if it was not the default. The
+`/etc/profile.d/05-aok-native-bin.sh`. It removes any symlink in that directory
+pointing **anywhere into `/AOK/native`** — not just SmallCLUE's applets, but the
+standalone programs too, and that includes a link you made to `/AOK/native/bash`
+or `/AOK/native/hx` by hand: the script now creates those itself, so it treats
+them as its own. A real file is never touched, nor is a symlink pointing
+anywhere outside `/AOK/native`, and only the top level of the directory is
+scanned. Keep a link you want to survive outside the link directory. Pass the same directory you installed into if it was not the default. The
 PATH change goes away at your next login.
+
+`--list` applies here too: `--list --remove` prints every link, file and shell
+change the removal would make, and makes none of them.
 
 For a single stubborn command, `--no-path` is the softer version: the links stay
 usable by full path, and nothing is shadowed.

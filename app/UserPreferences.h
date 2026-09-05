@@ -72,6 +72,29 @@ extern NSString *const kThemeBackgroundColor;
 @property BOOL shouldEnableCryptoAccel;
 @property BOOL shouldEnablePixAccel;
 @property BOOL shouldEnableExtraLocking;
+// Simulated swap (docs/simulated_swap_plan.md section 3.13). Paging guest
+// memory writes to the device's flash and occupies container space, so it is
+// not a thing to turn on for somebody: swap ships OFF, and the size is asked
+// for rather than derived from device RAM or free disk. Both halves matter --
+// swap runs for a launch only when shouldEnableSwap is YES *and* swapSizeMB is
+// greater than zero, so "enabled with no size chosen" is still off, and the
+// guest sees byte-for-byte what it sees today (SwapTotal 0, a header-only
+// /proc/swaps, swapon refusing). Both go across untouched:
+// ISHPublishSwapConfiguration in app/AppDelegate.m hands the pair to
+// swap_set_preference(), and swap_startup() in kernel/swap.c is the one place
+// that refuses an enable with no size -- and says so -- rather than this side
+// folding them together and losing the difference between "not asked for" and
+// "asked for and could not start".
+//
+// Read once per launch. Changing either takes effect at the next launch; a
+// running pager is deliberately not resizable in place.
+@property BOOL shouldEnableSwap;
+// 0 means "the user has not chosen a size", which is the registered default
+// and keeps swap off. Clamped to 0...ISHSwapMaxSizeMB on the way in AND on the
+// way out: the iOS Settings pane (app/Settings.bundle/Root.plist) writes this
+// key into NSUserDefaults with none of our code running, so the setter is not
+// the only writer and cannot be the only place the range is enforced.
+@property NSInteger swapSizeMB;
 @property BOOL shouldEnableLLMClient;
 @property (nonatomic) NSString *llmProvider;
 @property (nonatomic) NSString *llmServerURL;
@@ -93,6 +116,9 @@ extern NSString *const kThemeBackgroundColor;
 // collapsed in the transcript behind a "Thinking" disclosure instead of being shown
 // inline. The raw text is still stored and can be expanded and copied.
 @property BOOL llmHideThinking;
+// Gate for the Shortcuts "Run Command" App Intent (default YES). Off, the
+// action fails with an error naming this setting instead of running anything.
+@property BOOL shortcutsRunCommandsEnabled;
 @property (null_resettable) NSString *fontFamily;
 @property (readonly) NSString *fontFamilyUserFacingName;
 @property (readonly) UIFont *approximateFont;
@@ -114,7 +140,10 @@ extern NSString *const kThemeBackgroundColor;
 @property (nonatomic) NSString *customDnsServers;
 // When YES, new terminal sessions launched with the default "/bin/login -f root" command log in
 // as the unprivileged UID 1000 account instead, matching how a real Linux desktop is normally
-// used. Sessions with a customized launch command are unaffected.
+// used. Sessions with a customized launch command are unaffected. The headless command surfaces
+// (LLM chat's run_shell tool, the Shortcuts Run Command intent) and the Display applet's Wayland
+// session follow the same rule via su -- see +[AppDelegate headlessCommandAccountName] and
+// DisplayGuestSessionCommand. Session Shell / System Console surfaces stay root by design.
 @property BOOL shouldLoginAsDefaultUser;
 
 + (instancetype)shared;
@@ -132,6 +161,13 @@ extern NSString *const kThemeBackgroundColor;
 extern NSString *const kPreferenceLaunchCommandKey;
 extern NSString *const kPreferenceBootCommandKey;
 extern NSString *const kPreferenceInitialWindowKey;
+
+// The largest swap area the UI will offer or store, in MiB. 16 GiB: the slot
+// table costs 1 MiB per GiB of swap (docs/simulated_swap_plan.md section 3.14),
+// so this is 16 MiB of always-resident bookkeeping at the top of the range,
+// and the area is preallocated in the container, so a bigger number is a
+// bigger hole in the user's free space rather than a bigger win.
+extern const NSInteger ISHSwapMaxSizeMB;
 
 // "Open Everything as Default User" targets whatever account this rootfs already has at UID
 // 1000 (the conventional "first regular user" UID on Debian/Devuan/Alpine) -- no account is

@@ -8,9 +8,12 @@
 #endif
 #include "kernel/calls.h"
 #include "kernel/task.h"
+#include "kernel/swap.h"
+#include "fs/mem.h"
 #include "fs/proc.h"
 #include "fs/proc/net.h"
 #include "fs/dev.h"
+#include "kernel/sysvipc.h"
 #include "fs/devices.h"
 #include "fs/real.h"
 #include "platform/platform.h"
@@ -19,6 +22,12 @@
 #include "kernel/abi.h"
 #include "kernel/init.h"
 #include "kernel/hostinfo.h"
+// Last, deliberately: this header #defines POLL_* over the SIGPOLL si_code
+// constants glibc declares as an ENUM, so any system header pulled in after
+// it turns those enumerators into numeric literals. Clang on Darwin never
+// sees it; gcc on Linux fails the build outright. fs/proc.c orders it the
+// same way for the same reason.
+#include "fs/poll.h"
 
 extern int console_major;
 extern int console_minor;
@@ -320,7 +329,10 @@ static int proc_show_stat(struct proc_entry *UNUSED(entry), struct proc_data *bu
     struct timespec uptime_ts = {.tv_sec = btime.uptime_ticks / 100, .tv_nsec = btime.uptime_ticks % 100};
     struct timespec boot_time = timespec_subtract(timespec_now(CLOCK_REALTIME), uptime_ts);
     proc_printf(buf, "btime %ld\n", boot_time.tv_sec);
-    proc_printf(buf, "processes %d\n", alive_task_count);
+    // Cumulative, not the live count: Linux's "processes" is the number of
+    // forks since boot and only ever grows. See total_forks in kernel/task.h.
+    proc_printf(buf, "processes %"PRIu64"\n",
+            atomic_load_explicit(&total_forks, memory_order_relaxed));
     proc_printf(buf, "procs_running %d\n", alive_task_count - blocked_task_count);
     proc_printf(buf, "procs_blocked %d\n", blocked_task_count);
     proc_printf(buf, "softirq 0 0 0 0 0 0 0 0 0 0 0\n");
@@ -329,7 +341,12 @@ static int proc_show_stat(struct proc_entry *UNUSED(entry), struct proc_data *bu
 }
 
 static void show_kb(struct proc_data *buf, const char *name, uint64_t value) {
-    proc_printf(buf, "%s%8"PRIu64" kB\n", name, value / 1000);
+    // /proc/meminfo's "kB" is 1024 bytes, not 1000 -- Linux prints
+    // pages << (PAGE_SHIFT - 10). Dividing by 1000 overstated every figure by
+    // 2.4% and put MemTotal at odds with the guest's own sysinfo(2), which
+    // does use 1024. Anything comparing the two (or trusting free(1) against a
+    // cgroup limit) saw memory that does not exist.
+    proc_printf(buf, "%s%8"PRIu64" kB\n", name, value / 1024);
 }
 
 struct mem_page_class_totals {
@@ -464,24 +481,70 @@ DirectMap1G:           0 kB
     show_kb(buf, "MemAvailable:   ", usage.available);
     show_kb(buf, "Buffers:        ", 0);
     show_kb(buf, "Cached:         ", usage.cached);
-    show_kb(buf, "MemShared:      ", usage.free);
     show_kb(buf, "Active:         ", usage.active);
     show_kb(buf, "Inactive:       ", usage.inactive);
-    show_kb(buf, "SwapCached:     ", 0);
+    // The three swap keys, and the rule they encode (section 3.12): a kernel
+    // never reclaims anonymous pages without swap, so SwapTotal > 0 if and only
+    // if AOK ITSELF moves guest pages to storage -- and in every state the
+    // host's own counters must not leak into the guest. This file used to print
+    // XNU's whole-machine Swapins and Swapouts beside "SwapTotal: 0 kB", ten
+    // gigabytes paged out of a machine with no swap, which is a state no Linux
+    // can produce; see the long comment further down where those were removed.
+    //
+    // All three are 0 while swap is off -- byte-for-byte the lines this file
+    // printed before the pager existed. That is a contract, not a fallback:
+    // swap ships off (section 3.13), so the disabled column IS the default
+    // guest surface and it has to stay indistinguishable from the one every
+    // existing guest already knows.
+    //
+    // swap_get_stats reads the pager's own slot accounting and costs no walk,
+    // so this file is no more expensive than it was.
+    struct swap_stats swap;
+    swap_get_stats(&swap);
+    show_kb(buf, "SwapCached:     ", swap.cached_bytes);
     // Buffers/Dirty/Writeback/Slab have no honest analog: iSH has no Linux-style
     // unified page cache it controls, and no kernel slab allocator to account for.
     show_kb(buf, "Shmem:          ", page_totals.shmem_bytes);
-    show_kb(buf, "SwapTotal:      ", 0);
-    show_kb(buf, "SwapFree:       ", 0);
+    show_kb(buf, "SwapTotal:      ", swap.total_bytes);
+    show_kb(buf, "SwapFree:       ", swap.free_bytes);
     show_kb(buf, "Dirty:          ", 0);
     show_kb(buf, "Writeback:      ", 0);
     show_kb(buf, "AnonPages:      ", page_totals.anon_bytes);
     show_kb(buf, "Mapped:         ", page_totals.mapped_bytes);
     show_kb(buf, "Slab:           ", 0);
-    // Stuff that doesn't map elsehwere
-    show_kb(buf, "Swapins:        ", usage.swapins);
-    show_kb(buf, "Swapouts:       ", usage.swapouts);
-    show_kb(buf, "WireCount:      ", usage.wirecount);
+    // Four keys used to follow, three of them under a comment calling them
+    // "stuff that doesn't map elsewhere": MemShared, then Swapins, Swapouts and
+    // WireCount. None
+    // of them is a key /proc/meminfo has. MemShared was a 2.4-era key that
+    // Linux stopped emitting in 2.6, and the other three have never existed on
+    // any Linux; a guest asking what memory it has cannot be helped by a key it
+    // has no parser for.
+    //
+    // Worse, three of them were not this guest's numbers at all. Swapins,
+    // Swapouts and WireCount come from host_statistics64(HOST_VM_INFO64) in
+    // platform/darwin.c's get_mem_usage, so they describe the whole Mac -- and
+    // the first two are lifetime counters, not a current state. Measured in an
+    // arm64 Alpine guest on this machine: "Swapins: 2722688 kB" and "Swapouts:
+    // 10541184 kB" in a kernel whose very next lines say "SwapTotal: 0 kB" and
+    // "SwapFree: 0 kB". That pair is not merely useless, it is a machine that
+    // cannot exist: ten gigabytes paged out of a system with no swap. AOK is
+    // one app process with a jetsam budget; whole-machine figures do not belong
+    // in its guest's /proc at all, and none of them will until AOK does its own
+    // paging and can count it (docs/simulated_swap_plan.md).
+    //
+    // MemShared had a second defect on top of that one: its value was
+    // usage.free, a copy of the MemFree line four rows up rather than any
+    // shared-memory figure. The honest analog is Shmem, which is already
+    // printed above from AOK's own P_SHARED page count -- and Shmem is where
+    // busybox top's "shrd" column falls back to once MemShared is gone, which
+    // is what it reads on a real Linux. Before this change that column showed
+    // the free-memory figure.
+    //
+    // Deleting a key is safe in a way that changing one is not: every consumer
+    // checked parses the keys it finds and leaves the rest at zero -- procps-ng
+    // free(1) and busybox free/top all do, and "not reported" is a state Linux
+    // itself produces for every optional key (Shmem, KReclaimable and Percpu
+    // are all absent on kernels or configs that lack them).
     return 0;
 }
 
@@ -512,9 +575,45 @@ static int proc_show_vmstat(struct proc_entry *UNUSED(entry), struct proc_data *
             (atomic_load_explicit(&io_disk_read_bytes, memory_order_relaxed) / 1024));
     proc_printf(buf, "pgpgout %llu\n", (unsigned long long)
             (atomic_load_explicit(&io_disk_write_bytes, memory_order_relaxed) / 1024));
-    proc_printf(buf, "pswpin %"PRIu64"\n", usage.swapins / 4096);
-    proc_printf(buf, "pswpout %"PRIu64"\n", usage.swapouts / 4096);
+    // pswpin/pswpout used to be printed here as usage.swapins / 4096 and
+    // usage.swapouts / 4096. Both halves of that were wrong. The counters are
+    // XNU's whole-machine lifetime page-in/page-out totals (see the meminfo
+    // comment above and platform/darwin.c), so they describe the Mac and not
+    // the guest, and the divisor was the GUEST page size applied to a byte
+    // count derived from the HOST's 16 KiB pages, so even the unit was
+    // invented.
+    //
+    // vmstat(1) turns the delta between two reads of these into its si/so
+    // columns, which is how a guest that has never paged anything came to
+    // report paging. Measured with procps-ng vmstat in the glibc Devuan root:
+    // the first row read "si 2722752  so 10541184" -- 2.7 GB/s in and 10.5 GB/s
+    // out -- on the same screen as free(1)'s "Swap: 0 0 0". An absent key
+    // reads as 0 to procps, which parses what it finds into a hash and objects
+    // only to a wholly empty file (see the comment at the top of this
+    // function), and 0 is the honest figure for a kernel with no swap.
+    //
+    // The pager of docs/simulated_swap_plan.md now exists, so the two keys come
+    // back -- fed by AOK's OWN counters, in 4 KiB guest pages, and only while
+    // swap is enabled. Leaving them out entirely with swap off is the
+    // deliberate half: section 3.13 requires that surface to stay byte-identical
+    // to the one every existing guest already knows, and an absent key reads as
+    // 0 to procps for the reason given just above. Linux prints them
+    // unconditionally; a guest tool that demands the key rather than defaulting
+    // it is the price of that choice, and no consumer checked here does.
+    struct swap_stats swap;
+    swap_get_stats(&swap);
+    if (swap.enabled) {
+        proc_printf(buf, "pswpin %llu\n", (unsigned long long) swap.pswpin_pages);
+        proc_printf(buf, "pswpout %llu\n", (unsigned long long) swap.pswpout_pages);
+    }
     proc_printf(buf, "pgfault 0\n");
+    // pgmajfault stays 0 even with swap on, and deliberately rather than being
+    // wired to pswpin: a major fault is per-TASK, and the counter that would
+    // feed it (task->majflt, beside the existing task->minflt) does not exist
+    // yet -- which is also why /proc/<pid>/stat's fault fields and getrusage's
+    // ru_majflt are still 0. Publishing a whole-machine major-fault figure here
+    // while every per-process one read 0 is exactly the internally inconsistent
+    // surface section 11 records four rejected review rounds for.
     proc_printf(buf, "pgmajfault 0\n");
     return 0;
 }
@@ -569,6 +668,11 @@ static int proc_readlink_self(struct proc_entry *UNUSED(entry), char *buf) {
     return 0;
 }
 
+// /proc/thread-self points at the CALLING THREAD's directory
+// (<tgid>/task/<tid>), where /proc/self points at the process. A threaded
+// program that wants its own stack, status or comm -- not the leader's --
+// has no other way to name itself, and glibc's sched_getcpu and several
+// tracing libraries open it by name. It did not exist at all.
 static int proc_readlink_thread_self(struct proc_entry *UNUSED(entry), char *buf) {
     // Linux points this at "<tgid>/task/<tid>", and it exists because its
     // /proc/self is the thread GROUP: a per-thread write to
@@ -578,6 +682,190 @@ static int proc_readlink_thread_self(struct proc_entry *UNUSED(entry), char *buf
     // fallbacks resolve -- but a missing entry costs a failed lookup on a path
     // Android userspace takes constantly.
     snprintf(buf, MAX_PATH, "%d/task/%d", current->tgid, current->pid);
+    return 0;
+}
+
+// /proc/modules. There are no loadable modules here and never will be, which
+// is a real answer: Linux prints an empty file on a kernel with none loaded,
+// and lsmod prints its header and nothing else. The file's ABSENCE is what
+// lsmod cannot handle -- it fails with "libkmod: could not open moddep".
+static int proc_show_modules(struct proc_entry *UNUSED(entry), struct proc_data *UNUSED(buf)) {
+    return 0;
+}
+
+// /proc/swaps. The header alone, which is exactly what Linux shows on a system
+// with no swap configured. swapon --show reads it; free(1) does not, taking its
+// Swap row from /proc/meminfo.
+//
+// /proc/swaps. On Linux this and /proc/meminfo's SwapTotal agree BY
+// CONSTRUCTION -- si_swapinfo() and swap_show() walk the same swap_info[]
+// array, so SwapTotal > 0 with no rows here is a state the kernel cannot
+// produce. It was AOK's state until /dev/aokswap0 existed to be named.
+//
+// The format is swap_show()'s, reproduced exactly (captured with `cat -A` from
+// Ubuntu 24.04, kernel 6.8, aarch64):
+//
+//   path, then (40 - len) spaces if len < 40, else exactly ONE space
+//   "partition" or "file\t"   -- partition iff the backing file is a block dev
+//   "\t", size in KiB, "\t", and a SECOND "\t" only when size < 10000000
+//   used in KiB, "\t", and a second "\t" only when used < 10000000
+//   priority, "\n"
+//
+// Those two conditional tabs are real and they matter here: the area can be up
+// to 16 GiB, and above 10000000 KiB (~9.54 GiB) Linux drops them.
+//
+// Size is K(si->pages) -- the area MINUS its one-page header. AOK matches that
+// already without doing anything: swap_area_bytes() excludes the reserved
+// slot 0, so this row, SwapTotal and the block device's capacity are all the
+// same number and cannot drift.
+//
+// Priority -2 because Linux's first auto-priority area gets -2 (`p->prio =
+// --least_priority` from an initial -1), verified with two areas: -2 then -3.
+//
+// NOT gated on "swap is enabled". The row follows the AREA, because
+// swap_disable_locked deliberately keeps the area alive while slots are still
+// out -- so gating on `enabled` would make the row vanish while swap was still
+// answering faults, which is precisely the contradiction this file exists to
+// stop telling.
+static int proc_show_swaps(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    proc_printf(buf, "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n");
+    struct swap_stats st;
+    swap_get_stats(&st);
+    if (st.total_bytes == 0)
+        return 0;               // no area: no rows, and SwapTotal is 0 too
+    static const char path[] = "/dev/aokswap0";
+    unsigned long long size_kb = st.total_bytes / 1024;
+    unsigned long long used_kb = (st.total_bytes - st.free_bytes) / 1024;
+    size_t len = sizeof(path) - 1;
+    proc_printf(buf, "%s", path);
+    if (len < 40)
+        for (size_t i = len; i < 40; i++)
+            proc_printf(buf, " ");
+    else
+        proc_printf(buf, " ");
+    // "partition", not "file": Linux prints that iff the swap file's inode is a
+    // block device, and ours is one.
+    proc_printf(buf, "partition\t%llu%s\t%llu%s\t%d\n",
+                size_kb, size_kb < 10000000ULL ? "\t" : "",
+                used_kb, used_kb < 10000000ULL ? "\t" : "",
+                -2);
+    return 0;
+}
+
+// /proc/partitions. The guest has no block devices to partition; the header
+// alone is what Linux shows for a system with none, and it is what fdisk -l
+// and lsblk parse.
+static int proc_show_partitions(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    proc_printf(buf, "major minor  #blocks  name\n\n");
+    return 0;
+}
+
+// /proc/devices: the character and block majors that are actually dispatched.
+// Built from the same table that publishes /dev, so it cannot drift from what
+// is really there. MAKEDEV and udev-style tooling read it to decide what
+// nodes to create, and a missing file makes them create nothing.
+static const char *proc_dev_major_name(int major) {
+    switch (major) {
+        case MEM_MAJOR: return "mem";
+        case TTY_CONSOLE_MAJOR: return "tty";
+        case TTY_ALTERNATE_MAJOR: return "ttyprintk";
+        case MISC_MAJOR: return "misc";
+        case TTY_PSEUDO_MASTER_MAJOR: return "ptm";
+        case TTY_PSEUDO_SLAVE_MAJOR: return "pts";
+        case DYN_DEV_MAJOR: return "ish";
+        case DEV_RTC_MAJOR: return "rtc";
+        case AOKSWAP_MAJOR: return "aokswap";
+        default: return "unknown";
+    }
+}
+
+static int proc_show_devices(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    proc_printf(buf, "Character devices:\n");
+    bool seen[256] = {};
+    for (size_t i = 0; i < dev_standard_nodes_count; i++) {
+        int major = dev_standard_nodes[i].major;
+        // Block entries belong under the other header, further down. Printing
+        // them here would have /proc/devices claim major 241 is a character
+        // device -- a lie manufactured by the very change that exists to remove
+        // one, and one that MAKEDEV/udev-style tooling reads.
+        if (dev_standard_nodes[i].is_block)
+            continue;
+        if (major < 0 || major > 255 || seen[major])
+            continue;
+        seen[major] = true;
+        proc_printf(buf, "%3d %s\n", major, proc_dev_major_name(major));
+    }
+    // The pty majors have no /dev node of their own (devpts makes them on
+    // demand), so they are not in the table above, but they are dispatched
+    // and a caller enumerating character devices needs to see them.
+    static const int extra[] = { TTY_PSEUDO_MASTER_MAJOR, TTY_PSEUDO_SLAVE_MAJOR };
+    for (size_t i = 0; i < sizeof extra / sizeof extra[0]; i++)
+        if (!seen[extra[i]]) {
+            seen[extra[i]] = true;
+            proc_printf(buf, "%3d %s\n", extra[i], proc_dev_major_name(extra[i]));
+        }
+    proc_printf(buf, "\nBlock devices:\n");
+    bool seen_block[256] = {};
+    for (size_t i = 0; i < dev_standard_nodes_count; i++) {
+        if (!dev_standard_nodes[i].is_block)
+            continue;
+        int major = dev_standard_nodes[i].major;
+        if (major < 0 || major > 255 || seen_block[major])
+            continue;
+        seen_block[major] = true;
+        proc_printf(buf, "%3d %s\n", major, proc_dev_major_name(major));
+    }
+    return 0;
+}
+
+// /proc/cgroups: the v2 controllers this kernel presents, in the v1-shaped
+// table Linux still writes here. systemd reads it during startup to decide
+// which controllers exist.
+static int proc_show_cgroups(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    proc_printf(buf, "#subsys_name\thierarchy\tnum_cgroups\tenabled\n");
+    static const char *const controllers[] = { "cpu", "io", "memory", "pids" };
+    for (size_t i = 0; i < sizeof controllers / sizeof controllers[0]; i++)
+        proc_printf(buf, "%s\t0\t1\t1\n", controllers[i]);
+    return 0;
+}
+
+static int proc_show_sysvipc_sem(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    proc_sysvipc_show_sem(buf);
+    return 0;
+}
+
+static int proc_show_sysvipc_msg(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    proc_sysvipc_show_msg(buf);
+    return 0;
+}
+
+// System V shared memory is not implemented here, so the file is its header
+// alone -- which is what Linux shows when no segment exists, and what `ipcs
+// -m` prints. The header is the part ipcs needs to parse the file at all.
+static int proc_show_sysvipc_shm(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    proc_printf(buf, "%10s %10s %-10s %20s %5s %5s %6s %5s %5s %5s %5s %10s %10s %10s %20s %20s\n",
+                "key", "shmid", "perms", "size", "cpid", "lpid", "nattch",
+                "uid", "gid", "cuid", "cgid", "atime", "dtime", "ctime",
+                "rss", "swap");
+    return 0;
+}
+
+static struct proc_children proc_sysvipc_children = PROC_CHILDREN({
+    {"msg", .show = proc_show_sysvipc_msg},
+    {"sem", .show = proc_show_sysvipc_sem},
+    {"shm", .show = proc_show_sysvipc_shm},
+});
+
+// /proc/interrupts. There is no interrupt controller behind a usermode
+// kernel, so the honest answer is the CPU header and no lines -- the shape
+// Linux gives, with nothing claimed. It was absent, and absent is what breaks
+// a reader: procps and several monitoring agents treat a missing file as an
+// error rather than as "no interrupts".
+static int proc_show_interrupts(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    unsigned cpus = get_cpu_count();
+    for (unsigned i = 0; i < cpus; i++)
+        proc_printf(buf, "           CPU%u", i);
+    proc_printf(buf, "\n");
     return 0;
 }
 
@@ -600,7 +888,16 @@ static void proc_print_escaped(struct proc_data *buf, const char *str) {
 
 int proc_show_mounts(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     struct mount *mount;
+    // The mounts list is mutated under mounts_lock (fs/mount.c) and was walked
+    // here without it, so a concurrent mount or umount could free the entry
+    // this loop was standing on -- a use-after-free reachable from an ordinary
+    // `cat /proc/mounts`, and systemd reads mountinfo on every mount change.
+    lock(&mounts_lock, 0);
     list_for_each_entry(&mounts, mount, mounts) {
+        // A detached fsmount() has no mountpoint on Linux and appears in no
+        // listing until move_mount places it. See struct mount.
+        if (mount->detached)
+            continue;
         const char *point = mount->point;
         if (point[0] == '\0')
             point = "/";
@@ -628,13 +925,17 @@ int proc_show_mounts(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
             proc_printf_comma(buf, &at_start, "%s", mount->info);
         proc_printf(buf, " 0 0\n");
     };
+    unlock(&mounts_lock);
     return 0;
 }
 
+// Caller holds mounts_lock, like proc_mountinfo_parent_id below.
 static int proc_mountinfo_id(struct mount *target) {
-    return mount_id(target);
+    return mount_id_locked(target);
 }
 
+// Caller holds mounts_lock: this walks the same list its caller is iterating,
+// so it must not take the lock again.
 static int proc_mountinfo_parent_id(struct mount *target) {
     const char *point = target->point;
     if (point[0] == '\0')
@@ -658,7 +959,14 @@ static int proc_mountinfo_parent_id(struct mount *target) {
 
 int proc_show_mountinfo(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     struct mount *mount;
+    // See proc_show_mounts. Held across proc_mountinfo_parent_id's own walk of
+    // the list, which is why that one must not lock.
+    lock(&mounts_lock, 0);
     list_for_each_entry(&mounts, mount, mounts) {
+        // Same as proc_show_mounts: a detached fsmount() is not in any mount
+        // listing until move_mount gives it a point.
+        if (mount->detached)
+            continue;
         const char *point = mount->point;
         if (point[0] == '\0')
             point = "/";
@@ -687,25 +995,51 @@ int proc_show_mountinfo(struct proc_entry *UNUSED(entry), struct proc_data *buf)
             proc_printf(buf, ",%s", mount->info);
         proc_printf(buf, "\n");
     }
+    unlock(&mounts_lock);
     return 0;
+}
+
+// /proc/kmsg: the kernel log as a stream, which is the file the older syslog
+// daemons open ("cannot open kernel log (/proc/kmsg)" when it is missing).
+// Linux makes it root-only and CONSUMING -- each read takes messages out of
+// the buffer -- and blocks when there is nothing new. This shares the same
+// stream as /dev/kmsg (fs/mem.c) and is per-reader rather than consuming, so
+// two readers each see everything instead of racing for it. That is strictly
+// friendlier and nothing depends on the destruction; the blocking is what
+// matters, because a daemon's whole loop is this read.
+static ssize_t proc_kmsg_pread(struct proc_entry *UNUSED(entry), struct proc_data *buf, off_t off, int flags) {
+    unsigned long pos = (unsigned long) off;
+    return kmsg_stream_read(&pos, buf->data, buf->capacity, (flags & O_NONBLOCK_) != 0);
+}
+
+static int proc_kmsg_poll(struct proc_entry *UNUSED(entry), off_t off) {
+    return kmsg_stream_poll((unsigned long) off);
 }
 
 // in alphabetical order
 struct proc_dir_entry proc_root_entries[] = {
+    {"cgroups", .show = proc_show_cgroups},
     {"cmdline", .show = proc_show_cmdline},
     {"consoles", .show = proc_show_consoles},
     {"cpuinfo", .show = proc_show_cpuinfo},
+    {"devices", .show = proc_show_devices},
     {"diskstats", .show = proc_show_diskstats},
     {"filesystems", .show = proc_show_filesystems},
+    {"interrupts", .show = proc_show_interrupts},
     {"ish", S_IFDIR, .children = &proc_ish_children},
+    {"kmsg", S_IFREG | 0400, .pread = proc_kmsg_pread, .poll = proc_kmsg_poll},
     {"loadavg", .show = proc_show_loadavg},
     {"meminfo", .show = proc_show_meminfo},
     {"mountinfo", .show = proc_show_mountinfo},
     {"mounts", .show = proc_show_mounts},
     {"net", S_IFDIR, .children = &proc_net_children},
+    {"modules", .show = proc_show_modules},
+    {"partitions", .show = proc_show_partitions},
     {"self", S_IFLNK, .readlink = proc_readlink_self},
     {"stat", .show = proc_show_stat},
+    {"swaps", .show = proc_show_swaps},
     {"sys", S_IFDIR, .children = &proc_sys_children},
+    {"sysvipc", S_IFDIR, .children = &proc_sysvipc_children},
     {"thread-self", S_IFLNK, .readlink = proc_readlink_thread_self},
     {"uptime", .show = proc_show_uptime},
     {"version", .show = proc_show_version},
@@ -730,22 +1064,32 @@ static void proc_root_refresh_pid_snapshot(struct proc_entry *entry) {
     complex_lockt(&pids_lock, 0);
     struct pid *pid_entry;
     list_for_each_entry(&alive_pids_list, pid_entry, alive) {
-        struct task *task = pid_entry->task;
-        if (task == NULL || task->zombie)
+        // Zombies are listed too: an unreaped process still exists, still owns
+        // its pid, and ps must be able to show it.
+        if (pid_entry->task == NULL)
             continue;
         used++;
     }
     unlock(&pids_lock);
+
+    // Room for the synthetic kernel threads too (kernel/task.c): they have no
+    // task in alive_pids_list, so the walk above cannot see them, but /proc has
+    // to list them or nothing will look.
+    unsigned nkthreads = 0;
+    while (pid_kthread_at(nkthreads) != 0)
+        nkthreads++;
+    used += nkthreads;
 
     pids = calloc(used ? used : 1, sizeof(*pids));
     if (pids == NULL)
         return;
 
     unsigned filled = 0;
+    for (unsigned k = 0; k < nkthreads && filled < used; k++)
+        pids[filled++] = (dword_t) pid_kthread_at(k);
     complex_lockt(&pids_lock, 0);
     list_for_each_entry(&alive_pids_list, pid_entry, alive) {
-        struct task *task = pid_entry->task;
-        if (task == NULL || task->zombie)
+        if (pid_entry->task == NULL)
             continue;
         if (filled >= used)
             break;
@@ -810,6 +1154,14 @@ enum sysfs_node_kind {
     sysfs_devices,
     sysfs_system,
     sysfs_cpu,
+    sysfs_memory,
+    sysfs_memory_block_size,
+    sysfs_memory_block,
+    sysfs_memory_block_state,
+    sysfs_memory_block_removable,
+    sysfs_memory_block_valid_zones,
+    sysfs_memory_block_phys_index,
+    sysfs_memory_block_phys_device,
     sysfs_online,
     sysfs_possible,
     sysfs_present,
@@ -847,10 +1199,18 @@ enum sysfs_node_kind {
     sysfs_cgroup,
     sysfs_cgroup_unified,
     sysfs_cgroup_elogind,
+    sysfs_dev,
+    sysfs_dev_block,
+    sysfs_dev_char,
+    sysfs_dev_block_link,
     sysfs_block,
     sysfs_block_dev_dir,
     sysfs_block_dev_devno,
     sysfs_block_dev_stat,
+    sysfs_block_dev_size,
+    sysfs_block_dev_removable,
+    sysfs_block_dev_ro,
+    sysfs_block_dev_hidden,
     sysfs_class,
     sysfs_class_block,
     sysfs_class_block_dev,
@@ -898,6 +1258,9 @@ struct sysfs_node_desc {
 
 #define SYSFS_DIR (S_IFDIR | 0555)
 #define SYSFS_REG (S_IFREG | 0444)
+// Linux gives every sysfs symlink 0777; nothing checks it, but a link
+// reporting a directory's 0555 looks like a link nobody may follow.
+#define SYSFS_LNK (S_IFLNK | 0777)
 
 static const struct sysfs_node_desc sysfs_node_descs[] = {
     {sysfs_root, sysfs_root, "", SYSFS_DIR},
@@ -908,6 +1271,24 @@ static const struct sysfs_node_desc sysfs_node_descs[] = {
 
     {sysfs_system, sysfs_devices, "system", SYSFS_DIR},
     {sysfs_cpu, sysfs_system, "cpu", SYSFS_DIR},
+
+    // /sys/devices/system/memory: the memory-hotplug view of RAM, divided
+    // into fixed-size blocks. lsmem is built entirely on it and said
+    //
+    //     lsmem: cannot open /sys/devices/system/memory: No such file or directory
+    //
+    // Every block is online and none is removable, which is the truth: guest
+    // memory is the app's address space and there is no mechanism by which a
+    // piece of it could be taken offline.
+    {sysfs_memory, sysfs_system, "memory", SYSFS_DIR},
+    {sysfs_memory_block_size, sysfs_memory, "block_size_bytes", SYSFS_REG},
+    {sysfs_memory_block, sysfs_memory, NULL, SYSFS_DIR},
+
+    {sysfs_memory_block_state, sysfs_memory_block, "state", SYSFS_REG},
+    {sysfs_memory_block_removable, sysfs_memory_block, "removable", SYSFS_REG},
+    {sysfs_memory_block_valid_zones, sysfs_memory_block, "valid_zones", SYSFS_REG},
+    {sysfs_memory_block_phys_index, sysfs_memory_block, "phys_index", SYSFS_REG},
+    {sysfs_memory_block_phys_device, sysfs_memory_block, "phys_device", SYSFS_REG},
 
     {sysfs_online, sysfs_cpu, "online", SYSFS_REG},
     {sysfs_possible, sysfs_cpu, "possible", SYSFS_REG},
@@ -955,6 +1336,29 @@ static const struct sysfs_node_desc sysfs_node_descs[] = {
     {sysfs_block_dev_dir, sysfs_block, GUEST_DISK_NAME, SYSFS_DIR},
     {sysfs_block_dev_devno, sysfs_block_dev_dir, "dev", SYSFS_REG},
     {sysfs_block_dev_stat, sysfs_block_dev_dir, "stat", SYSFS_REG},
+    // The four attributes lsblk reads about a device once it has found it.
+    // Without `size` it printed "1638P" -- not a refusal, a number, and a
+    // wrong one, which is the failure mode worth avoiding most.
+    {sysfs_block_dev_size, sysfs_block_dev_dir, "size", SYSFS_REG},
+    {sysfs_block_dev_removable, sysfs_block_dev_dir, "removable", SYSFS_REG},
+    {sysfs_block_dev_ro, sysfs_block_dev_dir, "ro", SYSFS_REG},
+    {sysfs_block_dev_hidden, sysfs_block_dev_dir, "hidden", SYSFS_REG},
+
+    // /sys/dev/{block,char}: the device tree indexed by major:minor rather
+    // than by name. lsblk starts here rather than at /sys/block -- it builds
+    // its list by opening /sys/dev/block/<maj>:<min> and reading the LINK to
+    // learn the device's name -- and gave up outright without it:
+    //
+    //     lsblk: failed to access sysfs directory: /sys/dev/block
+    //
+    // char/ is present and empty because that is what AOK can honestly say:
+    // it models no character devices in sysfs at all, and /sys/class does not
+    // list them either. An absent directory would be a different claim, and
+    // the wrong one -- Linux always has both.
+    {sysfs_dev, sysfs_root, "dev", SYSFS_DIR},
+    {sysfs_dev_block, sysfs_dev, "block", SYSFS_DIR},
+    {sysfs_dev_char, sysfs_dev, "char", SYSFS_DIR},
+    {sysfs_dev_block_link, sysfs_dev_block, NULL, SYSFS_LNK},
 
     // /sys/class exists on every Linux system, and its absence is not cosmetic.
     // Devuan's /etc/init.d/eudev tests `[ ! -d /sys/class/ ]` and reports
@@ -1022,6 +1426,29 @@ static inline struct sysfs_node sysfs_decode_node(void *value) {
 
 static struct sysfs_node sysfs_node_make(enum sysfs_node_kind kind, int cpu, int index) {
     return (struct sysfs_node) {.kind = kind, .cpu = cpu, .index = index};
+}
+
+// Linux divides memory into fixed-size blocks for hotplug purposes and
+// reports the size, in hex, in block_size_bytes. 128 MiB is what x86_64 and
+// arm64 both use, and lsmem's whole output is arithmetic on it.
+#define SYSFS_MEMORY_BLOCK_BYTES (128ULL * 1024 * 1024)
+
+// How many blocks the guest's RAM comes to, rounded up: a machine whose
+// memory is not a whole number of blocks still has to account for the last
+// partial one, and Linux rounds the same way.
+static int sysfs_memory_block_count(void) {
+    struct mem_usage usage = get_mem_usage();
+    uint64_t total = usage.total;
+    if (total == 0)
+        return 1;
+    uint64_t blocks = (total + SYSFS_MEMORY_BLOCK_BYTES - 1) / SYSFS_MEMORY_BLOCK_BYTES;
+    if (blocks < 1)
+        blocks = 1;
+    // Same 12-bit ceiling the cpu number is held to; 4094 blocks is 511 GiB,
+    // far past any device this runs on.
+    if (blocks > 4094)
+        blocks = 4094;
+    return (int) blocks;
 }
 
 static int sysfs_cpu_count(void) {
@@ -1108,6 +1535,8 @@ static int sysfs_node_multiplicity(enum sysfs_node_kind kind) {
         return sysfs_cpu_count();
     if (kind == sysfs_net_dir)
         return sysfs_net_count();
+    if (kind == sysfs_memory_block)
+        return sysfs_memory_block_count();
     if (kind == sysfs_cache_index) {
         struct sysfs_cache_desc descs[3];
         return sysfs_cache_descs(descs);
@@ -1116,8 +1545,13 @@ static int sysfs_node_multiplicity(enum sysfs_node_kind kind) {
 }
 
 static bool sysfs_node_name(struct sysfs_node node, char *buf, size_t bufsize) {
+    if (node.kind == sysfs_dev_block_link)
+        return snprintf(buf, bufsize, "%d:%d",
+                        GUEST_DISK_MAJOR, GUEST_DISK_MINOR) >= 0;
     if (node.kind == sysfs_cpu_dir)
         return snprintf(buf, bufsize, "cpu%d", node.cpu) >= 0;
+    if (node.kind == sysfs_memory_block)
+        return snprintf(buf, bufsize, "memory%d", node.cpu) >= 0;
     if (node.kind == sysfs_net_dir) {
         struct net_iface_stats iface;
         if (!sysfs_net_iface_at(node.cpu, &iface))
@@ -1176,6 +1610,21 @@ static bool sysfs_lookup_child(struct sysfs_node parent, const char *name, size_
             continue;
         }
 
+        // Generated name: a major:minor pair. There is nothing to parse an
+        // index out of -- one device means one name -- so it is produced and
+        // compared, the same way an interface name is above.
+        if (desc->kind == sysfs_dev_block_link) {
+            struct sysfs_node candidate =
+                sysfs_node_make(desc->kind, parent.cpu, parent.index);
+            char devno[32];
+            if (!sysfs_node_name(candidate, devno, sizeof(devno)))
+                continue;
+            if (strlen(devno) != namelen || strncmp(devno, name, namelen) != 0)
+                continue;
+            *child_out = candidate;
+            return true;
+        }
+
         // Generated name: cpuN or indexN.
         char scratch[32];
         if (namelen >= sizeof(scratch))
@@ -1185,12 +1634,13 @@ static bool sysfs_lookup_child(struct sysfs_node parent, const char *name, size_
 
         int n = -1;
         int consumed = 0;
-        const char *prefix = desc->kind == sysfs_cpu_dir ? "cpu%d%n" : "index%d%n";
+        const char *prefix = desc->kind == sysfs_cpu_dir ? "cpu%d%n" :
+                             desc->kind == sysfs_memory_block ? "memory%d%n" : "index%d%n";
         if (sscanf(scratch, prefix, &n, &consumed) != 1 || consumed != (int) namelen)
             continue;
         if (n < 0 || n >= sysfs_node_multiplicity(desc->kind))
             continue;
-        if (desc->kind == sysfs_cpu_dir)
+        if (desc->kind == sysfs_cpu_dir || desc->kind == sysfs_memory_block)
             *child_out = sysfs_node_make(desc->kind, n, parent.index);
         else
             *child_out = sysfs_node_make(desc->kind, parent.cpu, n);
@@ -1257,6 +1707,27 @@ static size_t sysfs_format_cpulist(char *buf, size_t bufsize, int first, int las
 // Real Linux keeps this at /sys/block/<dev>/stat: the same 11 diskstats
 // fields as /proc/diskstats, minus the leading major/minor/name -- backed by
 // the same realfs_io_stats counters as proc_show_diskstats.
+// The guest disk's size in 512-byte sectors, which is the unit
+// /sys/block/<dev>/size is always in.
+//
+// AOK's sda is one synthetic device standing for all of the guest's storage,
+// so its size is the root filesystem's -- the same number df prints, and the
+// only honest answer available. A device that reported nothing here made
+// lsblk invent one.
+static size_t sysfs_guest_disk_size_format(char *buf, size_t bufsize) {
+    uint64_t sectors = 0;
+    char root_path[] = "/";
+    struct mount *root = mount_find(root_path);
+    if (root != NULL) {
+        struct statfsbuf stat;
+        memset(&stat, 0, sizeof(stat));
+        if (mount_statfs(root, &stat) == 0 && stat.bsize > 0)
+            sectors = stat.blocks * (uint64_t) stat.bsize / 512;
+        mount_release(root);
+    }
+    return snprintf(buf, bufsize, "%"PRIu64"\n", sectors);
+}
+
 static size_t sysfs_guest_disk_stat_format(char *buf, size_t bufsize) {
     uint64_t read_ops = atomic_load_explicit(&realfs_io_stats.read_ops, memory_order_relaxed);
     uint64_t read_sectors = atomic_load_explicit(&realfs_io_stats.read_bytes, memory_order_relaxed) / 512;
@@ -1374,9 +1845,34 @@ static size_t sysfs_file_data(struct sysfs_node node, char *buf, size_t bufsize)
             return sysfs_net_file_data(node, buf, bufsize);
 
         case sysfs_block_dev_devno:
-            return snprintf(buf, bufsize, "8:0\n");
+            return snprintf(buf, bufsize, "%d:%d\n",
+                            GUEST_DISK_MAJOR, GUEST_DISK_MINOR);
         case sysfs_block_dev_stat:
             return sysfs_guest_disk_stat_format(buf, bufsize);
+        case sysfs_memory_block_size:
+            // Hex, no 0x, exactly as Linux writes it.
+            return snprintf(buf, bufsize, "%llx\n",
+                            (unsigned long long) SYSFS_MEMORY_BLOCK_BYTES);
+        case sysfs_memory_block_state:
+            return snprintf(buf, bufsize, "online\n");
+        case sysfs_memory_block_removable:
+            return snprintf(buf, bufsize, "0\n");
+        case sysfs_memory_block_valid_zones:
+            // What Devuan reports for a block that cannot move between zones.
+            return snprintf(buf, bufsize, "none\n");
+        case sysfs_memory_block_phys_index:
+            return snprintf(buf, bufsize, "%08x\n", (unsigned) node.cpu);
+        case sysfs_memory_block_phys_device:
+            return snprintf(buf, bufsize, "0\n");
+        case sysfs_block_dev_size:
+            return sysfs_guest_disk_size_format(buf, bufsize);
+        case sysfs_block_dev_removable:
+            // Built-in storage: it cannot be ejected.
+            return snprintf(buf, bufsize, "0\n");
+        case sysfs_block_dev_ro:
+            return snprintf(buf, bufsize, "0\n");
+        case sysfs_block_dev_hidden:
+            return snprintf(buf, bufsize, "0\n");
         default:
             return 0;
     }
@@ -1470,6 +1966,59 @@ static int sysfs_stat_common(struct sysfs_node node, struct statbuf *stat) {
     stat->nlink = S_ISDIR(stat->mode) ? 2 : 1;
     stat->size = sysfs_file_size(node);
     return 0;
+}
+
+// Where a sysfs symlink points. Relative, and relative in the same shape
+// Linux uses (../../<real path>), because that is what a caller resolving it
+// against the link's own directory expects -- and because lsblk takes the
+// BASENAME of the target as the device's name, so the last component has to
+// be the device rather than a path that merely reaches it.
+static ssize_t sysfs_readlink(struct mount *UNUSED(mount), const char *path,
+                              char *buf, size_t bufsize) {
+    // Cheap rejection first, before any tree walk.
+    //
+    // Registering a ->readlink at all means fs/path.c now calls it for EVERY
+    // component of EVERY /sys path, where before it went straight to ->stat.
+    // That doubles the resolution work, and one branch of the walk is far
+    // from free: an interface name under /sys/class/net is matched by
+    // producing the live interface list, which is a fresh getifaddrs plus an
+    // ioctl per interface, once per candidate index. Measured before this
+    // early-out, on a host with 20 interfaces: 11.3 ms for a single read of
+    // /sys/class/net/utun15/statistics/rx_bytes, against 19 us for
+    // /sys/block/sda/size. btop reads six such counters per interface.
+    //
+    // Every symlink in this tree lives under /sys/dev/block/, and there is
+    // exactly one kind of them, so anything that cannot be one is refused
+    // without walking anywhere.
+    static const char dev_block_prefix[] = "dev/block/";
+    const char *p = path;
+    while (*p == '/')
+        p++;
+    if (strncmp(p, dev_block_prefix, sizeof(dev_block_prefix) - 1) != 0)
+        return _EINVAL;     // not a symlink: readlink(2)'s answer for one
+
+    struct sysfs_node node;
+    if (!sysfs_lookup_node(path, &node))
+        return _ENOENT;
+    if (!S_ISLNK(sysfs_node_mode(node)))
+        return _EINVAL;     // readlink(2) on a non-symlink
+    char target[MAX_PATH];
+    int len;
+    switch (node.kind) {
+        case sysfs_dev_block_link:
+            // /sys/dev/block/8:0 -> ../../block/sda
+            len = snprintf(target, sizeof(target), "../../block/%s", GUEST_DISK_NAME);
+            break;
+        default:
+            return _EINVAL;
+    }
+    if (len < 0 || (size_t) len >= sizeof(target))
+        return _EIO;
+    size_t copy = (size_t) len;
+    if (copy > bufsize)
+        copy = bufsize;
+    memcpy(buf, target, copy);
+    return (ssize_t) copy;
 }
 
 static int sysfs_stat(struct mount *UNUSED(mount), const char *path, struct statbuf *stat) {
@@ -1570,7 +2119,8 @@ static int sysfs_readdir(struct fd *fd, struct dir_entry *entry) {
         const struct sysfs_node_desc *desc = sysfs_desc(node.kind);
         struct sysfs_node parent = node;
         if (desc != NULL && node.kind != sysfs_root) {
-            int cpu = (node.kind == sysfs_cpu_dir || node.kind == sysfs_net_dir) ? -1 : node.cpu;
+            int cpu = (node.kind == sysfs_cpu_dir || node.kind == sysfs_net_dir ||
+                       node.kind == sysfs_memory_block) ? -1 : node.cpu;
             int idx = node.kind == sysfs_cache_index ? -1 : node.index;
             parent = sysfs_node_make(desc->parent, cpu, idx);
         }
@@ -1593,7 +2143,8 @@ static int sysfs_readdir(struct fd *fd, struct dir_entry *entry) {
         }
 
         struct sysfs_node child;
-        if (desc->kind == sysfs_cpu_dir || desc->kind == sysfs_net_dir)
+        if (desc->kind == sysfs_cpu_dir || desc->kind == sysfs_net_dir ||
+                desc->kind == sysfs_memory_block)
             child = sysfs_node_make(desc->kind, (int) remaining, node.index);
         else if (desc->kind == sysfs_cache_index)
             child = sysfs_node_make(desc->kind, node.cpu, (int) remaining);
@@ -1612,7 +2163,26 @@ static int sysfs_close(struct fd *UNUSED(fd)) {
     return 0;
 }
 
+// A sysfs attribute is always ready, and saying so is not optional.
+//
+// fd_ops with no ->poll read back as NEVER READY (kernel/poll.c asks
+// `ops->poll ? ops->poll(fd) : 0`), and busybox ash's `read` builtin polls
+// before every read even with no timeout -- so `read x < /sys/anything` hung
+// forever, at zero CPU, on the most ordinary way there is to consult a sysfs
+// file. `cat` worked, which is what made it look like the file was fine.
+//
+// The mask is sysfs's own, measured on Devuan rather than assumed: an
+// attribute reports POLLIN|POLLOUT|POLLPRI|POLLERR (0xf), where a procfs file
+// reports the plain DEFAULT_POLLMASK of POLLIN|POLLOUT (0x5). The extra two
+// are how sysfs signals "this attribute may have changed" to a poller camped
+// on it; reporting them keeps a caller that distinguishes the two kinds of
+// file seeing what it would see on Linux.
+static int sysfs_poll(struct fd *UNUSED(fd)) {
+    return POLL_READ | POLL_WRITE | POLL_PRI | POLL_ERR;
+}
+
 static const struct fd_ops sysfs_fdops = {
+    .poll = sysfs_poll,
     .read = sysfs_read,
     .write = sysfs_write,
     .pread = sysfs_pread,
@@ -1626,6 +2196,7 @@ const struct fs_ops sysfs = {
     .name = "sysfs",
     .magic = 0x62656572,
     .open = sysfs_open,
+    .readlink = sysfs_readlink,
     .stat = sysfs_stat,
     .fstat = sysfs_fstat,
     .getpath = sysfs_getpath,

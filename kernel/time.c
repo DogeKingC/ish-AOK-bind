@@ -16,6 +16,65 @@
 #include <limits.h>
 #include <sys/poll.h>
 
+// Linux encodes a per-process or per-thread CPU clock into a NEGATIVE clockid:
+//
+//     MAKE_PROCESS_CPUCLOCK(pid, which) = (~(clockid_t) pid << 3) | which
+//
+// with the per-thread form ORing in CPUCLOCK_PERTHREAD_MASK.
+// clock_getcpuclockid() and pthread_getcpuclockid() hand these out, and the C
+// library validates one by calling clock_getres on it -- so rejecting them
+// with EINVAL made both of those functions fail outright, and nothing could
+// read another process's CPU time.
+#define CPUCLOCK_PERTHREAD_MASK 4
+#define CPUCLOCK_CLOCK_MASK 3
+#define CPUCLOCK_MAX 3
+
+static bool cpuclock_decode(uint_t clock, pid_t_ *pid, bool *perthread) {
+    int32_t c = (int32_t) clock;
+    if (c >= 0)
+        return false;                       // an ordinary CLOCK_* id
+    if ((c & CPUCLOCK_CLOCK_MASK) >= CPUCLOCK_MAX)
+        return false;
+    *pid = (pid_t_) ~(c >> 3);              // arithmetic shift, as Linux does
+    *perthread = (c & CPUCLOCK_PERTHREAD_MASK) != 0;
+    return true;
+}
+
+// The CPU time this clock names. Total user+system, the same thing
+// CLOCK_PROCESS_CPUTIME_ID reports.
+static int cpuclock_gettime(pid_t_ pid, bool perthread, struct timespec *ts) {
+    // Resolve under pids_lock and take a reference, then RELEASE it before
+    // reading the usage: rusage_get_group_of takes pids_lock itself and it is
+    // not recursive, so holding it across the call deadlocks the caller
+    // against itself -- which wedged any process that asked for a CPU clock,
+    // including the one asking on its own behalf.
+    // pid 0 names the CALLER, exactly as MAKE_PROCESS_CPUCLOCK(0, ...) does on
+    // Linux -- and that is the form the C library actually uses.
+    // clock_getcpuclockid(0) builds -6 (process) or -2 (per-thread) and then
+    // validates it with clock_getres, so pid_get_task_ref(0) finding no task
+    // made both come back ESRCH. Measured against Devuan 6 / glibc 2.41, where
+    // clock_getcpuclockid(0) returns -6 and reads fine.
+    struct task *task;
+    bool borrowed = false;
+    if (pid == 0) {
+        task = current;
+    } else {
+        task = pid_get_task_ref(pid);
+        borrowed = true;
+    }
+    if (task == NULL)
+        return _ESRCH;
+    struct rusage_ rusage = perthread ? rusage_get_task(task)
+                                      : rusage_get_group_of(task->group);
+    if (borrowed)
+        task_ref_cnt_mod(task, -1);
+    int64_t usec = (int64_t) rusage.utime.sec * 1000000 + rusage.utime.usec
+                 + (int64_t) rusage.stime.sec * 1000000 + rusage.stime.usec;
+    ts->tv_sec = usec / 1000000;
+    ts->tv_nsec = (usec % 1000000) * 1000;
+    return 0;
+}
+
 static int clockid_to_real(uint_t clock, clockid_t *real) {
     switch (clock) {
         case CLOCK_REALTIME_:
@@ -37,6 +96,19 @@ static int clockid_to_real(uint_t clock, clockid_t *real) {
         case CLOCK_BOOTTIME_:
             // CLOCK_BOOTTIME (includes suspend time) is boot-relative like
             // MONOTONIC; use the host's when available, else MONOTONIC.
+#ifdef CLOCK_BOOTTIME
+            *real = CLOCK_BOOTTIME; break;
+#else
+            *real = CLOCK_MONOTONIC; break;
+#endif
+        case CLOCK_REALTIME_ALARM_:
+            // Reads identically to its non-alarm counterpart -- the only
+            // difference is that a TIMER on one may wake a suspended system,
+            // which is a permission question handled where timers are created,
+            // not here. Rejecting these made clock_gettime and clock_getres
+            // fail with EINVAL, which Linux never does for any user.
+            *real = CLOCK_REALTIME; break;
+        case CLOCK_BOOTTIME_ALARM_:
 #ifdef CLOCK_BOOTTIME
             *real = CLOCK_BOOTTIME; break;
 #else
@@ -179,8 +251,16 @@ int write_guest_timeval_abi(enum guest_abi abi, guest_addr_t addr, const struct 
     return 0;
 }
 
+// The `abi` argument selects the LAYOUT, and every caller in the tree names it
+// explicitly (GUEST_ABI_I386 for the 32-bit struct, GUEST_ABI_AMD64 for the
+// 64-bit one) rather than passing the guest's real ABI. Testing for AMD64 by
+// name therefore worked -- right up until a new caller passed current->abi,
+// which for an arm64 guest is neither, so a 64-bit timespec was read as a
+// 32-bit one: tv_nsec came out of the high half of tv_sec, i.e. zero, and a
+// semtimedop asked to wait 200ms timed out instantly. Ask whether the ABI is
+// 64-bit instead, which is true for the explicit AMD64 callers as well.
 int read_guest_timespec_abi(enum guest_abi abi, guest_addr_t addr, struct timespec *out) {
-    if (abi == GUEST_ABI_AMD64) {
+    if (guest_abi_is_64bit(abi)) {
         struct timespec64_ guest;
         if (user_get(addr, guest))
             return _EFAULT;
@@ -194,8 +274,9 @@ int read_guest_timespec_abi(enum guest_abi abi, guest_addr_t addr, struct timesp
     return 0;
 }
 
+// Same as read_guest_timespec_abi above.
 int write_guest_timespec_abi(enum guest_abi abi, guest_addr_t addr, const struct timespec *in) {
-    if (abi == GUEST_ABI_AMD64) {
+    if (guest_abi_is_64bit(abi)) {
         struct timespec64_ guest = timespec_to_guest64(*in);
         if (user_put(addr, guest))
             return _EFAULT;
@@ -273,6 +354,13 @@ static int host_sleep_interruptible(struct timespec req, struct timespec *rem) {
             slice = (struct timespec) {.tv_sec = 0, .tv_nsec = SLEEP_SLICE_NS};
 
         int res;
+        // Sleeping is a voluntary context switch in the sense getrusage means:
+        // the task gave up the CPU rather than being preempted. This sleep
+        // does not go through wait_for (it is a host nanosleep in slices), so
+        // it has to say so itself or a process whose whole life is sleep+poll
+        // reports having never yielded.
+        if (current != NULL)
+            current->nvcsw++;
         TASK_MAY_BLOCK { res = nanosleep(&slice, NULL); }
         if (res < 0 && errno != EINTR) {
             // Only EINVAL is possible (a bad slice would be our own bug), but
@@ -302,15 +390,80 @@ static int host_sleep_interruptible(struct timespec req, struct timespec *rem) {
 
 static dword_t clock_nanosleep_common(dword_t clock, int_t flags, struct timespec req,
         guest_addr_t rem_addr, bool rem_time64) {
-    clockid_t clock_id;
-    if (clockid_to_real(clock, &clock_id))
+    // Decode the dynamic cpu-clock form BEFORE clockid_to_real, which knows
+    // only the plain constants and would reject it outright -- the same shape
+    // of bug as timer_create had. glibc turns CLOCK_PROCESS_CPUTIME_ID into
+    // the dynamic id before the syscall, so every CPU-time sleep a glibc
+    // program asked for returned EINVAL instead of sleeping, while the same
+    // call through musl worked. The CPU-clock wait further down already
+    // handles both spellings; it simply never got the chance.
+    clockid_t clock_id = 0;
+    pid_t_ dyn_pid;
+    bool dyn_perthread;
+    if (cpuclock_decode(clock, &dyn_pid, &dyn_perthread)) {
+        // Linux does not permit sleeping on a THREAD cpu clock -- a thread
+        // cannot wait for its own CPU time to advance while it is not running,
+        // and posix_cpu_nsleep refuses it. EINVAL, as there.
+        if (dyn_perthread)
+            return _EINVAL;
+    } else if (clockid_to_real(clock, &clock_id)) {
         return _EINVAL;
+    }
+    // ...and the two spellings do NOT give the same errno. Linux routes the
+    // constant through its own k_clock, whose nsleep is thread_cpu_nsleep and
+    // returns EOPNOTSUPP, while the dynamic per-thread id goes through
+    // posix_cpu_nsleep and returns EINVAL. Measured on Devuan 6 / Linux 6.12,
+    // which answers 95 here and 22 there; assuming they matched is what this
+    // comment exists to stop the next person doing.
+    if (clock == CLOCK_THREAD_CPUTIME_ID_)
+        return _EOPNOTSUPP;
     if (flags & ~TIMER_ABSTIME_)
         return _EINVAL;
     if (!timespec_is_valid(req))
         return _EINVAL;
 
     struct timespec rem = {0};
+
+    // A CPU-time clock measures CPU CONSUMED, not wall time, and sleeping on
+    // one has to wait for the process to actually spend it. Sleeping wall time
+    // instead meant an idle process returned immediately from a request Linux
+    // would never complete, and a busy one returned far too early -- exactly
+    // backwards for the thing this clock exists to measure.
+    //
+    // There is nothing to hand the host: Darwin has no CPU-time sleep. So it
+    // is a wait against our own accounting. Polled rather than event-driven,
+    // because CPU time is only observable by asking -- 10ms is fine enough not
+    // to overshoot meaningfully and coarse enough not to spin, and an idle
+    // process simply never reaches its target, as on Linux.
+    pid_t_ cpu_pid;
+    bool cpu_perthread;
+    bool is_cpu_clock = clock == CLOCK_PROCESS_CPUTIME_ID_ ||
+        (cpuclock_decode(clock, &cpu_pid, &cpu_perthread) && !cpu_perthread);
+    if (is_cpu_clock) {
+        if (clock == CLOCK_PROCESS_CPUTIME_ID_)
+            cpu_pid = current->pid;
+        struct timespec consumed;
+        int cpu_err = cpuclock_gettime(cpu_pid, false, &consumed);
+        if (cpu_err < 0)
+            return cpu_err;
+        struct timespec target = (flags & TIMER_ABSTIME_)
+            ? req : timespec_add(consumed, req);
+        for (;;) {
+            cpu_err = cpuclock_gettime(cpu_pid, false, &consumed);
+            if (cpu_err < 0)
+                return cpu_err;
+            if (!timespec_positive(timespec_subtract(target, consumed)))
+                return 0;
+            struct timespec slice = { .tv_sec = 0, .tv_nsec = 10000000 };
+            if (host_sleep_interruptible(slice, &rem) < 0) {
+                int err = errno_map();
+                if (err == _EINTR)
+                    return signal_restart_or_eintr_nohand(err);
+                return err;
+            }
+        }
+    }
+
     if (flags & TIMER_ABSTIME_) {
         req = timespec_subtract(req, timespec_now(clock_id));
         if (!timespec_positive(req))
@@ -325,6 +478,19 @@ static dword_t clock_nanosleep_common(dword_t clock, int_t flags, struct timespe
                clock, flags, (long long) req.tv_sec, req.tv_nsec, rem_addr);
     }
 
+    // Resuming after a job-control stop: sleep out the deadline this call
+    // already had rather than the full relative time again. An absolute
+    // request needs nothing -- it is already a deadline.
+    if (current != NULL && current->sleep_restart_valid) {
+        bool usable = !(flags & TIMER_ABSTIME_);
+        current->sleep_restart_valid = false;
+        if (usable) {
+            struct timespec left = timespec_subtract(current->sleep_restart_deadline,
+                                                     timespec_now(CLOCK_MONOTONIC));
+            req = timespec_positive(left) ? left : (struct timespec) {0};
+        }
+    }
+    struct timespec sleep_deadline = timespec_add(timespec_now(CLOCK_MONOTONIC), req);
     int res = host_sleep_interruptible(req, &rem);
     if (trace_short_sleep) {
         printk("INFO: wait clock_nanosleep exit pid=%d comm=%s res=%d rem=%llds.%09ld\n",
@@ -334,6 +500,19 @@ static dword_t clock_nanosleep_common(dword_t clock, int_t flags, struct timespe
     }
     if (res < 0) {
         int err = errno_map();
+        // ERESTARTNOHAND, exactly as for poll: a job-control stop resumes the
+        // sleep transparently (carrying the deadline across), while a handler
+        // actually running still gives the guest its EINTR.
+        if (err == _EINTR) {
+            int restarted = signal_restart_or_eintr_nohand(err);
+            if (restarted == _ERESTART_NOHAND) {
+                if (current != NULL && !(flags & TIMER_ABSTIME_)) {
+                    current->sleep_restart_deadline = sleep_deadline;
+                    current->sleep_restart_valid = true;
+                }
+                return (dword_t) restarted;
+            }
+        }
         // POSIX: an interrupted *relative* sleep reports the time remaining so
         // the caller (or its libc restart logic) can resume. The host nanosleep
         // already populated `rem`; hand it back. Best effort — still report
@@ -351,17 +530,17 @@ static dword_t clock_nanosleep_common(dword_t clock, int_t flags, struct timespe
         return err;
     }
 
-    if (rem_addr != 0 && !(flags & TIMER_ABSTIME_)) {
-        if (rem_time64) {
-            struct timespec64_ rem_ts = timespec_to_guest64(rem);
-            if (user_put(rem_addr, rem_ts))
-                return _EFAULT;
-        } else {
-            struct timespec_ rem_ts = timespec_to_guest(rem);
-            if (user_put(rem_addr, rem_ts))
-                return _EFAULT;
-        }
-    }
+    // A COMPLETED sleep does not touch rmtp at all. Linux writes it only on
+    // the signal-interrupted relative path (the EINTR branch above): there is
+    // nothing remaining to report, and the caller's buffer is its own.
+    //
+    // Writing it here did two wrong things. It clobbered a buffer the caller
+    // had left data in -- the usual shape is `struct timespec req = ..., rem;
+    // while (nanosleep(&req, &rem)) req = rem;`, and a caller that reuses one
+    // buffer for something else between sleeps lost it. Worse, it FAULTED: a
+    // sleep that ran to completion returned EFAULT when rmtp was not a valid
+    // pointer, which Linux never even looks at, so a caller passing a stale
+    // or deliberately-invalid rmtp saw its successful sleep fail.
     return 0;
 }
 
@@ -476,7 +655,13 @@ static dword_t sys_clock_gettime_guest_abi(dword_t clock, guest_addr_t tp, enum 
     STRACE("clock_gettime(%d, 0x%x)", clock, tp);
 
     struct timespec ts;
-    if (clock == CLOCK_PROCESS_CPUTIME_ID_) {
+    pid_t_ cpuclock_pid;
+    bool cpuclock_perthread;
+    if (cpuclock_decode(clock, &cpuclock_pid, &cpuclock_perthread)) {
+        int cpuclock_err = cpuclock_gettime(cpuclock_pid, cpuclock_perthread, &ts);
+        if (cpuclock_err < 0)
+            return cpuclock_err;
+    } else if (clock == CLOCK_PROCESS_CPUTIME_ID_) {
         // Real CLOCK_PROCESS_CPUTIME_ID measures total (user+system) CPU time
         // consumed by every thread in the process, not just the caller's.
         struct rusage_ rusage = rusage_get_group();
@@ -516,7 +701,13 @@ dword_t sys_clock_gettime64_guest(dword_t clock, guest_addr_t tp) {
     STRACE("clock_gettime64(%d, 0x%x)", clock, tp);
 
     struct timespec ts;
-    if (clock == CLOCK_PROCESS_CPUTIME_ID_) {
+    pid_t_ cpuclock_pid;
+    bool cpuclock_perthread;
+    if (cpuclock_decode(clock, &cpuclock_pid, &cpuclock_perthread)) {
+        int cpuclock_err = cpuclock_gettime(cpuclock_pid, cpuclock_perthread, &ts);
+        if (cpuclock_err < 0)
+            return cpuclock_err;
+    } else if (clock == CLOCK_PROCESS_CPUTIME_ID_) {
         // Real CLOCK_PROCESS_CPUTIME_ID measures total (user+system) CPU time
         // consumed by every thread in the process, not just the caller's.
         struct rusage_ rusage = rusage_get_group();
@@ -546,14 +737,38 @@ dword_t sys_clock_getres(dword_t clock, addr_t res_addr) {
 
 static dword_t sys_clock_getres_guest_abi(dword_t clock, guest_addr_t res_addr, enum guest_abi abi) {
     STRACE("clock_getres(%d, %#x)", clock, res_addr);
+    struct timespec res;
+    pid_t_ cpuclock_pid;
+    bool cpuclock_perthread;
+    if (cpuclock_decode(clock, &cpuclock_pid, &cpuclock_perthread)) {
+        // This is the call the C library makes to decide whether the id it
+        // just computed is usable, so it must answer for a live pid and fail
+        // for a dead one. Linux reports 1ns for the CPU clocks.
+        struct timespec ignored;
+        int cpuclock_err = cpuclock_gettime(cpuclock_pid, cpuclock_perthread, &ignored);
+        if (cpuclock_err < 0)
+            return cpuclock_err;
+        res.tv_sec = 0;
+        res.tv_nsec = 1;
+        // A NULL res is legal: clock_getres(2) says "if res is NULL, the
+        // resolution is not returned", and the call becomes a pure "is this
+        // clock usable?" question. That is precisely how the C library uses
+        // it -- glibc's clock_getcpuclockid computes the dynamic id and then
+        // validates it with clock_getres(id, NULL) -- so faulting on the NULL
+        // made clock_getcpuclockid fail with EFAULT on every glibc guest.
+        // Verified against Devuan 6 / glibc 2.41, where clock_getres(-6, NULL)
+        // returns 0.
+        if (res_addr != 0 && write_guest_timespec_abi(abi, res_addr, &res))
+            return _EFAULT;
+        return 0;
+    }
     clockid_t clock_id;
     if (clockid_to_real(clock, &clock_id)) return _EINVAL;
 
-    struct timespec res;
     int err = clock_getres(clock_id, &res);
     if (err < 0)
         return errno_map();
-    if (write_guest_timespec_abi(abi, res_addr, &res))
+    if (res_addr != 0 && write_guest_timespec_abi(abi, res_addr, &res))
         return _EFAULT;
     return 0;
 }
@@ -576,14 +791,33 @@ dword_t sys_clock_getres_time64(dword_t clock, addr_t res_addr) {
 
 dword_t sys_clock_getres_time64_guest(dword_t clock, guest_addr_t res_addr) {
     STRACE("clock_getres_time64(%d, %#x)", clock, res_addr);
-    clockid_t clock_id;
-    if (clockid_to_real(clock, &clock_id))
-        return _EINVAL;
-
+    // This is a SECOND body, not a wrapper, so both of the fixes in
+    // sys_clock_getres_guest_abi have to exist here too -- and on i386 this is
+    // the one that runs. musl there defines only the *_time64 numbers for the
+    // clock calls, so every i386 clock_getres arrives at this entry and not
+    // the one above.
     struct timespec res;
-    int err = clock_getres(clock_id, &res);
-    if (err < 0)
-        return errno_map();
+    pid_t_ cpuclock_pid;
+    bool cpuclock_perthread;
+    if (cpuclock_decode(clock, &cpuclock_pid, &cpuclock_perthread)) {
+        struct timespec ignored;
+        int cpuclock_err = cpuclock_gettime(cpuclock_pid, cpuclock_perthread, &ignored);
+        if (cpuclock_err < 0)
+            return cpuclock_err;
+        res.tv_sec = 0;
+        res.tv_nsec = 1;
+    } else {
+        clockid_t clock_id;
+        if (clockid_to_real(clock, &clock_id))
+            return _EINVAL;
+        int err = clock_getres(clock_id, &res);
+        if (err < 0)
+            return errno_map();
+    }
+    // NULL means "do not return the resolution", which makes the call a pure
+    // validity check -- see the comment in sys_clock_getres_guest_abi.
+    if (res_addr == 0)
+        return 0;
     struct timespec64_ t = timespec_to_guest64(res);
     if (user_put(res_addr, t))
         return _EFAULT;
@@ -600,12 +834,46 @@ static dword_t clock_settime_errno(dword_t clock) {
     return clock == CLOCK_REALTIME_ ? _EPERM : _EINVAL;
 }
 
-dword_t sys_clock_settime(dword_t clock, addr_t UNUSED(tp)) {
-    return clock_settime_errno(clock);
+// Linux checks in this order: copy the timespec in (EFAULT), range-check it
+// (EINVAL), and only then apply the capability check (EPERM). AOK refused
+// first and never looked, so a caller probing with a deliberately-bad pointer
+// -- or one whose struct was simply wrong -- was told it lacked permission
+// for a call it had got wrong, and went looking for the wrong problem.
+static dword_t clock_settime_common(dword_t clock, guest_addr_t tp, bool time64) {
+    if (clock != CLOCK_REALTIME_ && clock != CLOCK_REALTIME_ALARM_)
+        return _EINVAL;
+    // The layout is the CALLER's: clock_settime carries a 32-bit timespec on a
+    // 32-bit guest and a 64-bit one on a 64-bit guest, while clock_settime64
+    // is always the wide form. Reading the narrow struct out of a 64-bit
+    // guest's buffer is how this first reported EFAULT for a well-formed
+    // call.
+    struct timespec ts;
+    if (time64) {
+        struct timespec64_ guest_ts;
+        if (user_get(tp, guest_ts))
+            return _EFAULT;
+        ts.tv_sec = (time_t) guest_ts.sec;
+        ts.tv_nsec = (long) guest_ts.nsec;
+    } else if (read_guest_timespec_abi(current->abi, tp, &ts)) {
+        return _EFAULT;
+    }
+    if (!timespec_is_valid(ts))
+        return _EINVAL;
+    // iSH cannot move the host (iOS) clock, so a well-formed request is
+    // refused the way an unprivileged one is on Linux.
+    return _EPERM;
 }
 
-dword_t sys_clock_settime64(dword_t clock, addr_t UNUSED(tp)) {
-    return clock_settime_errno(clock);
+dword_t sys_clock_settime(dword_t clock, addr_t tp) {
+    if (clock != CLOCK_REALTIME_ && clock != CLOCK_REALTIME_ALARM_)
+        return clock_settime_errno(clock);
+    return clock_settime_common(clock, tp, false);
+}
+
+dword_t sys_clock_settime64(dword_t clock, addr_t tp) {
+    if (clock != CLOCK_REALTIME_ && clock != CLOCK_REALTIME_ALARM_)
+        return clock_settime_errno(clock);
+    return clock_settime_common(clock, tp, true);
 }
 
 // clock_adjtime / clock_adjtime64 (chronyd, ntpd). iSH runs no kernel NTP loop
@@ -727,16 +995,18 @@ static bool time_warning_trace_enabled(void) {
     return false;
 }
 
-static void itimer_notify(struct task *task) {
+// The timer carries the TGROUP, not the arming task. ITIMER_REAL is
+// process-directed on Linux: any eligible thread may take SIGALRM, and the
+// timer outlives whichever thread happened to arm it. Carrying a struct task
+// meant the signal went only to that thread's private queue -- so it was lost
+// if that thread had it blocked, and the callback dereferenced a FREED task if
+// that thread exited while the timer was still armed. The group is safe to
+// hold: exit_tgroup frees these timers when the group dies.
+static void itimer_notify(struct tgroup *group) {
     struct siginfo_ info = {
         .code = SI_TIMER_,
     };
-    if (time_warning_trace_enabled())
-        printk("WARNING: itimer_notify pid=%d tgid=%d comm=%s sig=%d pending=%#llx blocked=%#llx\n",
-               task->pid, task->tgid, task->comm, SIGALRM_,
-               (unsigned long long) task->pending,
-               (unsigned long long) task->blocked);
-    send_signal(task, SIGALRM_, info);
+    send_signal_to_group(group, SIGALRM_, info);
 }
 
 // ITIMER_VIRTUAL/PROF: neither has a native CPU-time clock this codebase's
@@ -779,9 +1049,10 @@ static bool itimer_vprof_maybe_fire(struct cpu_itimer_state *state, struct times
     return true;
 }
 
+// Same as itimer_notify: the group, not a thread. SIGVTALRM/SIGPROF are
+// process-directed too.
 static void itimer_vprof_sampler_notify(void *data) {
-    struct task *task = data;
-    struct tgroup *group = task->group;
+    struct tgroup *group = data;
 
     struct timespec cpu_user = cpu_time_now_of(group, false);
     struct timespec cpu_total = cpu_time_now_of(group, true);
@@ -793,9 +1064,9 @@ static void itimer_vprof_sampler_notify(void *data) {
 
     struct siginfo_ info = { .code = SI_TIMER_ };
     if (fire_virtual)
-        send_signal(task, SIGVTALRM_, info);
+        send_signal_to_group(group, SIGVTALRM_, info);
     if (fire_prof)
-        send_signal(task, SIGPROF_, info);
+        send_signal_to_group(group, SIGPROF_, info);
 }
 
 // Must be called with group->lock held (matches itimer_set's caller).
@@ -814,13 +1085,20 @@ static long itimer_vprof_set(struct tgroup *group, int which, struct timer_spec 
 
     if (old_spec != NULL) {
         *old_spec = (struct timer_spec) {};
+        // The interval is reported whether or not the timer is armed: Linux's
+        // set_cpu_itimer/get_cpu_itimer read and write it->incr
+        // unconditionally, so `setitimer(ITIMER_PROF, {interval=7s, value=0})`
+        // followed by getitimer reports 7s. Gating it on `armed` reported 0
+        // and lost what the caller had just set.
+        old_spec->interval = state->interval;
         if (state->armed) {
             struct timespec remaining = timespec_subtract(state->deadline, cpu_now);
             old_spec->value = timespec_positive(remaining) ? remaining : (struct timespec) {};
-            old_spec->interval = state->interval;
         }
     }
 
+    // Stored before the disarm check, for the same reason.
+    state->interval = spec.interval;
     if (timespec_is_zero(spec.value)) {
         state->armed = false;
         return 0;
@@ -828,10 +1106,9 @@ static long itimer_vprof_set(struct tgroup *group, int which, struct timer_spec 
 
     state->armed = true;
     state->deadline = timespec_add(cpu_now, spec.value);
-    state->interval = spec.interval;
 
     if (group->itimer_vprof_sampler == NULL) {
-        struct timer *sampler = timer_new(CLOCK_MONOTONIC, itimer_vprof_sampler_notify, current);
+        struct timer *sampler = timer_new(CLOCK_MONOTONIC, itimer_vprof_sampler_notify, group);
         if (IS_ERR(sampler))
             return PTR_ERR(sampler);
         group->itimer_vprof_sampler = sampler;
@@ -855,7 +1132,7 @@ static long itimer_set(struct tgroup *group, int which, struct timer_spec spec, 
         return _EINVAL;
 
     if (!group->itimer) {
-        struct timer *timer = timer_new(CLOCK_REALTIME, (timer_callback_t) itimer_notify, current);
+        struct timer *timer = timer_new(CLOCK_REALTIME, (timer_callback_t) itimer_notify, group);
         if (IS_ERR(timer))
             return PTR_ERR(timer);
         group->itimer = timer;
@@ -871,6 +1148,13 @@ static long itimer_set(struct tgroup *group, int which, struct timer_spec spec, 
                (long) spec.interval.tv_sec, spec.interval.tv_nsec,
                (void *) group->itimer);
 
+    // Disarming ITIMER_REAL discards the interval with it. Linux's
+    // do_setitimer sets it_real_incr only when it_value is nonzero and clears
+    // it otherwise, so getitimer after a disarm reports 0/0 -- while
+    // ITIMER_VIRTUAL and ITIMER_PROF keep theirs (see itimer_vprof_set).
+    // AOK had the two exactly the wrong way round.
+    if (timespec_is_zero(spec.value))
+        spec.interval = (struct timespec) {};
     return timer_set(group->itimer, spec, old_spec);
 }
 
@@ -914,6 +1198,15 @@ static long sys_setitimer_guest_abi(int_t which, guest_addr_t new_val_addr, gues
             .value.tv_nsec = val.value.usec * 1000,
         };
     }
+    // Linux rejects tv_usec >= 1e6 and negative seconds with EINVAL. We copied
+    // them straight through, so a denormalized value left the deadline
+    // permanently in the past and the timer thread spun a host core at 100%
+    // for the timer's life -- and a negative one fired immediately and
+    // repeatedly. timespec_is_valid already existed for clock_nanosleep; the
+    // timer paths simply never called it. usec has been scaled to nsec above,
+    // so the nsec bound is the usec bound.
+    if (!timespec_is_valid(spec.value) || !timespec_is_valid(spec.interval))
+        return _EINVAL;
     struct timer_spec old_spec;
 
     struct tgroup *group = current->group;
@@ -991,9 +1284,10 @@ static long sys_getitimer_guest_abi(int_t which, guest_addr_t old_val_addr, enum
         unlock(&timer->lock);
     } else if (which == ITIMER_VIRTUAL_ || which == ITIMER_PROF_) {
         struct cpu_itimer_state *state = which == ITIMER_VIRTUAL_ ? &group->itimer_virtual : &group->itimer_prof;
+        // Unconditionally, matching get_cpu_itimer -- see itimer_vprof_set.
+        spec.interval = state->interval;
         if (state->armed) {
             struct timespec remaining = timespec_subtract(state->deadline, cpu_now);
-            spec.interval = state->interval;
             if (timespec_positive(remaining))
                 spec.value = remaining;
         }
@@ -1075,6 +1369,13 @@ static dword_t sys_nanosleep_guest_abi(guest_addr_t req_addr, guest_addr_t rem_a
     if (read_guest_timespec_abi(abi, req_addr, &req_ts))
         return _EFAULT;
     STRACE("nanosleep({%lld, %ld}, 0x%x", (long long) req_ts.tv_sec, req_ts.tv_nsec, rem_addr);
+    // The same validation clock_nanosleep_common already does, which plain
+    // nanosleep never had: a tv_nsec outside [0, 999999999] or a negative
+    // tv_sec is EINVAL and nothing is slept. Accepting them returned success
+    // without sleeping, so a caller that had computed a bad duration -- which
+    // is the whole reason the check exists -- was told its sleep happened.
+    if (!timespec_is_valid(req_ts))
+        return _EINVAL;
     bool trace_short_sleep = wait_trace_enabled() && req_ts.tv_sec >= 0 && req_ts.tv_sec <= 2;
     if (trace_short_sleep) {
         printk("INFO: wait nanosleep enter pid=%d comm=%s req=%llds.%09ld rem=%#x\n",
@@ -1083,6 +1384,15 @@ static dword_t sys_nanosleep_guest_abi(guest_addr_t req_addr, guest_addr_t rem_a
                (long long) req_ts.tv_sec, req_ts.tv_nsec, rem_addr);
     }
     struct timespec rem;
+    // Same job-control-stop handling as clock_nanosleep_common; nanosleep() is
+    // always relative, so the carried deadline needs no ABSTIME check.
+    if (current != NULL && current->sleep_restart_valid) {
+        current->sleep_restart_valid = false;
+        struct timespec left = timespec_subtract(current->sleep_restart_deadline,
+                                                 timespec_now(CLOCK_MONOTONIC));
+        req_ts = timespec_positive(left) ? left : (struct timespec) {0};
+    }
+    struct timespec sleep_deadline = timespec_add(timespec_now(CLOCK_MONOTONIC), req_ts);
     int res = host_sleep_interruptible(req_ts, &rem);
     if (trace_short_sleep) {
         printk("INFO: wait nanosleep exit pid=%d comm=%s res=%d rem=%llds.%09ld\n",
@@ -1092,13 +1402,26 @@ static dword_t sys_nanosleep_guest_abi(guest_addr_t req_addr, guest_addr_t rem_a
     }
     if (res < 0) {
         int err = errno_map();
+        // ERESTARTNOHAND: a job-control stop resumes the sleep transparently,
+        // carrying the deadline across; a handler running still gives EINTR.
+        if (err == _EINTR) {
+            int restarted = signal_restart_or_eintr_nohand(err);
+            if (restarted == _ERESTART_NOHAND) {
+                if (current != NULL) {
+                    current->sleep_restart_deadline = sleep_deadline;
+                    current->sleep_restart_valid = true;
+                }
+                return (dword_t) restarted;
+            }
+        }
         // On EINTR report the remaining time (Linux does); best effort.
         if (err == _EINTR && rem_addr != 0)
             (void) write_guest_timespec_abi(abi, rem_addr, &rem);
         return err;
     }
-    if (rem_addr != 0 && write_guest_timespec_abi(abi, rem_addr, &rem))
-        return _EFAULT;
+    // A completed sleep does not touch rmtp -- see the same rule and the same
+    // reasoning in sys_clock_nanosleep_common. This is the second copy: plain
+    // nanosleep and clock_nanosleep each have their own body.
     return 0;
 }
 
@@ -1117,13 +1440,28 @@ dword_t sys_nanosleep_amd64_guest(guest_addr_t req_addr, guest_addr_t rem_addr) 
 dword_t sys_times_guest(guest_addr_t tbuf) {
     STRACE("times(0x%x)", tbuf);
     if (tbuf) {
-        struct rusage_ rusage = rusage_get_current();
+        struct rusage_ rusage = rusage_get_group();
         clock_t_ utime = clock_from_timeval(rusage.utime);
         clock_t_ stime = clock_from_timeval(rusage.stime);
-        if (current->abi == GUEST_ABI_AMD64) {
-            // amd64 struct tms has 64-bit (long) fields, vs the 32-bit i386 layout.
+        // tms_cutime/tms_cstime are the REAPED CHILDREN's accumulated time,
+        // not a second copy of our own -- which is what they were, so a shell
+        // or a build tool asking how long its children took was handed its own
+        // CPU time instead. The accounting already exists and is already right
+        // (getrusage(RUSAGE_CHILDREN) reports it); it just was not being read.
+        lock(&current->group->lock, 0);
+        struct rusage_ children = current->group->children_rusage;
+        unlock(&current->group->lock);
+        clock_t_ cutime = clock_from_timeval(children.utime);
+        clock_t_ cstime = clock_from_timeval(children.stime);
+        // struct tms is four `clock_t` (long) fields, so its layout follows the
+        // ABI's word size -- 64-bit on arm64 and riscv64 just as much as on
+        // amd64. Testing only for amd64 wrote the 32-bit layout to an arm64
+        // guest, which then read four 64-bit fields out of sixteen bytes:
+        // tms_utime happened to survive whenever tms_stime was 0, and
+        // tms_cutime came back as garbage.
+        if (guest_abi_is_64bit(current->abi)) {
             struct amd64_tms { qword_t utime, stime, cutime, cstime; } tmp = {
-                .utime = utime, .stime = stime, .cutime = utime, .cstime = stime,
+                .utime = utime, .stime = stime, .cutime = cutime, .cstime = cstime,
             };
             if (user_put(tbuf, tmp))
                 return _EFAULT;
@@ -1131,13 +1469,19 @@ dword_t sys_times_guest(guest_addr_t tbuf) {
             struct tms_ tmp;
             tmp.tms_utime = utime;
             tmp.tms_stime = stime;
-            tmp.tms_cutime = utime;
-            tmp.tms_cstime = stime;
+            tmp.tms_cutime = cutime;
+            tmp.tms_cstime = cstime;
             if (user_put(tbuf, tmp))
                 return _EFAULT;
         }
     }
-    return 0;
+    // Linux returns the number of clock ticks since an arbitrary point in the
+    // past -- in practice boot -- and callers use the DIFFERENCE between two
+    // calls to measure elapsed time. Returning a constant 0 made every such
+    // measurement come out as zero, which is what `time` in a shell without a
+    // builtin, and any benchmark using times(), reports.
+    struct timespec up = timespec_now(CLOCK_MONOTONIC);
+    return (dword_t) (up.tv_sec * 100 + up.tv_nsec / 10000000);
 }
 
 dword_t sys_times(addr_t tbuf) {
@@ -1151,9 +1495,16 @@ dword_t sys_gettimeofday(addr_t tv, addr_t tz) {
     if (gettimeofday(&timeval, &timezone) < 0) {
         return errno_map();
     }
+    // Linux fills tz from its own sys_tz, which is {0, 0} unless a
+    // long-obsolete settimeofday set it; tz_dsttime is documented as always
+    // 0. Darwin answers with the HOST's timezone, and passing that through
+    // leaked the Mac's DST flag to the guest -- a nonzero tz_dsttime is a
+    // state no Linux produces, and the few programs that still read this
+    // field treat it as one.
     struct timezone_ tz_;
-    tz_.minuteswest = timezone.tz_minuteswest;
-    tz_.dsttime = timezone.tz_dsttime;
+    tz_.minuteswest = 0;
+    tz_.dsttime = 0;
+    (void) timezone;
     if ((tv && write_guest_timeval_abi(GUEST_ABI_I386, tv, &timeval)) || (tz && user_put(tz, tz_))) {
         return _EFAULT;
     }
@@ -1171,9 +1522,16 @@ dword_t sys_gettimeofday_amd64_guest(guest_addr_t tv, guest_addr_t tz) {
     if (gettimeofday(&timeval, &timezone) < 0) {
         return errno_map();
     }
+    // Linux fills tz from its own sys_tz, which is {0, 0} unless a
+    // long-obsolete settimeofday set it; tz_dsttime is documented as always
+    // 0. Darwin answers with the HOST's timezone, and passing that through
+    // leaked the Mac's DST flag to the guest -- a nonzero tz_dsttime is a
+    // state no Linux produces, and the few programs that still read this
+    // field treat it as one.
     struct timezone_ tz_;
-    tz_.minuteswest = timezone.tz_minuteswest;
-    tz_.dsttime = timezone.tz_dsttime;
+    tz_.minuteswest = 0;
+    tz_.dsttime = 0;
+    (void) timezone;
     if ((tv && write_guest_timeval_abi(GUEST_ABI_AMD64, tv, &timeval)) || (tz && user_put(tz, tz_))) {
         return _EFAULT;
     }
@@ -1201,6 +1559,31 @@ dword_t sys_adjtimex_guest(guest_addr_t tx_addr) {
     return clock_adjtime_read(tx_addr, guest_abi_is_64bit(current->abi));
 }
 
+// Read the owning thread's CPU clock, by pid rather than by pointer: the timer
+// outlives nothing, but the thread can exit while the timer is armed, and a
+// stored task pointer would be dangling by the time this ran. A thread that is
+// gone reports its clock as far in the future, so an armed timer stops
+// counting down rather than firing spuriously -- Linux disarms such a timer,
+// and never firing is the same observable outcome.
+static struct timespec posix_timer_thread_cpu_now(void *data) {
+    struct posix_timer *timer = data;
+    struct task *task = pid_get_task_ref(timer->cpu_clock_pid);
+    if (task == NULL) {
+        struct timespec forever = { .tv_sec = INT64_MAX / 2, .tv_nsec = 0 };
+        return forever;
+    }
+    unsigned long utime = 0, stime = 0;
+    task_thread_cpu_time(task, &utime, &stime);
+    task_ref_cnt_mod(task, -1);
+    // task_thread_cpu_time counts in jiffies at USER_HZ = 100.
+    unsigned long ticks = utime + stime;
+    struct timespec now = {
+        .tv_sec = (time_t) (ticks / 100),
+        .tv_nsec = (long) ((ticks % 100) * 10000000L),
+    };
+    return now;
+}
+
 static void posix_timer_callback(struct posix_timer *timer) {
     if (timer->tgroup == NULL)
         return;
@@ -1224,7 +1607,16 @@ static void posix_timer_callback(struct posix_timer *timer) {
                thread != NULL ? thread->pid : 0, thread != NULL);
     // TODO: solve pid reuse. currently we have two ways of referring to a task: pid_t_ and struct task *. pids get reused. task struct pointers get freed on exit or reap. need a third option for cases like this, like a refcount layer.
     if (thread != NULL) {
-        send_signal(thread, timer->signal, info);
+        // If the last signal from this timer is still queued, this expiration
+        // is an overrun, not a second signal. See
+        // signal_timer_count_overrun.
+        int overrun = signal_timer_count_overrun(thread, timer->signal, timer->timer_id);
+        if (overrun >= 0) {
+            timer->last_overrun = overrun;
+        } else {
+            timer->last_overrun = 0;
+            send_signal(thread, timer->signal, info);
+        }
         task_ref_cnt_mod(thread, -1);
     }
 }
@@ -1258,11 +1650,43 @@ static int_t sys_timer_create_guest_abi(dword_t clock, guest_addr_t sigevent_add
     if (time_warning_trace_enabled())
         printk("WARNING: timer_create pid=%d tgid=%d comm=%s clock=%u sigevent=%#x timer_addr=%#x\n",
                current->pid, current->tgid, current->comm, clock, sigevent_addr, timer_addr);
+    // The C library does not hand timer_create the plain CLOCK_*_CPUTIME_ID
+    // constant -- it hands over the DYNAMIC cpu-clock encoding, the same one
+    // clock_getcpuclockid returns. glibc turns CLOCK_PROCESS_CPUTIME_ID into
+    // 0xfffffffa (-6) and CLOCK_THREAD_CPUTIME_ID into 0xfffffffe (-2) before
+    // the syscall; strace on Devuan shows exactly that. clockid_to_real knows
+    // only the constants, so every CPU-time timer a glibc program created came
+    // back EINVAL -- while the same call through musl, which passes the
+    // constant, worked. That is why the Alpine test roots never saw it and the
+    // Devuan guest did.
     clockid_t real_clockid;
-    if (clockid_to_real(clock, &real_clockid))
+    pid_t_ cpu_pid;
+    bool cpu_perthread;
+    if (cpuclock_decode(clock, &cpu_pid, &cpu_perthread)) {
+        // Only the caller's own clocks. Linux allows a timer on another
+        // process's CPU clock only for a process you already control, and
+        // nothing in the guest asks for it; EINVAL is what it answers when the
+        // clock names someone else.
+        if (cpu_pid != 0 && cpu_pid != current->tgid && cpu_pid != current->pid)
+            return _EINVAL;
+        real_clockid = cpu_perthread ? CLOCK_THREAD_CPUTIME_ID
+                                     : CLOCK_PROCESS_CPUTIME_ID;
+    } else if (clockid_to_real(clock, &real_clockid)) {
         return _EINVAL;
+    }
     struct sigevent_ sigev = {};
-    if (abi == GUEST_ABI_AMD64) {
+    // timer_create(2): "If evp is NULL ... the default sigevent is
+    // sigev_notify = SIGEV_SIGNAL, sigev_signo = SIGALRM, and sigev_value.
+    // sival_int = timer ID." AOK read the struct unconditionally, so a NULL
+    // evp faulted and the call returned EFAULT -- glibc's timer_create(clock,
+    // NULL, &t) and every program that takes the documented default got an
+    // error Linux never returns. sival_int is filled in below, once the timer
+    // id is known.
+    bool default_sigevent = sigevent_addr == 0;
+    if (default_sigevent) {
+        sigev.method = SIGEV_SIGNAL_;
+        sigev.signo = SIGALRM_;
+    } else if (abi == GUEST_ABI_AMD64) {
         struct amd64_sigevent_marshaled user_sigev;
         if (user_get(sigevent_addr, user_sigev))
             return _EFAULT;
@@ -1287,6 +1711,14 @@ static int_t sys_timer_create_guest_abi(dword_t clock, guest_addr_t sigevent_add
     }
     if (sigev.method != SIGEV_SIGNAL_ && sigev.method != SIGEV_NONE_ && sigev.method != SIGEV_THREAD_ID_)
         return _EINVAL;
+    // Linux rejects a signo outside 1..64 here. We stored it unchecked, so a
+    // guest could create a timer carrying signo 100 with three ordinary
+    // syscalls and no privilege; the FIRST expiry then tripped
+    // assert(sig >= 1 && sig < NUM_SIGS) in sig_mask and aborted the host
+    // process, destroying the whole guest and every process in it.
+    if ((sigev.method == SIGEV_SIGNAL_ || sigev.method == SIGEV_THREAD_ID_) &&
+            (sigev.signo < 1 || sigev.signo >= NUM_SIGS))
+        return _EINVAL;
 
     if (sigev.method == SIGEV_THREAD_ID_) {
         struct task *target = pid_get_task_ref(sigev.tid);
@@ -1304,8 +1736,12 @@ static int_t sys_timer_create_guest_abi(dword_t clock, guest_addr_t sigevent_add
             break;
     }
     if (timer_id >= TIMERS_MAX) {
+        // What Linux reports when a process exhausts its own timer bound
+        // (RLIMIT_SIGPENDING), and what callers check for. ENOMEM says the
+        // kernel is out of memory, which it is not, and sends a caller down
+        // an allocation-failure path instead of a back-off-and-retry one.
         unlock(&group->lock);
-        return _ENOMEM;
+        return _EAGAIN;
     }
     if (user_put(timer_addr, timer_id)) {
         unlock(&group->lock);
@@ -1314,7 +1750,21 @@ static int_t sys_timer_create_guest_abi(dword_t clock, guest_addr_t sigevent_add
 
     struct posix_timer *timer = &group->posix_timers[timer_id];
     timer->timer_id = timer_id;
+    // The documented default carries the timer id as sival_int.
+    if (default_sigevent)
+        sigev.value.sv_ptr = timer_id;
     timer->timer = timer_new(real_clockid, (timer_callback_t) posix_timer_callback, timer);
+    // CLOCK_THREAD_CPUTIME_ID belongs to ONE thread, and the timer runs on its
+    // own -- which is asleep, so its thread clock never advances and the
+    // deadline never arrives. The timer was created and armed and reported
+    // success and then simply never fired, which is the worst of the three
+    // possible answers. Sample the clock of the thread that created it
+    // instead. (The process CPU clock needs none of this: the timer thread is
+    // in the same process, so reading it on any thread gives the same number.)
+    if (real_clockid == CLOCK_THREAD_CPUTIME_ID) {
+        timer->cpu_clock_pid = current->pid;
+        timer_set_clock_source(timer->timer, posix_timer_thread_cpu_now, timer);
+    }
     timer->signal = sigev.signo;
     timer->sig_value = sigev.value;
     timer->tgroup = NULL;
@@ -1392,10 +1842,14 @@ int_t sys_timer_getoverrun(dword_t timer_id) {
     lock(&current->group->lock, 0);
     struct posix_timer *timer = &current->group->posix_timers[timer_id];
     bool valid = timer->timer != NULL;
+    int_t overrun = timer->last_overrun;
     unlock(&current->group->lock);
     if (!valid)
         return _EINVAL;
-    return 0;
+    // Hardcoded 0 before, which told a program running a periodic timer that
+    // it had never missed a period no matter how far behind it was. See the
+    // comment on posix_timer.last_overrun.
+    return overrun;
 }
 
 static int_t sys_timer_settime_common(dword_t timer_id, int_t flags, guest_addr_t new_value_addr,
@@ -1420,6 +1874,9 @@ static int_t sys_timer_settime_common(dword_t timer_id, int_t flags, guest_addr_
             return _EFAULT;
         spec = timer_spec_to_real64(value);
     }
+    // Same validation as setitimer above, for the same reason.
+    if (!timespec_is_valid(spec.value) || !timespec_is_valid(spec.interval))
+        return _EINVAL;
 
     lock(&current->group->lock, 0);
     struct posix_timer *timer = &current->group->posix_timers[timer_id];
@@ -1477,6 +1934,13 @@ int_t sys_timer_gettime64_guest(dword_t timer_id, guest_addr_t curr_value_addr) 
 
 int_t sys_timer_delete(dword_t timer_id) {
     STRACE("timer_delete(%d)\n", timer_id);
+    // The bounds check its three siblings all have (gettime, getoverrun,
+    // settime). Without it the guest indexes posix_timers[] out of bounds and
+    // hands timer_free() whatever lies past the array -- an attacker-chosen
+    // pointer, since adjacent tgroup fields are guest-settable -- taking down
+    // the whole emulator and every other guest process with it.
+    if (timer_id >= TIMERS_MAX)
+        return _EINVAL;
     lock(&current->group->lock, 0);
     struct posix_timer *timer = &current->group->posix_timers[timer_id];
     if (timer->timer == NULL) {
@@ -1507,8 +1971,17 @@ fd_t sys_timerfd_create(int_t clockid, int_t flags) {
     // Linux timerfd only accepts the wall/uptime clocks; the CPU-time and
     // COARSE clocks (and unknown ids) are rejected with EINVAL even though
     // clockid_to_real would happily map some of them.
-    if (clockid != CLOCK_REALTIME_ && clockid != CLOCK_MONOTONIC_ && clockid != CLOCK_BOOTTIME_)
+    if (clockid == CLOCK_REALTIME_ALARM_ || clockid == CLOCK_BOOTTIME_ALARM_) {
+        // The alarm clocks exist for timerfd, but arming one may wake a
+        // suspended system, so Linux requires CAP_WAKE_ALARM and answers EPERM
+        // without it -- never EINVAL, which is what a caller reads as "this
+        // kernel has no such clock" and gives up on entirely.
+        if (!current_capable(CAP_WAKE_ALARM_))
+            return _EPERM;
+    } else if (clockid != CLOCK_REALTIME_ && clockid != CLOCK_MONOTONIC_ &&
+               clockid != CLOCK_BOOTTIME_) {
         return _EINVAL;
+    }
     // Only TFD_NONBLOCK / TFD_CLOEXEC are valid (== O_NONBLOCK / O_CLOEXEC);
     // unknown flag bits -> EINVAL (was previously ignored).
     if (flags & ~(O_NONBLOCK_ | O_CLOEXEC_))
@@ -1573,6 +2046,13 @@ static int_t sys_timerfd_settime_common(fd_t f, int_t flags, guest_addr_t new_va
             return _EFAULT;
         spec = timer_spec_to_real64(value);
     }
+    // Out-of-range nanoseconds are EINVAL, as everywhere else that takes a
+    // timespec. Accepting them let a caller arm a timer for a deadline it
+    // never asked for -- the value was carried through arithmetic that
+    // silently normalised it -- instead of being told its struct was wrong.
+    if (!timespec_is_valid(spec.value) || !timespec_is_valid(spec.interval))
+        return _EINVAL;
+
     struct timer_spec old_spec;
     if (flags & TIMER_ABSTIME_) {
         struct timespec now = timespec_now(fd->timerfd.timer->clockid);
