@@ -12,6 +12,7 @@
 #include "fs/proc.h"
 #include "platform/platform.h"
 #include <sys/utsname.h>
+#include "kernel/binfmt_misc.h"
 
 void get_current_hostname(char *hostname, size_t size);
 
@@ -155,25 +156,119 @@ static bool sys_show_vm(struct proc_entry *UNUSED(entry), unsigned long *index, 
 static struct proc_dir_entry proc_sys_vm_entry = {NULL, S_IFREG | 0644,
     .getname = proc_sys_vm_getname, .show = proc_sys_vm_show, .update = proc_sys_vm_update};
 
-// /proc/sys/fs/binfmt_misc: an EMPTY directory, which is exactly what Linux
-// shows until the binfmt_misc filesystem is mounted on it.
+// /proc/sys/fs/binfmt_misc.
 //
-// It used to present `register` and `status` unconditionally, with nothing
-// behind them. `status` read "enabled" always; a `register` write returned the
+// EMPTY until the filesystem is mounted on it, which is exactly what Linux
+// shows -- `register` and `status` come into existence with the mount.
+//
+// It used to present `register` and `status` unconditionally with NOTHING
+// BEHIND THEM. `status` read "enabled" always; a `register` write returned the
 // full byte count and was discarded, so no file for the format appeared and
 // execve never consulted it; and writing 0 to `status` reported success and
-// left it reading "enabled".
+// left it reading "enabled". update-binfmts and systemd-binfmt both check
+// `status`, register their formats, and believe the success they are handed --
+// so a guest configured to run foreign binaries through an interpreter looked
+// configured and then silently ran nothing.
 //
-// That is the worst of the three possible answers. update-binfmts and
-// systemd-binfmt both check `status`, register their formats, and believe the
-// success they are handed -- so a guest configured to run, say, foreign
-// binaries through an interpreter looked configured and then silently ran
-// nothing. An empty directory is the truthful state and one those tools
-// already handle: it is what every kernel without CONFIG_BINFMT_MISC, and
-// every system that has not mounted it yet, looks like.
-static bool proc_binfmt_misc_readdir(struct proc_entry *UNUSED(entry), unsigned long *UNUSED(index),
-        struct proc_entry *UNUSED(next_entry)) {
-    return false;
+// That history is the constraint on this code: a registration visible here MUST
+// affect execve. kernel/binfmt_misc.c holds the registrations and
+// kernel/exec.c's format_exec consults them, so it does.
+static int proc_binfmt_register_update(struct proc_entry *UNUSED(entry), struct proc_data *data) {
+    if (!superuser())
+        return _EPERM;
+    int err = binfmt_misc_register(data->data, data->size);
+    return err < 0 ? err : 0;
+}
+
+static int proc_binfmt_status_show(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    // One word and a newline, as Linux prints.
+    proc_printf(buf, "%s\n", binfmt_misc_enabled() ? "enabled" : "disabled");
+    return 0;
+}
+
+static int proc_binfmt_status_update(struct proc_entry *UNUSED(entry), struct proc_data *data) {
+    if (!superuser())
+        return _EPERM;
+    char v[8] = "";
+    size_t n = data->size < sizeof(v) - 1 ? data->size : sizeof(v) - 1;
+    memcpy(v, data->data, n);
+    while (n > 0 && (v[n - 1] == '\n' || v[n - 1] == '\r'))
+        v[--n] = '\0';
+    v[n] = '\0';
+    if (strcmp(v, "-1") == 0) {
+        // Linux: writing -1 to `status` removes EVERY registration.
+        binfmt_misc_clear_all();
+        return 0;
+    }
+    if (strcmp(v, "0") == 0) {
+        binfmt_misc_set_enabled(false);
+        return 0;
+    }
+    if (strcmp(v, "1") == 0) {
+        binfmt_misc_set_enabled(true);
+        return 0;
+    }
+    return _EINVAL;
+}
+
+// One registration. The name travels on the entry (proc_entry_cleanup frees
+// it), rather than an index, so a registration removed between readdir and
+// open cannot make this show a different one.
+static void proc_binfmt_entry_getname(struct proc_entry *entry, char *buf) {
+    snprintf(buf, MAX_NAME, "%s", entry->name != NULL ? entry->name : "");
+}
+
+static int proc_binfmt_entry_show(struct proc_entry *entry, struct proc_data *buf) {
+    if (entry->name == NULL)
+        return _ENOENT;
+    char body[1024];
+    size_t len = 0;
+    int err = binfmt_misc_show(entry->name, body, sizeof(body), &len);
+    if (err < 0)
+        return err;
+    proc_buf_append(buf, body, len);
+    return 0;
+}
+
+static int proc_binfmt_entry_update(struct proc_entry *entry, struct proc_data *data) {
+    if (!superuser())
+        return _EPERM;
+    if (entry->name == NULL)
+        return _ENOENT;
+    return binfmt_misc_control(entry->name, data->data, data->size);
+}
+
+static struct proc_dir_entry proc_binfmt_register = {"register", S_IFREG | 0200,
+    .update = proc_binfmt_register_update};
+static struct proc_dir_entry proc_binfmt_status = {"status", S_IFREG | 0644,
+    .show = proc_binfmt_status_show, .update = proc_binfmt_status_update};
+static struct proc_dir_entry proc_binfmt_entry = {NULL, S_IFREG | 0644,
+    .getname = proc_binfmt_entry_getname, .show = proc_binfmt_entry_show,
+    .update = proc_binfmt_entry_update};
+
+static bool proc_binfmt_misc_readdir(struct proc_entry *UNUSED(entry), unsigned long *index,
+        struct proc_entry *next_entry) {
+    // Nothing at all until it is mounted -- an empty directory is what Linux
+    // shows, and what every kernel without CONFIG_BINFMT_MISC shows.
+    if (!binfmt_misc_is_mounted())
+        return false;
+    if (*index == 0) {
+        *next_entry = (struct proc_entry) {&proc_binfmt_register};
+        (*index)++;
+        return true;
+    }
+    if (*index == 1) {
+        *next_entry = (struct proc_entry) {&proc_binfmt_status};
+        (*index)++;
+        return true;
+    }
+    char name[MAX_NAME];
+    if (!binfmt_misc_name_at(*index - 2, name, sizeof(name)))
+        return false;
+    (*index)++;
+    *next_entry = (struct proc_entry) {&proc_binfmt_entry};
+    next_entry->name = strdup(name);
+    return true;
 }
 
 // Set once written, computed from memory otherwise: a value nothing enforces,

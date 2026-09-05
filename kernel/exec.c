@@ -25,6 +25,7 @@
 #include "jit/jit.h"
 #include "tools/ptraceomatic-config.h"
 #include "util/sync.h"
+#include "kernel/binfmt_misc.h"
 
 #define ARGV_MAX 32 * PAGE_SIZE
 
@@ -1300,11 +1301,98 @@ static inline int user_memset(guest_addr_t start, byte_t val, dword_t len) {
     return 0;
 }
 
+static struct fd *open_exec(const char *file, struct statbuf *stat);
+static int format_exec(struct fd *fd, const char *file, struct exec_args argv, struct exec_args envp);
+
+// binfmt_misc: hand the file to a registered interpreter.
+//
+// This is what makes /proc/sys/fs/binfmt_misc honest. That directory used to
+// present `register` and `status` with nothing behind them, so update-binfmts
+// registered a format, was told it worked, and execve never consulted it -- a
+// guest looked configured and silently ran nothing. A registration that is
+// visible there has to reach here, or the empty directory was the better lie.
+//
+// Modelled on shebang_exec above, and the argv it builds is Linux's
+// (fs/binfmt_misc.c load_misc_binary):
+//
+//   without P: interpreter, file, original argv[1..]   -- argv[0] is DROPPED
+//   with    P: interpreter, file, original argv[0..]   -- argv[0] preserved
+static int binfmt_misc_exec(struct fd *fd, const char *file, struct exec_args argv,
+                            struct exec_args envp) {
+    if (fd->ops->lseek(fd, 0, SEEK_SET))
+        return _EIO;
+    char header[128];
+    ssize_t size = fd->ops->read(fd, header, sizeof(header));
+    if (size < 0)
+        return _EIO;
+
+    char interpreter[MAX_PATH];
+    bool preserve_argv0 = false;
+    if (!binfmt_misc_match(file, header, (size_t) size, interpreter,
+                           sizeof(interpreter), &preserve_argv0))
+        return _ENOEXEC;
+
+    // Everything after argv[0]. With P the original argv[0] is kept as well,
+    // so the interpreter can see how the program was invoked.
+    struct exec_args argv_rest = {
+        .count = argv.count > 0 ? argv.count - 1 : 0,
+        .args = argv.count > 0 ? argv.args + strlen(argv.args) + 1 : argv.args,
+    };
+    const char *argv0 = argv.count > 0 ? argv.args : NULL;
+    size_t args_rest_size = args_size(argv_rest);
+    size_t interpreter_len = strlen(interpreter);
+    size_t file_len = strlen(file);
+    size_t argv0_len = (preserve_argv0 && argv0 != NULL) ? strlen(argv0) : 0;
+
+    size_t extra = interpreter_len + 1 + file_len + 1;
+    if (preserve_argv0 && argv0 != NULL)
+        extra += argv0_len + 1;
+    if (args_rest_size + extra >= ARGV_MAX)
+        return _E2BIG;
+
+    char *new_argv_buf = malloc(ARGV_MAX);
+    if (new_argv_buf == NULL)
+        return _ENOMEM;
+    struct exec_args new_argv = {.args = new_argv_buf};
+    size_t n = 0;
+    memcpy(new_argv_buf, interpreter, interpreter_len + 1);
+    new_argv.count++;
+    n += interpreter_len + 1;
+    memcpy(new_argv_buf + n, file, file_len + 1);
+    new_argv.count++;
+    n += file_len + 1;
+    if (preserve_argv0 && argv0 != NULL) {
+        memcpy(new_argv_buf + n, argv0, argv0_len + 1);
+        new_argv.count++;
+        n += argv0_len + 1;
+    }
+    memcpy(new_argv_buf + n, argv_rest.args, args_rest_size);
+    new_argv.count += argv_rest.count;
+
+    // The interpreter is executed, so it faces the same rules as any other
+    // program -- execute permission, ordinary file, a mount that allows exec.
+    struct statbuf interpreter_stat;
+    struct fd *interpreter_fd = open_exec(interpreter, &interpreter_stat);
+    if (IS_ERR(interpreter_fd)) {
+        free(new_argv_buf);
+        return (int) PTR_ERR(interpreter_fd);
+    }
+    int err = format_exec(interpreter_fd, interpreter, new_argv, envp);
+    free(new_argv_buf);
+    if (err < 0)
+        fd_close(interpreter_fd);
+    return err;
+}
+
 static int format_exec(struct fd *fd, const char *file, struct exec_args argv, struct exec_args envp) {
     int err = (int)elf_exec(fd, file, argv, envp);
     if (err != _ENOEXEC)
         return err;
-    // other formats would go here
+    // A registered binfmt_misc interpreter is consulted only after every
+    // built-in format has declined, exactly as Linux orders its binfmt list.
+    err = binfmt_misc_exec(fd, file, argv, envp);
+    if (err != _ENOEXEC)
+        return err;
     return _ENOEXEC;
 }
 

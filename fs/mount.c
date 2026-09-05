@@ -5,6 +5,7 @@
 #include "fs/path.h"
 #include "fs/real.h"
 #include "fs/dev.h"
+#include "kernel/binfmt_misc.h"
 
 // Sized for the static set below plus the two the iOS app registers at
 // startup (iosfs and iosfs_unsafe) with room to spare -- overflowing this
@@ -50,6 +51,8 @@ void fs_register(const struct fs_ops *fs) {
     assert(!"reached filesystem limit");
 }
 
+#define BINFMT_MISC_FS_LINE "nodev    binfmt_misc\n"
+
 char * get_filesystems(void) {
     unsigned int i;
     size_t total_len = 0;
@@ -60,6 +63,14 @@ char * get_filesystems(void) {
             total_len += strlen("nodev    ") + strlen(filesystems[i]->name) + 1; // +1 for newline
         }
     }
+    // binfmt_misc is a filesystem TYPE the kernel accepts but not an entry in
+    // filesystems[]: mounting it does not create a mount, it brings
+    // /proc/sys/fs/binfmt_misc's `register` and `status` into being (fs/proc/sys.c).
+    // It has to be listed here all the same, because mount(8) reads this file
+    // and refuses a type it does not find WITHOUT EVER CALLING mount(2) --
+    // which is exactly why the accept-the-mount branch further down was
+    // unreachable for years.
+    total_len += strlen(BINFMT_MISC_FS_LINE);
 
     // Pass 2: Allocate and populate the buffer
     char *fs_list = malloc(total_len + 1); // +1 for null terminator
@@ -77,6 +88,8 @@ char * get_filesystems(void) {
             *ptr++ = '\n';
         }
     }
+    memcpy(ptr, BINFMT_MISC_FS_LINE, strlen(BINFMT_MISC_FS_LINE));
+    ptr += strlen(BINFMT_MISC_FS_LINE);
     *ptr = '\0';
 
     return fs_list;
@@ -823,12 +836,24 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
     // after the dot only names the daemon for mtab display.
     if (fs == NULL && strncmp(type, "fuse.", 5) == 0)
         fs = &fusefs;
+    // binfmt_misc is not a mount in AOK's table: the directory already exists
+    // in procfs and mounting it brings `register` and `status` into being, the
+    // way Linux does. So this accepts the mount and flips the flag procfs
+    // reads, rather than creating a mount.
+    //
+    // This used to accept the mount and do NOTHING, which was unreachable in
+    // practice -- mount(8) reads /proc/filesystems first and refused the type
+    // before ever calling mount(2) -- but would have handed a direct mount(2)
+    // caller (systemd does this) a successful mount of an empty directory, a
+    // state Linux cannot produce.
     if (fs == NULL &&
             strcmp(point, "/proc/sys/fs/binfmt_misc") == 0 &&
             (strcmp(type, "binfmt_misc") == 0 ||
              strcmp(source, "binfmt_misc") == 0 ||
              strcmp(source, "none") == 0)) {
+        binfmt_misc_set_mounted(true);
         unlock(&mounts_lock);
+        proc_mountinfo_notify_changed();
         return 0;
     }
     if (fs == NULL) {
@@ -911,6 +936,14 @@ struct fscontext_data {
     const struct fs_ops *fs;
     bool created;
     bool readonly;
+    // binfmt_misc is not a mount in AOK's table -- the directory already exists
+    // in procfs and "mounting" it brings `register` and `status` into being
+    // (fs/proc/sys.c). It still has to be reachable through the NEW mount API,
+    // because util-linux 2.41's libmount tries fsopen FIRST and only falls back
+    // to mount(2) on ENOSYS: an ENODEV from fsopen made it report "unknown
+    // filesystem type" and never call mount(2) at all, so the working mount(2)
+    // path below was dead for every caller that used the tool.
+    bool binfmt_misc;
     char point[MAX_PATH];
 };
 
@@ -946,13 +979,14 @@ fd_t sys_fsopen_guest(guest_addr_t fsname_addr, dword_t flags) {
             break;
         }
     }
-    if (fs == NULL)
+    bool is_binfmt = fs == NULL && strcmp(fsname, "binfmt_misc") == 0;
+    if (fs == NULL && !is_binfmt)
         return _ENODEV;
 
     struct fscontext_data *data = malloc(sizeof(struct fscontext_data));
     if (data == NULL)
         return _ENOMEM;
-    *data = (struct fscontext_data) {.fs = fs};
+    *data = (struct fscontext_data) {.fs = fs, .binfmt_misc = is_binfmt};
     struct fd *fd = adhoc_fd_create(&fscontext_ops);
     if (fd == NULL) {
         free(data);
@@ -1015,6 +1049,16 @@ dword_t sys_fsconfig_guest(fd_t f, dword_t cmd, guest_addr_t key_addr, guest_add
             // generic_mkdirat resolves its path via mount_find, which takes
             // mounts_lock itself -- must run before we take the lock below,
             // or this self-deadlocks (mounts_lock isn't recursive).
+            if (data->binfmt_misc) {
+                // Nothing to stage. This is where Linux's fs_context creates
+                // the superblock, and for binfmt_misc creating it IS the whole
+                // effect -- `register` and `status` come into being. move_mount
+                // then has nothing left to do but name where it already is.
+                binfmt_misc_set_mounted(true);
+                proc_mountinfo_notify_changed();
+                data->created = true;
+                return 0;
+            }
             int mkerr = generic_mkdirat(AT_PWD, "/.ish-fsmount", 0700);
             if (mkerr < 0 && mkerr != _EEXIST)
                 return mkerr;
@@ -1077,6 +1121,18 @@ fd_t sys_fsmount_guest(fd_t f, dword_t flags, dword_t attr_flags) {
     struct fscontext_data *data = fd->data;
     if (!data->created)
         return _EINVAL;
+
+    if (data->binfmt_misc) {
+        // There is no staged mount to hand back: fsconfig(CREATE) above already
+        // did the whole of what "mounting" binfmt_misc means. Return a
+        // directory fd on the real thing, which is what move_mount will be
+        // given and what /proc/self/fdinfo would show.
+        struct fd *dirfd = generic_open_realroot("/proc/sys/fs/binfmt_misc",
+                O_RDONLY_ | O_DIRECTORY_ | O_CLOEXEC_, 0);
+        if (IS_ERR(dirfd))
+            return PTR_ERR(dirfd);
+        return f_install(dirfd, O_CLOEXEC_);
+    }
 
     // data->point is a real-root staging path (/.ish-fsmount/<n>) that is
     // not visible inside a chroot; open it against the real root, or
@@ -1209,6 +1265,17 @@ dword_t sys_move_mount_guest(fd_t from_dfd, guest_addr_t from_path_addr, fd_t to
     err = path_normalize(AT_PWD, to_path_raw, to_point, N_SYMLINK_FOLLOW);
     if (err < 0)
         return err;
+
+    // binfmt_misc has already arrived: fsconfig(CMD_CREATE) brought `register`
+    // and `status` into being, and there is no mount object to relocate. The
+    // fd fsmount handed back is a plain directory fd on the target itself, so
+    // the move is a no-op -- succeed rather than failing after the effect has
+    // happened, which is what left mount(8) reporting "wrong fs type" over a
+    // directory that had in fact just been populated.
+    if (strcmp(from_point, "/proc/sys/fs/binfmt_misc") == 0 &&
+            strcmp(to_point, "/proc/sys/fs/binfmt_misc") == 0 &&
+            binfmt_misc_is_mounted())
+        return 0;
 
     // The same rule sys_mount_guest applies to devtmpfs, or this API would be
     // a way around it: a devtmpfs must not be moved on top of a /dev that is

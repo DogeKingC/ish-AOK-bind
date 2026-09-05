@@ -516,6 +516,7 @@ src = [
     'kernel/ktop_glue.c',
     'kernel/exit.c',
     'kernel/time.c',
+    'kernel/binfmt_misc.c',
     'kernel/mmap.c',
     'kernel/swap.c',
     'kernel/uname.c',
