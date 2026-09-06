@@ -7258,6 +7258,105 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
         return true;
     }
 
+    // 66 0F 3A: palignr (0F), pcmpestri (61), pcmpistri (63).
+    //
+    // These three are the whole three-byte-opcode footprint of glibc's string
+    // functions, and they were 98.7% of every amd64 JIT block fallback on a
+    // gcc workload -- 16177 of 16384. A fallback is not one bridged
+    // instruction: jit.c frees the WHOLE compiled block and interprets it, so
+    // one of these inside strlen de-JITs everything around it.
+    //
+    // Both operand forms are handled, and the memory one is the point. Static
+    // greps of libc suggest palignr/pcmpistri; what actually EXECUTES is
+    // dominated by pcmpestri against memory. Measured over the same workload,
+    // by (op3, mod): 61/mem 12936, 0f/mem 4819, 63/mem 2424, and only 51 of
+    // 20250 in any register form. An earlier version of this handled mod==3
+    // only and moved the fallback count by nothing at all.
+    //
+    // 0x3a is NOT in amd64_opcode_needs_modrm's list, so the decoder stops
+    // right after the escape byte: has_modrm is false and amd64_ip points AT
+    // op3. Layout from there is <op3> <modrm> [sib] [disp] <imm8>.
+    if (!insn.address_size_prefix && insn.two_byte_opcode &&
+            !insn.fs_prefix && !insn.lock_prefix &&
+            insn.operand_size_prefix && insn.rep_mode == amd64_jit_rep_none &&
+            insn.op2 == 0x3a) {
+        byte_t op3 = 0, str3a_modrm = 0;
+        if (tlb_read(tlb, state->amd64_ip, &op3, sizeof(op3)) &&
+                (op3 == 0x0f || op3 == 0x61 || op3 == 0x63) &&
+                tlb_read(tlb, state->amd64_ip + 1, &str3a_modrm, sizeof(str3a_modrm))) {
+            extern void gadget_amd64_v_palignr_xmm(void);
+            extern void gadget_amd64_v_pcmpistri_xmm(void);
+            extern void gadget_amd64_v_pcmpestri_xmm(void);
+            extern void gadget_amd64_v_palignr_mem(void);
+            extern void gadget_amd64_v_pcmpistri_mem(void);
+            extern void gadget_amd64_v_pcmpestri_mem(void);
+            void (*g_reg)(void) = op3 == 0x0f ? gadget_amd64_v_palignr_xmm
+                                : op3 == 0x61 ? gadget_amd64_v_pcmpestri_xmm
+                                              : gadget_amd64_v_pcmpistri_xmm;
+            void (*g_mem)(void) = op3 == 0x0f ? gadget_amd64_v_palignr_mem
+                                : op3 == 0x61 ? gadget_amd64_v_pcmpestri_mem
+                                              : gadget_amd64_v_pcmpistri_mem;
+            // palignr touches only xmm; the two pcmp forms write RCX and the
+            // flags, so a cached GPR has to go back to memory first.
+            bool writes_gpr = (op3 != 0x0f);
+            byte_t imm8 = 0;
+
+            if (amd64_modrm_mod(str3a_modrm) == 3) {
+                if (tlb_read(tlb, state->amd64_ip + 2, &imm8, sizeof(imm8))) {
+                    unsigned reg_id = amd64_modrm_reg(str3a_modrm) | (insn.rex.r ? 8 : 0);
+                    unsigned rm_id = amd64_modrm_rm(str3a_modrm) | (insn.rex.b ? 8 : 0);
+                    next_ip = state->amd64_ip + 3;
+                    state->amd64_ip = next_ip;
+                    amd64_jit_debug("v-str3a-reg op3=%02x ip=%llx src=%u dst=%u imm=%u",
+                            op3, (unsigned long long) insn.start_ip, rm_id, reg_id,
+                            (unsigned) imm8);
+                    if (writes_gpr)
+                        gen_amd64_flush_reg_cache(state);
+                    gen(state, (unsigned long) g_reg);
+                    gen(state, (unsigned long) (rm_id | (reg_id << 4)
+                                | ((unsigned long) imm8 << 8)));
+                    gen_amd64_defer_rip(state, next_ip);
+                    return true;
+                }
+            } else {
+                // gen_amd64_decode_mem_meta reads the ModRM out of insn and
+                // its SIB/disp from amd64_ip+1, so it needs both moved on by
+                // one byte to skip op3. Restored before any failure path.
+                struct amd64_jit_insn mem_insn = insn;
+                mem_insn.modrm = str3a_modrm;
+                mem_insn.has_modrm = true;
+                guest_addr_t saved_ip = state->amd64_ip;
+                unsigned long meta = 0, disp = 0;
+                guest_addr_t after_mem = 0;
+                state->amd64_ip = saved_ip + 1;
+                bool got_mem = gen_amd64_decode_mem_meta(state, tlb, &mem_insn, 128,
+                        &meta, &disp, &after_mem);
+                state->amd64_ip = saved_ip;
+                // imm8 follows the whole memory operand, so the instruction
+                // ends one byte past it. That end is what the gadget adds for
+                // a RIP-relative address, which is why it must include imm8.
+                if (got_mem && tlb_read(tlb, after_mem, &imm8, sizeof(imm8))) {
+                    next_ip = after_mem + 1;
+                    state->amd64_ip = next_ip;
+                    meta |= ((unsigned long) imm8) << 40;
+                    amd64_jit_debug("v-str3a-mem op3=%02x ip=%llx meta=%lx imm=%u",
+                            op3, (unsigned long long) insn.start_ip, meta,
+                            (unsigned) imm8);
+                    // Base/index registers must be in memory for the address
+                    // computation, and rip flushed so a fault re-executes.
+                    gen_amd64_flush_reg_cache(state);
+                    gen_amd64_flush_rip(state);
+                    gen(state, (unsigned long) g_mem);
+                    gen(state, meta);
+                    gen(state, disp);
+                    gen(state, (unsigned long) next_ip);
+                    gen_amd64_defer_rip(state, next_ip);
+                    return true;
+                }
+            }
+        }
+    }
+
     // 66 0F D7 pmovmskb r32, xmm, mod==3: pack the 16 byte-MSBs of xmm[rm] into a
     // 16-bit mask in GPR[reg] (zero-extended). Writes a GPR -> flush the reg cache.
     // This + pcmpeqb is the core of glibc's SSE2 strlen/memchr. (No mem form exists.)

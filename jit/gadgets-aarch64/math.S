@@ -2852,6 +2852,52 @@ amd64_v_neon_binop punpcklqdq, zip1, 2d
     gret 1
 
 # ---------------------------------------------------------------------------
+# 66 0F 3A 0F palignr xmm, xmm, imm8   (mod==3)
+# 66 0F 3A 63 pcmpistri xmm, xmm, imm8 (mod==3)
+#
+# These two are the ENTIRE three-byte-opcode footprint of glibc's string
+# functions -- 309 palignr and 202 pcmpistri in libc.so.6 -- and together they
+# were 98.7% of every amd64 JIT block fallback measured on a gcc workload
+# (16384 fallbacks, 6 distinct opcodes, 0f 3a = 16177 of them).
+#
+# A fallback is not one bridged instruction. jit.c frees the whole compiled
+# block and runs it interpreted, so a single pcmpistri inside strlen de-JITs
+# every instruction around it -- which is why glibc string code has been the
+# slowest thing an amd64 guest does.
+#
+# Both call into C rather than open-coding the semantics: palignr is a 32-byte
+# funnel shift and pcmpistri is the full SSE4.2 aggregation-with-imm-control,
+# and emu/vec.c already has both, bit-exact against real Intel via
+# tests/remote/corpus/sse4.c. The win here is keeping the BLOCK compiled, not
+# shaving the instruction.
+#
+# Operand word: xmm src (rm) id in bits 0-3, xmm dst (reg) id in bits 4-7,
+# imm8 in bits 8-15.
+# ---------------------------------------------------------------------------
+# Register form: xmm src (rm) id in bits 0-3, xmm dst (reg) id in bits 4-7,
+# imm8 in bits 8-15.
+.macro amd64_v_str3a_reg name, helper
+    .gadget amd64_v_\name\()_xmm
+        ldr  x8, [_ip]
+        and  x9, x8, 0xf
+        ubfx x10, x8, 4, 4
+        ubfx x11, x8, 8, 8
+        add  x12, _cpu, CPU_xmm
+        save_c
+        mov  x0, _cpu
+        add  x1, x12, x9, lsl 4
+        add  x2, x12, x10, lsl 4
+        mov  w3, w11
+        bl   NAME(\helper)
+        restore_c
+        gret 1
+.endm
+
+amd64_v_str3a_reg palignr,   vec_palignr128
+amd64_v_str3a_reg pcmpistri, amd64_jit_pcmpistri
+amd64_v_str3a_reg pcmpestri, amd64_jit_pcmpestri
+
+# ---------------------------------------------------------------------------
 # Native amd64 SSE memory load/store.
 #
 # Unlike the i386 SSE path, amd64 guest addresses are 47-bit, so the 32-bit
@@ -3125,6 +3171,53 @@ amd64_v_neon_binop_mem punpcklwd, zip1, 8h
 amd64_v_neon_binop_mem punpckldq, zip1, 4s
 amd64_v_neon_binop_mem punpcklqdq, zip1, 2d
 amd64_v_neon_binop_mem pcmpeqb, cmeq, 16b
+
+# Memory form -- the one that matters. glibc compares AGAINST memory, so mod
+# 0/1 is 99.75% of real use (20199 of 20250 decodes on a gcc workload); the
+# register form was 51.
+#
+# Operand layout is the same [meta][disp][next_ip] the other vector memory
+# gadgets use, so the miss/cross-page machinery is unchanged, with imm8 packed
+# into meta bits 40-47 -- nothing above bit 35 is used by AMD64_JIT_MEM_*, and
+# a fourth operand word would have meant teaching the fault path a new stride.
+#
+# meta has to be re-read from [_ip] after the prep: amd64_vread_prep clobbers
+# x8 (and x11/x12/x13), while x10 survives it. The source is pulled into q1
+# before save_c -- NEON registers are untouched by it -- and spilled to a
+# 16-byte stack slot, because the vec.c helpers take a pointer.
+.macro amd64_v_str3a_mem name, helper
+    .gadget amd64_v_\name\()_mem
+        ldr  x8, [_ip]
+        ldr  x9, [_ip, 8]
+        ubfx x10, x8, 8, 4
+        amd64_vmem_addr
+        amd64_vread_prep 16, \name\()m
+        ldr  q1, [x9]
+        ldr  x8, [_ip]
+        ubfx x11, x8, 40, 8
+        save_c
+        sub  sp, sp, 16
+        str  q1, [sp]
+        # _cpu IS x1, so every use of it must happen before x1 becomes the
+        # src argument. Computing the dst pointer after `mov x1, sp` reads the
+        # stack pointer as the cpu base and lands the destination in nowhere --
+        # which shows up not as a crash but as pcmpistri quietly returning a
+        # constant, and glibc's strcmp silently agreeing with itself.
+        mov  x0, _cpu
+        add  x2, _cpu, CPU_xmm
+        add  x2, x2, x10, lsl 4
+        mov  w3, w11
+        mov  x1, sp
+        bl   NAME(\helper)
+        add  sp, sp, 16
+        restore_c
+        gret 3
+        amd64_vread_bullshit 16, \name\()m
+.endm
+
+amd64_v_str3a_mem palignr,   vec_palignr128
+amd64_v_str3a_mem pcmpistri, amd64_jit_pcmpistri
+amd64_v_str3a_mem pcmpestri, amd64_jit_pcmpestri
 
 # movq xmm, m64 (F3 0F 7E mem form, or 66 0F 6E with REX.W): load 8 bytes into
 # the low lane of xmm[reg], zero the high lane.
