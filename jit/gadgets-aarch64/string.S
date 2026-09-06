@@ -89,14 +89,36 @@
             ldr esi, [_cpu, CPU_esi]
             ldr edi, [_cpu, CPU_edi]
             ldr ecx, [_cpu, CPU_ecx]
-            cbnz x19, 7f                /* nonzero: faulted */
+            cbnz x19, 7f                /* nonzero: faulted, or poked */
             gret 1
         7:
+            cmp x19, 3
+            b.eq 5f                     /* x19==3: poked mid-rep */
             cmp x19, 1
             b.ne 6f                     /* x19==2: dest/write fault */
             b segfault_read             /* x19==1: source/read fault */
         6:
             b segfault_write
+        5:
+            # Poked in the middle of a rep. ecx/esi/edi were written back by
+            # the helper and are the restart state x86 defines, so all this
+            # has to do is rewind eip to THIS instruction and leave: [_ip] is
+            # the same operand slot segfault_read/segfault_write read, which
+            # is there for exactly this purpose. The frontend consumes the
+            # poke (jit_should_yield -> cpu_take_poke), services whatever
+            # raised it, and re-enters; the rep resumes with the ecx it kept.
+            #
+            # Deliberately NOT the shared `poke` label. That one rewinds to the
+            # start of the BLOCK, which is correct where it is used -- at a
+            # block boundary -- and wrong here, because it would re-execute
+            # every instruction between the block start and this rep.
+            #
+            # An unconditional branch reaches jit_ret in entry.S; a conditional
+            # one could not (same range constraint as `b poke` in control.S),
+            # which is why the test above jumps to this local label first.
+            ldr x0, [_ip]
+            mov eip, w0
+            b jit_ret
         8:
         .endif
         .endifin
@@ -164,7 +186,38 @@
                     cbz _tmp, 2f
                 .endif N .endif
             .endifin
-            cbnz ecx, 1b
+            cbz ecx, 2f
+            # A rep that does NOT take the bulk fast path above -- backward
+            # (DF=1), or any scas/cmps/lods -- runs its whole count right here,
+            # and this loop used to have no way out. Measured on a 96 MB buffer
+            # with a 1ms repeating timer: a backward `rep movsb` took 118ms and
+            # delivered ONE signal, `repne scasb` 111ms and one. Those are
+            # longer stalls than the forward case, because this path pays a TLB
+            # lookup per element instead of a memmove per page-run.
+            #
+            # Nothing can reach the thread for that whole window: not a signal
+            # (no SIGKILL, no SIGSTOP), and not the swap pager's throttle poke
+            # -- which this loop is precisely the thing that provokes, since a
+            # backward fill takes a write TLB miss every 4 KiB and that is the
+            # sensor that calls cpu_poke (emu/tlb.c).
+            #
+            # ecx doubles as the counter: it decrements every iteration, so
+            # testing its low bits costs no register and checks once per 1024
+            # elements. Two instructions on the back edge buys a bound on how
+            # long this loop can ignore the rest of the system.
+            tst ecx, 1023
+            b.ne 1b
+            ldr x8, [_cpu, CPU_poked_ptr]
+            ldrb w8, [x8]
+            cbz w8, 1b
+            # Poked. eip goes back to this instruction and we leave; jit_exit's
+            # save_regs spills ecx/esi/edi, which ARE the x86 restart state, so
+            # re-entry resumes the rep exactly where it stopped. _tmp is x0 and
+            # is dead here (the scas/cmps compare above has been consumed, and a
+            # movs value has already been stored).
+            ldr x0, [_ip]
+            mov eip, w0
+            b jit_ret
     2:
         .endif
         gret 1

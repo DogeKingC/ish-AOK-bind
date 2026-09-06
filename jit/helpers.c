@@ -1,9 +1,12 @@
 #include <time.h>
+#include <stdlib.h>
+#include <stdio.h>
 #include "emu/cpu.h"
 #include "emu/cpuid.h"
 #include "emu/tlb.h"
 #include "kernel/task.h"
 #include "util/sync.h"
+#include "emu/vec.h"
 
 void helper_cpuid(dword_t *a, dword_t *b, dword_t *c, dword_t *d) {
     do_cpuid(a, b, c, d);
@@ -111,6 +114,10 @@ int helper_atomic_cmpxchg8b(struct cpu_state *cpu, struct tlb *tlb, dword_t addr
 // and tlb->segfault_addr already set by the miss handler, so the gadget jumps
 // to the existing segfault_read/segfault_write exit.
 //
+// It returns 3 when a poke arrived mid-rep, with that same restart state, and
+// the gadget exits to jit_ret with eip set back to this instruction so the rep
+// resumes after the interrupt has been handled.
+//
 // Overlapping forward movs (edi>esi within the run) is the x86 "smear" case
 // that memmove would NOT reproduce, so it falls back to single-element copies
 // through guest memory, which smears identically to the hardware.
@@ -179,6 +186,38 @@ int rep_string_fast(struct cpu_state *cpu, struct tlb *tlb, unsigned elem_size, 
         cpu->ecx = ecx;
         cpu->edi = edi;
         cpu->esi = esi;
+
+        // x86 makes REP interruptible BETWEEN iterations, and until now AOK
+        // did not: this helper ran to ecx == 0 no matter how long that took,
+        // and the JIT only tests the poke flag at block boundaries. A guest
+        // memcpy compiled to `rep movsb` over a large buffer therefore held
+        // the thread inside one gadget for the whole copy -- a signal could
+        // not be delivered, and the swap pager's throttle poke (emu/tlb.c
+        // sets mem_throttle_wanted and calls cpu_poke) could not reach the
+        // thread it was aimed at, so reclaim waited on a copy that had
+        // already faulted in everything it touched.
+        //
+        // Once per loop iteration, which is once per page-run on the bulk arm
+        // above and once per ELEMENT on the single-element arm (an overlapping
+        // forward movs, or an element straddling a page). That is the right
+        // way round: the single-element arm is the slow one, so it is the one
+        // that most needs to be interruptible, and it is rare enough that a
+        // load per element does not matter.
+        //
+        // Only AFTER the registers above have been written back and progress
+        // has been made. ecx, edi and esi are exactly the restart state x86
+        // defines for #PF, so re-executing the instruction resumes where this
+        // left off; returning before doing any work would livelock on a flag
+        // nobody clears.
+        //
+        // Relaxed, and a load rather than an exchange. No ordering is needed
+        // -- nothing here reads data published alongside the flag -- and the
+        // authoritative read is cpu_take_poke's seq_cst exchange, which is
+        // what actually consumes it. Clearing it here would swallow the poke
+        // and yield for nothing. This matches jit_ret_chain, which reads the
+        // same byte with a plain ldrb.
+        if (ecx != 0 && __atomic_load_n(cpu->poked_ptr, __ATOMIC_RELAXED))
+            return 3;
     }
     return 0;
 }
@@ -303,4 +342,47 @@ void helper_aad(struct cpu_state *cpu, uint32_t base) {
     al = (uint8_t) sum;
     cpu->eax = (cpu->eax & 0xffff0000) | al;
     bcd_set_result_flags(cpu, al);
+}
+
+// ---------------------------------------------------------------------------
+// 66 0F 3A 63 pcmpistri, register form. Called from the JIT gadget rather than
+// having it call vec_pcmpistri128 directly, because two things must happen
+// afterwards and both are easy to miss in assembly:
+//
+//   - the index lands in cpu->ecx. vec.c's pcmp helpers are shared with the
+//     i386 emulator and write the LEGACY register; for an amd64 guest it has
+//     to be moved into amd64_regs[rcx], zero-extended to 64 bits.
+//   - the flags it sets are the lazy kind, so they have to be collapsed before
+//     anything reads them.
+//
+// emu/amd64_interp.c's bridge does exactly this pair after its own call. A
+// gadget that skipped either would not fail loudly -- it would return a stale
+// rcx or stale flags to glibc's strlen, which is the worst possible shape for
+// a bug.
+// ---------------------------------------------------------------------------
+void amd64_jit_pcmpistri(struct cpu_state *cpu, const union xmm_reg *src,
+        union xmm_reg *dst, uint8_t imm) {
+    vec_pcmpistri128(cpu, src, dst, imm);
+    cpu->amd64_regs[amd64_rcx] = (uint32_t) cpu->ecx;
+    collapse_flags(cpu);
+}
+
+// 66 0F 3A 61 pcmpestri. The EXPLICIT-length form, and the one that actually
+// dominates: measured over a gcc workload in the amd64 guest, op3=0x61 was
+// 12956 of 20250 three-byte decodes (64%), against 6 for the register form of
+// pcmpistri. It does not show up in a mnemonic grep of libc because glibc
+// reaches it through strcmp/strncmp rather than by name.
+//
+// Unlike pcmpistri it reads the string lengths from EAX and EDX, and those are
+// the LEGACY registers -- vec.c is shared with the i386 emulator -- so for an
+// amd64 guest they have to be staged down from RAX/RDX first. The interpreter
+// does exactly this before its own call; a gadget that skipped it would hand
+// vec.c whatever the last i386-shaped write happened to leave behind.
+void amd64_jit_pcmpestri(struct cpu_state *cpu, const union xmm_reg *src,
+        union xmm_reg *dst, uint8_t imm) {
+    cpu->eax = (dword_t) cpu->amd64_regs[amd64_rax];
+    cpu->edx = (dword_t) cpu->amd64_regs[amd64_rdx];
+    vec_pcmpestri128(cpu, src, dst, imm);
+    cpu->amd64_regs[amd64_rcx] = (uint32_t) cpu->ecx;
+    collapse_flags(cpu);
 }

@@ -261,3 +261,4 @@ native_zsh_fork_state.sh
 native_bash_fork_state.sh
 native_signal_write_eintr.sh
 stack_guard_gap.c
+x86/rep_interruptible.c

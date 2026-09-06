@@ -145,6 +145,13 @@ static bool amd64_opcode_needs_modrm(const struct amd64_jit_insn *insn) {
         case 0xab:
         case 0xac:
         case 0xad:
+        // 0xae was missing here, and the omission was worth 20% of all
+        // remaining block fallbacks. 0F AE (the fence / xsave group) HAS a
+        // handler -- the 0f-rm-helper bridge -- but that arm is gated on
+        // insn.has_modrm, which this switch is the only thing that sets. So
+        // every LFENCE/MFENCE/SFENCE fell through the entire chain to
+        // amd64_bridge_step and de-JITted its whole block.
+        case 0xae:
         case 0xaf:
         case 0xb0:
         case 0xb1:
@@ -491,6 +498,25 @@ static void gen_amd64_jcc(struct gen_state *state, unsigned cc,
     state->jump_ip[1] = state->size - 1;
 #else
     (void) state; (void) cc; (void) target_ip; (void) next_ip;
+#endif
+}
+
+// JRCXZ (0xe3): branch if RCX == 0. A conditional branch with a register test
+// instead of a flag test, so it is chained like a jcc (tagged operands +
+// jump_ip) rather than exiting the block the way LOOP does.
+static void gen_amd64_jrcxz(struct gen_state *state,
+        guest_addr_t target_ip, guest_addr_t next_ip) {
+#if defined(__aarch64__)
+    extern void gadget_amd64_jrcxz(void);
+    gen_amd64_flush_reg_cache(state);
+    state->amd64_deferred_rip_valid = false;
+    gen(state, (unsigned long) gadget_amd64_jrcxz);
+    gen(state, (unsigned long) (target_ip | (1ull << 63)));   // taken
+    state->jump_ip[0] = state->size - 1;
+    gen(state, (unsigned long) (next_ip | (1ull << 63)));     // else
+    state->jump_ip[1] = state->size - 1;
+#else
+    (void) state; (void) target_ip; (void) next_ip;
 #endif
 }
 
@@ -5859,8 +5885,17 @@ static bool amd64_jit_one_byte_branch_prefixes(const struct amd64_jit_insn *insn
 }
 
 static bool amd64_jit_one_byte_rel_call_prefixes(const struct amd64_jit_insn *insn) {
+    // No !operand_size_prefix here on purpose. In 64-bit mode the operand-size
+    // prefix is IGNORED on a near call -- which is exactly why the assembler
+    // uses 66 as padding in the general-dynamic TLS sequence
+    // `66 66 48 e8 <rel32>` (data16 data16 rex64 call __tls_get_addr@plt).
+    // libmpfr alone carries 1887 of those and is linked into cc1, so rejecting
+    // them was worth 45% of the remaining block fallbacks. This was
+    // conservatism, not semantics: emu/amd64_interp.c's own case 0xe8 fetches
+    // an int32 rel32 and pushes a 64-bit return address without ever consulting
+    // the prefix, so accepting it makes the JIT emit what the interpreter
+    // already runs.
     return !insn->two_byte_opcode &&
-        !insn->operand_size_prefix &&
         !insn->fs_prefix &&
         !insn->lock_prefix &&
         insn->rep_mode == amd64_jit_rep_none;
@@ -5895,7 +5930,17 @@ static bool gen_amd64_decode_mem_meta(struct gen_state *state, struct tlb *tlb,
     bool rip_relative = false;
     int32_t disp = 0;
 
-    if (mod == 3 || insn->address_size_prefix)
+    // A 0x67 address-size prefix is refused for every consumer that actually
+    // DEREFERENCES the address, because none of them truncate it to 32 bits.
+    // LEA is the exception and the only one: it computes an address and never
+    // touches memory, and under 0x67 the low 32 bits of the truncated
+    // computation equal the low 32 bits of the untruncated one (addition and
+    // left-shift are congruent mod 2^32). With the operand size below 64 the
+    // destination write keeps only those bits and zero-extends, so the result
+    // is bit-identical. REX.W would genuinely differ and stays refused.
+    bool lea_addr32_ok = insn->opcode == 0x8d && !insn->two_byte_opcode &&
+        !insn->rex.w;
+    if (mod == 3 || (insn->address_size_prefix && !lea_addr32_ok))
         return false;
 
     if (rm_low == 4) {
@@ -6226,6 +6271,26 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
                 (unsigned long long) insn.start_ip, insn.opcode,
                 (unsigned long long) target_ip, (unsigned long long) next_ip);
         gen_amd64_loop(state, insn.opcode, target_ip, next_ip);
+        return false;
+    }
+
+    // Native JRCXZ (0xe3), rel8. It sat in the literal gap between the LOOP arm
+    // above and the port-I/O arm below and matched nothing, so every one of
+    // them walked the whole chain to amd64_bridge_step and de-JITted its block.
+    // Like LOOP, the 0x67/ECX form is left to the bridge.
+    if (amd64_jit_one_byte_branch_prefixes(&insn) && insn.opcode == 0xe3) {
+        if (!tlb_read(tlb, state->amd64_ip, &rel8, sizeof(rel8))) {
+            state->amd64_ip = state->amd64_orig_ip;
+            state->amd64_fallback_to_interp = true;
+            return false;
+        }
+        next_ip = state->amd64_ip + sizeof(rel8);
+        target_ip = next_ip + rel8;
+        state->amd64_ip = next_ip;
+        amd64_jit_debug("jrcxz ip=%llx target=%llx next=%llx",
+                (unsigned long long) insn.start_ip,
+                (unsigned long long) target_ip, (unsigned long long) next_ip);
+        gen_amd64_jrcxz(state, target_ip, next_ip);
         return false;
     }
 
@@ -7256,6 +7321,164 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
         gen(state, (unsigned long) (rm_id | (reg_id << 4) | ((insn.rex.w ? 1ul : 0ul) << 8)));
         gen_amd64_defer_rip(state, next_ip);
         return true;
+    }
+
+    // 66 0F 38 00 pshufb, both operand forms. The other three-byte escape.
+    // Same decode shape as the 0F 3A block below -- 0x38 is likewise absent
+    // from amd64_opcode_needs_modrm, so amd64_ip points AT op3 -- except that
+    // 0F 38 carries NO trailing imm8, so the instruction ends one byte earlier.
+    //
+    // pshufb was the last opcode still de-JITting blocks on a gcc workload.
+    // Measured, every occurrence was the register form: 21 of 21 decodes were
+    // op3=00, mod=3, 66-prefixed. The memory form is wired up anyway so the
+    // opcode is closed rather than nearly closed.
+    if (!insn.address_size_prefix && insn.two_byte_opcode &&
+            !insn.fs_prefix && !insn.lock_prefix &&
+            insn.operand_size_prefix && insn.rep_mode == amd64_jit_rep_none &&
+            insn.op2 == 0x38) {
+        byte_t op3_38 = 0, modrm_38 = 0;
+        if (tlb_read(tlb, state->amd64_ip, &op3_38, sizeof(op3_38)) &&
+                op3_38 == 0x00 &&
+                tlb_read(tlb, state->amd64_ip + 1, &modrm_38, sizeof(modrm_38))) {
+            if (amd64_modrm_mod(modrm_38) == 3) {
+                extern void gadget_amd64_v_pshufb_xmm(void);
+                unsigned reg_id = amd64_modrm_reg(modrm_38) | (insn.rex.r ? 8 : 0);
+                unsigned rm_id = amd64_modrm_rm(modrm_38) | (insn.rex.b ? 8 : 0);
+                next_ip = state->amd64_ip + 2;
+                state->amd64_ip = next_ip;
+                amd64_jit_debug("v-pshufb-reg ip=%llx src=%u dst=%u",
+                        (unsigned long long) insn.start_ip, rm_id, reg_id);
+                gen(state, (unsigned long) gadget_amd64_v_pshufb_xmm);
+                gen(state, (unsigned long) (rm_id | (reg_id << 4)));
+                gen_amd64_defer_rip(state, next_ip);
+                return true;
+            } else {
+                extern void gadget_amd64_v_pshufb_mem(void);
+                struct amd64_jit_insn m38 = insn;
+                m38.modrm = modrm_38;
+                m38.has_modrm = true;
+                guest_addr_t saved38 = state->amd64_ip;
+                unsigned long meta38 = 0, disp38 = 0;
+                guest_addr_t end38 = 0;
+                state->amd64_ip = saved38 + 1;
+                bool ok38 = gen_amd64_decode_mem_meta(state, tlb, &m38, 128,
+                        &meta38, &disp38, &end38);
+                state->amd64_ip = saved38;
+                if (ok38) {
+                    next_ip = end38;   // no imm8, unlike 0F 3A
+                    state->amd64_ip = next_ip;
+                    amd64_jit_debug("v-pshufb-mem ip=%llx meta=%lx",
+                            (unsigned long long) insn.start_ip, meta38);
+                    gen_amd64_flush_reg_cache(state);
+                    gen_amd64_flush_rip(state);
+                    gen(state, (unsigned long) gadget_amd64_v_pshufb_mem);
+                    gen(state, meta38);
+                    gen(state, disp38);
+                    gen(state, (unsigned long) next_ip);
+                    gen_amd64_defer_rip(state, next_ip);
+                    return true;
+                }
+            }
+        }
+    }
+
+    // 66 0F 3A: palignr (0F), pcmpestri (61), pcmpistri (63).
+    //
+    // These three are the whole three-byte-opcode footprint of glibc's string
+    // functions, and they were 98.7% of every amd64 JIT block fallback on a
+    // gcc workload -- 16177 of 16384. A fallback is not one bridged
+    // instruction: jit.c frees the WHOLE compiled block and interprets it, so
+    // one of these inside strlen de-JITs everything around it.
+    //
+    // Both operand forms are handled, and the memory one is the point. Static
+    // greps of libc suggest palignr/pcmpistri; what actually EXECUTES is
+    // dominated by pcmpestri against memory. Measured over the same workload,
+    // by (op3, mod): 61/mem 12936, 0f/mem 4819, 63/mem 2424, and only 51 of
+    // 20250 in any register form. An earlier version of this handled mod==3
+    // only and moved the fallback count by nothing at all.
+    //
+    // 0x3a is NOT in amd64_opcode_needs_modrm's list, so the decoder stops
+    // right after the escape byte: has_modrm is false and amd64_ip points AT
+    // op3. Layout from there is <op3> <modrm> [sib] [disp] <imm8>.
+    if (!insn.address_size_prefix && insn.two_byte_opcode &&
+            !insn.fs_prefix && !insn.lock_prefix &&
+            insn.operand_size_prefix && insn.rep_mode == amd64_jit_rep_none &&
+            insn.op2 == 0x3a) {
+        byte_t op3 = 0, str3a_modrm = 0;
+        if (tlb_read(tlb, state->amd64_ip, &op3, sizeof(op3)) &&
+                (op3 == 0x0f || op3 == 0x61 || op3 == 0x63) &&
+                tlb_read(tlb, state->amd64_ip + 1, &str3a_modrm, sizeof(str3a_modrm))) {
+            extern void gadget_amd64_v_palignr_xmm(void);
+            extern void gadget_amd64_v_pcmpistri_xmm(void);
+            extern void gadget_amd64_v_pcmpestri_xmm(void);
+            extern void gadget_amd64_v_palignr_mem(void);
+            extern void gadget_amd64_v_pcmpistri_mem(void);
+            extern void gadget_amd64_v_pcmpestri_mem(void);
+            void (*g_reg)(void) = op3 == 0x0f ? gadget_amd64_v_palignr_xmm
+                                : op3 == 0x61 ? gadget_amd64_v_pcmpestri_xmm
+                                              : gadget_amd64_v_pcmpistri_xmm;
+            void (*g_mem)(void) = op3 == 0x0f ? gadget_amd64_v_palignr_mem
+                                : op3 == 0x61 ? gadget_amd64_v_pcmpestri_mem
+                                              : gadget_amd64_v_pcmpistri_mem;
+            // palignr touches only xmm; the two pcmp forms write RCX and the
+            // flags, so a cached GPR has to go back to memory first.
+            bool writes_gpr = (op3 != 0x0f);
+            byte_t imm8 = 0;
+
+            if (amd64_modrm_mod(str3a_modrm) == 3) {
+                if (tlb_read(tlb, state->amd64_ip + 2, &imm8, sizeof(imm8))) {
+                    unsigned reg_id = amd64_modrm_reg(str3a_modrm) | (insn.rex.r ? 8 : 0);
+                    unsigned rm_id = amd64_modrm_rm(str3a_modrm) | (insn.rex.b ? 8 : 0);
+                    next_ip = state->amd64_ip + 3;
+                    state->amd64_ip = next_ip;
+                    amd64_jit_debug("v-str3a-reg op3=%02x ip=%llx src=%u dst=%u imm=%u",
+                            op3, (unsigned long long) insn.start_ip, rm_id, reg_id,
+                            (unsigned) imm8);
+                    if (writes_gpr)
+                        gen_amd64_flush_reg_cache(state);
+                    gen(state, (unsigned long) g_reg);
+                    gen(state, (unsigned long) (rm_id | (reg_id << 4)
+                                | ((unsigned long) imm8 << 8)));
+                    gen_amd64_defer_rip(state, next_ip);
+                    return true;
+                }
+            } else {
+                // gen_amd64_decode_mem_meta reads the ModRM out of insn and
+                // its SIB/disp from amd64_ip+1, so it needs both moved on by
+                // one byte to skip op3. Restored before any failure path.
+                struct amd64_jit_insn mem_insn = insn;
+                mem_insn.modrm = str3a_modrm;
+                mem_insn.has_modrm = true;
+                guest_addr_t saved_ip = state->amd64_ip;
+                unsigned long meta = 0, disp = 0;
+                guest_addr_t after_mem = 0;
+                state->amd64_ip = saved_ip + 1;
+                bool got_mem = gen_amd64_decode_mem_meta(state, tlb, &mem_insn, 128,
+                        &meta, &disp, &after_mem);
+                state->amd64_ip = saved_ip;
+                // imm8 follows the whole memory operand, so the instruction
+                // ends one byte past it. That end is what the gadget adds for
+                // a RIP-relative address, which is why it must include imm8.
+                if (got_mem && tlb_read(tlb, after_mem, &imm8, sizeof(imm8))) {
+                    next_ip = after_mem + 1;
+                    state->amd64_ip = next_ip;
+                    meta |= ((unsigned long) imm8) << 40;
+                    amd64_jit_debug("v-str3a-mem op3=%02x ip=%llx meta=%lx imm=%u",
+                            op3, (unsigned long long) insn.start_ip, meta,
+                            (unsigned) imm8);
+                    // Base/index registers must be in memory for the address
+                    // computation, and rip flushed so a fault re-executes.
+                    gen_amd64_flush_reg_cache(state);
+                    gen_amd64_flush_rip(state);
+                    gen(state, (unsigned long) g_mem);
+                    gen(state, meta);
+                    gen(state, disp);
+                    gen(state, (unsigned long) next_ip);
+                    gen_amd64_defer_rip(state, next_ip);
+                    return true;
+                }
+            }
+        }
     }
 
     // 66 0F D7 pmovmskb r32, xmm, mod==3: pack the 16 byte-MSBs of xmm[rm] into a
@@ -8654,7 +8877,16 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
         return true;
     }
 
-    if (!insn.two_byte_opcode && !insn.address_size_prefix &&
+    // LEA accepts a 0x67 address-size prefix as long as the OPERAND size is not
+    // 64. Under 0x67 the address is (base32 + (index32<<scale) + disp) mod 2^32,
+    // and addition and left-shift are congruent mod 2^32 -- so the low 32 bits
+    // of that are identical to the low 32 bits of the untruncated 64-bit
+    // computation the existing gadget already does. LEA writes only `size`
+    // bits and a 32-bit x86 write zero-extends, so for size 32 and 16 the
+    // result is bit-identical with no gadget change at all. Only REX.W would
+    // actually differ, and that form is left to the bridge.
+    if (!insn.two_byte_opcode &&
+            (!insn.address_size_prefix || !insn.rex.w) &&
             !insn.fs_prefix && !insn.lock_prefix &&
             insn.rep_mode == amd64_jit_rep_none &&
             insn.has_modrm && amd64_modrm_mod(insn.modrm) != 3 &&
@@ -8809,7 +9041,22 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
             !insn.fs_prefix && !insn.lock_prefix &&
             insn.rep_mode == amd64_jit_rep_none &&
             insn.has_modrm && amd64_modrm_mod(insn.modrm) == 3 &&
-            (insn.opcode == 0x88 || insn.opcode == 0x8a)) {
+            (insn.opcode == 0x88 || insn.opcode == 0x8a) &&
+            // Without a REX prefix, encodings 4-7 name AH/CH/DH/BH rather
+            // than SPL/BPL/SIL/DIL, and the gadget below cannot express that.
+            // This used to be a `goto amd64_bridge_step` INSIDE the arm, which
+            // meant the arm claimed the instruction and then de-JITted the
+            // whole block -- 72% of the remaining fallbacks, and none of them
+            // for want of an implementation. Excluding the case here instead
+            // lets it fall through to the mod==3 reg-reg switch further down,
+            // whose 0x88/0x8a entries reach amd64_jit_reg_reg_op; that helper
+            // already implements high-byte semantics exactly
+            // (amd64_reg_set_encoded8/amd64_reg_get_encoded8) and already
+            // receives the REX_PRESENT bit that selects them. It costs a C
+            // call and keeps the block compiled, which is the trade that
+            // matters.
+            !(!insn.rex.present && (amd64_modrm_reg(insn.modrm) >= 4 ||
+                                    amd64_modrm_rm(insn.modrm) >= 4))) {
         unsigned reg_raw = amd64_modrm_reg(insn.modrm);
         unsigned rm_raw = amd64_modrm_rm(insn.modrm);
         unsigned reg_id = reg_raw | (insn.rex.r ? 8 : 0);
@@ -8817,8 +9064,7 @@ static int gen_step64(struct gen_state *state, struct tlb *tlb) {
         unsigned src_id = insn.opcode == 0x88 ? reg_id : rm_id;
         unsigned dst_id = insn.opcode == 0x88 ? rm_id : reg_id;
         unsigned long packed = src_id | (dst_id << 4);
-        if (!insn.rex.present && (reg_raw >= 4 || rm_raw >= 4))
-            goto amd64_bridge_step;
+        (void) reg_raw; (void) rm_raw;
         next_ip = state->amd64_ip + 1;
         state->amd64_ip = next_ip;
         amd64_jit_debug("mov8-reg-reg-direct ip=%llx src=%u dst=%u next=%llx",
@@ -10102,6 +10348,46 @@ amd64_bridge_step:
             insn.rep_mode,
             insn.has_modrm,
             insn.modrm);
+    // TRUNCATE rather than discard, when there is anything to keep.
+    //
+    // Setting amd64_fallback_to_interp makes jit.c free the WHOLE block and
+    // interpret every instruction in it, including the ones already translated
+    // -- so one unhandled opcode costs its entire basic block. That is what
+    // made the 0F 3A group so expensive before it was implemented: a pcmpistri
+    // sitting in the middle of glibc's strcmp de-JITted everything around it.
+    //
+    // What still arrives here is almost entirely instructions that are SUPPOSED
+    // to interpret -- `lock notl`/`lock negl`, `lock cmpxchg8b` (the
+    // lock-prefixed RMW ops go to the interpreter precisely to stay atomic) and
+    // x87. Measured over the amd64 regression suite, 6972 of them, and 6963
+    // arrive with an EMPTY block: they are alone at a block start, because the
+    // previous block already ended on the one before. Those genuinely have
+    // nothing to save and still take the fallback below.
+    //
+    // The other 9 are the point. They reached here with real translated work
+    // behind them, and before this that work was thrown away.
+    //
+    // Ending the block here instead keeps the compiled prefix and exits with
+    // rip pointing AT the unhandled instruction. The frontend then re-enters
+    // there, gen_step64 hits it as instruction zero, and the fallback below
+    // interprets exactly that one instruction -- so forward progress is
+    // guaranteed and the semantics are identical to today's.
+    //
+    // The guard is what makes that safe. With nothing emitted the block would
+    // be empty, gen_exit would emit an exit at the same rip, and the frontend
+    // would compile-run-exit at that address forever without ever advancing.
+    // state->size is the right test rather than comparing addresses: state->ip
+    // is addr_t (32-bit) and would truncate a 64-bit guest address, and every
+    // translated instruction emits at least one gadget word.
+    //
+    // gen_exit is already the established way to end a block early -- jit.c
+    // uses it for the page-size cap -- and it flushes the register cache and
+    // the deferred rip for amd64 before emitting the exit.
+    if (state->size > 0) {
+        state->amd64_ip = insn.start_ip;
+        gen_exit(state);
+        return false;
+    }
     state->amd64_fallback_to_interp = true;
     return false;
 }

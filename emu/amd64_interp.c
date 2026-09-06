@@ -8035,8 +8035,11 @@ static inline qword_t amd64_string_addr(const struct cpu_state *cpu, unsigned re
 // only (what musl's str ops use); stops -- leaving rcx/rdi/rsi at the boundary
 // for the per-element loop to finish or fault -- on an inaccessible/COW page or a
 // forward-overlapping movs run. cpu->df == 0 (forward) is checked by the caller.
-static inline void amd64_rep_string_fast(struct cpu_state *cpu, struct tlb *tlb,
+// Returns true if a poke arrived partway through, with rcx/rsi/rdi left as the
+// restart state so the caller can rewind rip and let the instruction resume.
+static inline bool amd64_rep_string_fast(struct cpu_state *cpu, struct tlb *tlb,
         unsigned elem_size, byte_t opcode) {
+    bool poked = false;
     bool is_movs = (opcode == 0xa4 || opcode == 0xa5);
     qword_t rcx = cpu->amd64_regs[amd64_rcx];
     qword_t rdi = cpu->amd64_regs[amd64_rdi];
@@ -8077,10 +8080,18 @@ static inline void amd64_rep_string_fast(struct cpu_state *cpu, struct tlb *tlb,
         }
         rdi += run * elem_size;
         rcx -= run;
+
+        // Once per page-run, and only after progress has been made.
+        if (rcx != 0 && cpu->poked_ptr != NULL &&
+                __atomic_load_n(cpu->poked_ptr, __ATOMIC_RELAXED)) {
+            poked = true;
+            break;
+        }
     }
     cpu->amd64_regs[amd64_rcx] = rcx;
     cpu->amd64_regs[amd64_rdi] = rdi;
     cpu->amd64_regs[amd64_rsi] = rsi;
+    return poked;
 }
 
 static inline int amd64_string_op(struct cpu_state *cpu, struct tlb *tlb,
@@ -8093,14 +8104,22 @@ static inline int amd64_string_op(struct cpu_state *cpu, struct tlb *tlb,
     if (rep_mode != AMD64_REP_NONE && count > 1 && !cpu->df &&
             !cpu->amd64_address_size_prefix &&
             (opcode == 0xa4 || opcode == 0xa5 || opcode == 0xaa || opcode == 0xab)) {
-        amd64_rep_string_fast(cpu, tlb, size / 8, opcode);
+        bool poked = amd64_rep_string_fast(cpu, tlb, size / 8, opcode);
         count = amd64_reg_get(cpu, amd64_rcx, count_size);
         if (count == 0) {
             amd64_sync_legacy_regs(cpu);
             return INT_NONE;
         }
+        if (poked) {
+            // See the long note in the per-element loop below for why this is
+            // INT_TIMER and not INT_NONE.
+            cpu->amd64_rip = saved_rip;
+            amd64_sync_legacy_regs(cpu);
+            return INT_TIMER;
+        }
     }
 
+    unsigned rep_since_poke_check = 0;
     while (count != 0) {
         qword_t value;
         switch (opcode) {
@@ -8160,6 +8179,45 @@ static inline int amd64_string_op(struct cpu_state *cpu, struct tlb *tlb,
                     break;
                 if (rep_mode == AMD64_REPNZ && cpu->zf)
                     break;
+            }
+
+            // x86 makes REP interruptible BETWEEN iterations. Only forward
+            // movs/stos reach the bulk fast path above; everything else --
+            // backward reps, and every scas/cmps/lods -- runs its whole count
+            // right here, and this loop had no way out. Measured on a 96 MB
+            // buffer with a 1ms repeating timer: backward `rep movsb` 2694ms
+            // and ONE signal, `repne scasb` 3772ms, `repe cmpsb` 4542ms. For
+            // those multi-second windows the thread could take no signal (no
+            // SIGKILL, no SIGSTOP) and could not see the swap pager's throttle
+            // poke -- which this loop is itself the thing that provokes.
+            //
+            // rcx/rsi/rdi were written back above by amd64_reg_set and
+            // amd64_bump_string_reg, so they are already the restart state x86
+            // defines for #PF. Rewinding rip to the instruction is therefore
+            // all that is needed, and re-executing resumes where this stopped.
+            //
+            // INT_TIMER, NOT INT_NONE, and that is the whole trick. An amd64
+            // guest runs under the JIT, which steps one instruction at a time
+            // through amd64_step_to_interrupt_jit_bridge; INT_NONE tells it
+            // "this instruction retired, go to the next one", so it advances
+            // past the rep and the rewind of cpu->amd64_rip is simply ignored.
+            // Returning INT_NONE here abandoned the rep mid-copy instead of
+            // resuming it -- measured as a 96 MB backward movsb finishing in
+            // 1.5ms with 95% of the destination still holding its old bytes.
+            // A non-NONE interrupt makes the JIT leave and re-dispatch from
+            // cpu->amd64_rip, which is why amd64_gpf_restore returns INT_PF
+            // rather than INT_NONE for the same rewind.
+            //
+            // Checked once per 1024 elements so the cost stays off the hot
+            // path, and only while count != 0, so a yield can never happen
+            // without progress having been made. Measured cost on the
+            // per-element path: within noise of the unfixed build.
+            if (count != 0 && (++rep_since_poke_check & 1023) == 0 &&
+                    cpu->poked_ptr != NULL &&
+                    __atomic_load_n(cpu->poked_ptr, __ATOMIC_RELAXED)) {
+                cpu->amd64_rip = saved_rip;
+                amd64_sync_legacy_regs(cpu);
+                return INT_TIMER;
             }
         } else {
             break;
