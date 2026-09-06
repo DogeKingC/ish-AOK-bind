@@ -3215,6 +3215,49 @@ amd64_v_neon_binop_mem pcmpeqb, cmeq, 16b
         amd64_vread_bullshit 16, \name\()m
 .endm
 
+# 66 0F 38 00 pshufb xmm, xmm/m128.
+#
+# x86: for each byte i, dst[i] = (src[i] & 0x80) ? 0 : dst[src[i] & 0x0f].
+# NEON TBL returns 0 for any index >= 16, so masking the index vector with 0x8f
+# reproduces BOTH halves of that rule exactly and for free: a set high bit
+# becomes 0x80-0x8f, which is out of range and zeroes; a clear one becomes 0-15,
+# which indexes the table. dst is both the table and the destination.
+#
+# This was the last opcode still de-JITting blocks on a gcc workload, and only
+# in its register form -- 21 of 21 measured decodes were mod==3, 66-prefixed.
+# The memory form is here too so the opcode is closed rather than nearly closed.
+.gadget amd64_v_pshufb_xmm
+    ldr  x8, [_ip]
+    and  x9, x8, 0xf
+    ubfx x10, x8, 4, 4
+    add  x14, _cpu, CPU_xmm
+    add  x11, x14, x9, lsl 4
+    add  x12, x14, x10, lsl 4
+    ldr  q1, [x11]
+    ldr  q0, [x12]
+    movi v2.16b, #0x8f
+    and  v1.16b, v1.16b, v2.16b
+    tbl  v0.16b, {v0.16b}, v1.16b
+    str  q0, [x12]
+    gret 1
+
+.gadget amd64_v_pshufb_mem
+    ldr  x8, [_ip]
+    ldr  x9, [_ip, 8]
+    ubfx x10, x8, 8, 4
+    amd64_vmem_addr
+    amd64_vread_prep 16, pshufbm
+    ldr  q1, [x9]
+    add  x14, _cpu, CPU_xmm
+    add  x14, x14, x10, lsl 4
+    ldr  q0, [x14]
+    movi v2.16b, #0x8f
+    and  v1.16b, v1.16b, v2.16b
+    tbl  v0.16b, {v0.16b}, v1.16b
+    str  q0, [x14]
+    gret 3
+    amd64_vread_bullshit 16, pshufbm
+
 amd64_v_str3a_mem palignr,   vec_palignr128
 amd64_v_str3a_mem pcmpistri, amd64_jit_pcmpistri
 amd64_v_str3a_mem pcmpestri, amd64_jit_pcmpestri

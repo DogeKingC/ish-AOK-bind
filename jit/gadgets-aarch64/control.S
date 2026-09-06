@@ -405,6 +405,22 @@ amd64_gen_loop loop, none
 amd64_gen_loop loope, e
 amd64_gen_loop loopne, ne
 
+# amd64 JRCXZ (0xe3), rel8: branch if RCX == 0. Unlike LOOP it neither
+# decrements the counter nor consults ZF, so it needs no do_jump and no flag
+# reasoning at all -- just a register test. Chained like the jcc gadgets rather
+# than exiting like LOOP: operand 0 = taken, operand 1 = else, both bit-63
+# tagged for amd64_branch_dispatch, so the frontend can patch either arm to a
+# successor block. gen.c flushes the reg cache, so RCX is read straight out of
+# CPU_amd64_regs.
+.gadget amd64_jrcxz
+    ldr x8, [_cpu, (CPU_amd64_regs + 8)]    /* RCX */
+    cbz x8, 1f
+    ldr _ip, [_ip, 8]                       /* RCX != 0 -> else / fall through */
+    b amd64_branch_dispatch
+1:
+    ldr _ip, [_ip]                          /* RCX == 0 -> taken */
+    b amd64_branch_dispatch
+
 .gadget pushf
     save_c
     mov x0, _cpu
