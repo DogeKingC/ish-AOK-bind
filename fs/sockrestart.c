@@ -117,6 +117,7 @@ void sockrestart_on_suspend() {
 
 void sockrestart_on_resume() {
     lock(&sockrestart_lock, 0);
+    unsigned restored = 0;
     struct saved_socket *saved, *tmp;
     list_for_each_entry_safe(&saved_sockets, saved, tmp, saved) {
         list_remove(&saved->saved);
@@ -144,14 +145,23 @@ void sockrestart_on_resume() {
             goto thank_u_next;
         }
         close(new_sock);
+        restored++;
 
 thank_u_next:
         fd_close(saved->sock);
     }
-    struct task *task;
-    list_for_each_entry(&listen_tasks, task, sockrestart.listen) {
-        task->sockrestart.punt = true;
-        pthread_kill(task->thread, SIGUSR1);
+    // Only kick the accept()ers if a socket underneath them actually changed.
+    // This runs on EVERY foreground transition, and the overwhelming majority
+    // of those follow no suspension at all -- the app was backgrounded for a
+    // moment, iOS never froze it, and nothing was saved. Punting there would
+    // fire a SIGUSR1 at every listening task on every unlock of the phone, for
+    // a socket that was never disturbed.
+    if (restored != 0) {
+        struct task *task;
+        list_for_each_entry(&listen_tasks, task, sockrestart.listen) {
+            task->sockrestart.punt = true;
+            pthread_kill(task->thread, SIGUSR1);
+        }
     }
     unlock(&sockrestart_lock);
 }

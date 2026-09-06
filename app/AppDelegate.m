@@ -57,6 +57,7 @@
 #include "app/LocationDevice.h"
 #include "fs/fake-db.h"
 #include "kernel/swap.h"
+#include "fs/sockrestart.h"
 #import <os/log.h>
 #import <os/lock.h>
 #include "platform/platform.h"
@@ -3803,6 +3804,24 @@ void ISHSuspendGuardEnterBackground(void) {
             // restoring stays PROT_NONE with its bytes only on disk. A no-op
             // when swap is off, which is the default.
             bool swapDrained = swap_quiesce_begin(2000);
+
+            // A listening socket does not survive suspension. iOS tears down
+            // the underlying host socket while we are frozen, and nothing in
+            // the guest is told: the fd stays open and bound, the process
+            // stays alive, and /proc/net/tcp shows the socket sitting in
+            // TCP_CLOSE instead of LISTEN. Every connection is then refused by
+            // a server that looks, from inside the guest, perfectly healthy.
+            //
+            // Seen on a device 2026-09-06: sshd left running overnight was
+            // still there in ps the next morning, with its listener at
+            // 00000000:0016 in state 07, and every ssh attempt from the Mac
+            // refused on all five of the phone's addresses. Restarting sshd by
+            // hand put it back to state 0A.
+            //
+            // This records what each listener was bound to; the matching
+            // sockrestart_on_resume rebuilds it and dup2()s it back over the
+            // same fd, so the server never learns it happened.
+            sockrestart_on_suspend();
             os_log(ISHSuspendLog(), "quiesced for suspension: drained=%{public}d straggling=%{public}u swap=%{public}d",
                    drained, stragglers, swapDrained);
             [ISHDiagnosticsStore recordBreadcrumb:@"application.fakefsQuiesced"
@@ -3827,6 +3846,12 @@ void ISHSuspendGuardEnterBackground(void) {
                            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
                 fakefs_quiesce_end();
                 swap_quiesce_end();
+                // Rebuild the listeners here too. Not because they were
+                // damaged -- if this block runs, iOS never froze us -- but
+                // because sockrestart_on_suspend asserts the saved list is
+                // empty, so leaving it populated would turn the NEXT
+                // suspension into an abort.
+                sockrestart_on_resume();
                 os_log(ISHSuspendLog(), "still running after %{public}.0fs backgrounded; gate lifted",
                        kISHQuiesceMaxHoldSeconds);
             });
@@ -3839,6 +3864,10 @@ void ISHSuspendGuardEnterForeground(void) {
     // Lift the gate before anything else: guest tasks may be parked on it.
     fakefs_quiesce_end();
     swap_quiesce_end();
+    // Put the listening sockets back. A no-op unless suspension was actually
+    // imminent enough for the expiration handler to have saved them, which is
+    // why this is safe to call on every foreground transition.
+    sockrestart_on_resume();
     ISHEndSuspendGuard();
 }
 
