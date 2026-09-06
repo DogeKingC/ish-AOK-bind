@@ -10348,6 +10348,46 @@ amd64_bridge_step:
             insn.rep_mode,
             insn.has_modrm,
             insn.modrm);
+    // TRUNCATE rather than discard, when there is anything to keep.
+    //
+    // Setting amd64_fallback_to_interp makes jit.c free the WHOLE block and
+    // interpret every instruction in it, including the ones already translated
+    // -- so one unhandled opcode costs its entire basic block. That is what
+    // made the 0F 3A group so expensive before it was implemented: a pcmpistri
+    // sitting in the middle of glibc's strcmp de-JITted everything around it.
+    //
+    // What still arrives here is almost entirely instructions that are SUPPOSED
+    // to interpret -- `lock notl`/`lock negl`, `lock cmpxchg8b` (the
+    // lock-prefixed RMW ops go to the interpreter precisely to stay atomic) and
+    // x87. Measured over the amd64 regression suite, 6972 of them, and 6963
+    // arrive with an EMPTY block: they are alone at a block start, because the
+    // previous block already ended on the one before. Those genuinely have
+    // nothing to save and still take the fallback below.
+    //
+    // The other 9 are the point. They reached here with real translated work
+    // behind them, and before this that work was thrown away.
+    //
+    // Ending the block here instead keeps the compiled prefix and exits with
+    // rip pointing AT the unhandled instruction. The frontend then re-enters
+    // there, gen_step64 hits it as instruction zero, and the fallback below
+    // interprets exactly that one instruction -- so forward progress is
+    // guaranteed and the semantics are identical to today's.
+    //
+    // The guard is what makes that safe. With nothing emitted the block would
+    // be empty, gen_exit would emit an exit at the same rip, and the frontend
+    // would compile-run-exit at that address forever without ever advancing.
+    // state->size is the right test rather than comparing addresses: state->ip
+    // is addr_t (32-bit) and would truncate a 64-bit guest address, and every
+    // translated instruction emits at least one gadget word.
+    //
+    // gen_exit is already the established way to end a block early -- jit.c
+    // uses it for the page-size cap -- and it flushes the register cache and
+    // the deferred rip for amd64 before emitting the exit.
+    if (state->size > 0) {
+        state->amd64_ip = insn.start_ip;
+        gen_exit(state);
+        return false;
+    }
     state->amd64_fallback_to_interp = true;
     return false;
 }
