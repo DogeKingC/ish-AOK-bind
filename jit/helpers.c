@@ -111,6 +111,10 @@ int helper_atomic_cmpxchg8b(struct cpu_state *cpu, struct tlb *tlb, dword_t addr
 // and tlb->segfault_addr already set by the miss handler, so the gadget jumps
 // to the existing segfault_read/segfault_write exit.
 //
+// It returns 3 when a poke arrived mid-rep, with that same restart state, and
+// the gadget exits to jit_ret with eip set back to this instruction so the rep
+// resumes after the interrupt has been handled.
+//
 // Overlapping forward movs (edi>esi within the run) is the x86 "smear" case
 // that memmove would NOT reproduce, so it falls back to single-element copies
 // through guest memory, which smears identically to the hardware.
@@ -179,6 +183,38 @@ int rep_string_fast(struct cpu_state *cpu, struct tlb *tlb, unsigned elem_size, 
         cpu->ecx = ecx;
         cpu->edi = edi;
         cpu->esi = esi;
+
+        // x86 makes REP interruptible BETWEEN iterations, and until now AOK
+        // did not: this helper ran to ecx == 0 no matter how long that took,
+        // and the JIT only tests the poke flag at block boundaries. A guest
+        // memcpy compiled to `rep movsb` over a large buffer therefore held
+        // the thread inside one gadget for the whole copy -- a signal could
+        // not be delivered, and the swap pager's throttle poke (emu/tlb.c
+        // sets mem_throttle_wanted and calls cpu_poke) could not reach the
+        // thread it was aimed at, so reclaim waited on a copy that had
+        // already faulted in everything it touched.
+        //
+        // Once per loop iteration, which is once per page-run on the bulk arm
+        // above and once per ELEMENT on the single-element arm (an overlapping
+        // forward movs, or an element straddling a page). That is the right
+        // way round: the single-element arm is the slow one, so it is the one
+        // that most needs to be interruptible, and it is rare enough that a
+        // load per element does not matter.
+        //
+        // Only AFTER the registers above have been written back and progress
+        // has been made. ecx, edi and esi are exactly the restart state x86
+        // defines for #PF, so re-executing the instruction resumes where this
+        // left off; returning before doing any work would livelock on a flag
+        // nobody clears.
+        //
+        // Relaxed, and a load rather than an exchange. No ordering is needed
+        // -- nothing here reads data published alongside the flag -- and the
+        // authoritative read is cpu_take_poke's seq_cst exchange, which is
+        // what actually consumes it. Clearing it here would swallow the poke
+        // and yield for nothing. This matches jit_ret_chain, which reads the
+        // same byte with a plain ldrb.
+        if (ecx != 0 && __atomic_load_n(cpu->poked_ptr, __ATOMIC_RELAXED))
+            return 3;
     }
     return 0;
 }
