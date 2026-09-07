@@ -250,6 +250,21 @@ static NSURL *ISHFileProviderPersistMetadataURL(void) {
                                                       error:nil];
     } else {
         NSURL *container = ContainerURL();
+        // ContainerURL() is nil in an extension with no app group: an extension
+        // gets its own private container, not the app's, so the fallback that
+        // rescues the main app would hand this process a directory the app
+        // never looks at -- and AppGroup.m returns nil rather than lie about
+        // it. Nil-messaging then carries all the way to
+        // strdup(_rootURL.fileSystemRepresentation) below, which is strdup(NULL)
+        // and a crash in the extension rather than a Files error the user can
+        // read. The persist branch above already guards its own nil the same
+        // way; this branch simply never had a nil to guard until the app-group
+        // fallback landed.
+        if (container == nil) {
+            if (error != nil)
+                *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:ENOENT userInfo:nil];
+            return nil;
+        }
         NSURL *fs_dir = [[container URLByAppendingPathComponent:@"roots"]
                          URLByAppendingPathComponent:rootName];
         _rootURL = [fs_dir URLByAppendingPathComponent:@"data"];
