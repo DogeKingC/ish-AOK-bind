@@ -1639,7 +1639,9 @@ ish = declare_dependency(
     dependencies: dependencies,
     include_directories: includes)
 
-# A cross build targeting LINUX is not the Xcode case: it is how
+# The CLI executable is skipped for the iOS cross build because Xcode links the
+# app itself from these libraries (xcode-meson.sh, system = 'darwin').
+# A cross build targeting LINUX is a different thing entirely -- it is how
 # tools/run-arm64-guest-tests.sh gets an aarch64-host `ish` to run under
 # qemu-user from an x86_64 machine, which is the only way to exercise the
 # arm64-GUEST gadget set without a physical arm64 box. Nothing links it for us

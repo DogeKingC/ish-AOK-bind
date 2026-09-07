@@ -12,11 +12,15 @@
 // startup (iosfs and iosfs_unsafe) -- overflowing this asserts at boot rather
 // than failing gracefully, so don't run it to the rim.
 //
-// Count it before changing it: 12 static entries here plus those 2 is 14
-// exactly. Upstream's 14 had a spare because upstream's table has neither
-// binderfs nor selinuxfs; taking that number unchanged across this merge
-// would have left none, and the next filesystem anyone adds -- on either side
-// -- would assert at boot rather than at build time.
+// Count it before changing it -- and the count was wrong, which for an
+// instruction to count is worse than saying nothing. There are 13 static
+// entries in the initializer below (realfs, procfs, aokfs, devptsfs, tmpfs,
+// devtmpfs, sysfs, cgroupfs, cgroup2fs, fakefs, binderfs, selinuxfs, fusefs),
+// so with those 2 registered at runtime it is 15 of 16 -- ONE spare, not two.
+// Upstream's 14 had a spare because upstream's table has neither binderfs nor
+// selinuxfs; taking that number unchanged across the merge would have left
+// none, and the next filesystem anyone adds -- on either side -- would assert
+// at boot rather than at build time.
 #define MAX_FILESYSTEMS 16
 static const struct fs_ops *filesystems[MAX_FILESYSTEMS] = {
     &realfs,
