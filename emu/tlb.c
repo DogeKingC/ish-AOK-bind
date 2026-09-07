@@ -1212,22 +1212,38 @@ void arm64_watch_dump(void) {
                "start of history -- older stores are in the ring; a store missing "
                "above may simply be further back. Raise N in all:N.\n",
                arm64_watch_dump_limit);
-    // What is and is not in here, because an absence is read as evidence and
-    // an earlier version of this comment got it wrong in the direction that
-    // costs a round: it claimed the C-side atomics were invisible.
+    // What is and is not in here, because an absence is read as evidence.
+    // This comment has now been wrong twice, in both directions, and each
+    // version cost a round -- so it is written from what actually calls
+    // tlb_write_ptr_slow rather than from what looks like it should.
     //
     // RECORDED: ordinary stores (the JIT's write path, which "all" forces
-    // through the revalidate funnel), and the arm64 atomics that resolve via
+    // through the revalidate funnel), and every arm64 atomic that resolves via
     // tlb_write_ptr_slow -- the LSE read-modify-writes (LDADD/LDCLR/LDEOR/
-    // LDSET/LDSMAX/LDSMIN/LDUMAX/LDUMIN and SWP), CAS and CASP. Refcounts ARE
-    // visible: incStrong/decStrong are outline-atomics LDADD, and they land
-    // here with the right address and the pre-store value.
+    // LDSET/LDSMAX/LDSMIN/LDUMAX/LDUMIN and SWP), CAS, CASP, STXR, and STXP.
+    // STXR and STXP are easy to miss: neither resolves an address itself, they
+    // reach arm64_cas / arm64_casp on a monitor hit and record from there.
+    // Refcounts ARE visible: incStrong/decStrong are outline-atomics LDADD,
+    // and they land here with the right address and the pre-store value.
     //
     // NOT recorded, all of which reach memory without passing this wrapper:
     // a store that straddles a page boundary (__tlb_write_cross_page), an
-    // AdvSIMD ld1/st1 transfer (tlb_write), and the LDXP/STXP exclusive pair.
+    // AdvSIMD ld1/st1 transfer (tlb_write), and LDXP -- which is a load.
     // Rule those out by the instruction's form before reading an absence as
     // "it never ran".
+    //
+    // A RECORD DOES NOT PROVE A STORE HAPPENED. arm64_cas and arm64_casp
+    // resolve the pointer BEFORE they compare, so a failed CAS, a lost STXR
+    // and a CAS-fail STXP each push a record with a correct address, a correct
+    // pre-value and a correct ip for a store that never landed. Read the
+    // old= value against what the instruction would have written before
+    // concluding it wrote.
+    //
+    // The ip is only trustworthy for the arm64 JIT. The x86 LOCK helpers
+    // (x86_atomic_rmw and friends) also record, and no i386/amd64 gadget sets
+    // watch_ip, so their records carry 0 or a stale arm64 ip; the arm64
+    // INTERPRETER is the same, since only the JIT gadgets stash it. The dump
+    // is tid-scoped by default, which mostly contains both.
 }
 
 // ISH_ARM64_TRACE_IP=<hex guest pc> + ISH_ARM64_TRACE_LDR="rn,rm": before

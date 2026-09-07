@@ -810,12 +810,23 @@ that have nothing to do with the bug can empty it:
   still in the ring, and the answer is to raise N (max 4096) and re-run. This is
   the same trap as the seven-arm matrix that ran without `servicemanager`: a
   measurement that cannot show it covered the target has not measured anything.
-- *Three store forms execute without passing through this funnel*, and so leave
-  no record even in a window that reaches back far enough: a store that straddles
-  a page boundary (it goes through `arm64_crosspage_store`), an AdvSIMD `ld1`/
-  `st1` transfer, and the C-side atomics. `str x0, [x19, #8]` at an 8-byte
-  aligned offset is none of them, so for THIS store an absence is real -- but
-  check the form before concluding it for the next one.
+- *Some store forms never pass through this funnel*, and so leave no record even
+  in a window that reaches back far enough: a store that straddles a page
+  boundary (it goes through `arm64_crosspage_store`), and an AdvSIMD `ld1`/`st1`
+  transfer. `str x0, [x19, #8]` at an 8-byte aligned offset is neither, so for
+  THIS store an absence is real -- but check the form before concluding it for
+  the next one.
+
+  This bullet used to name "the C-side atomics" as a third, and that was wrong:
+  every arm64 atomic that reaches memory records. LSE RMW, CAS, CASP, STXR and
+  STXP all resolve through `tlb_write_ptr_slow`, which is what records; only
+  LDXP does not, because it is a load. The mistake mattered -- it is what made
+  the refcount question look like it needed a new instrument.
+- *A record does not prove a store happened.* `arm64_cas` and `arm64_casp`
+  resolve the pointer BEFORE they compare, so a failed CAS, a lost STXR and a
+  CAS-fail STXP each leave a record with a correct address and pre-value for a
+  store that never landed. Read `old=` against what the instruction would have
+  written before concluding it wrote.
 
 Each record prints `ip=` as a guest pc. To turn it into a `libutils.so+0x...`
 the disassembly can be read against, take the library base from the fault line,

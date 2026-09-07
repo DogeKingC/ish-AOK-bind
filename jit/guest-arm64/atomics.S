@@ -491,6 +491,13 @@ ldxp_gadget ldxp64, 3
 .gadget \name
     ldr x8, [_ip]
     ldr x19, [_ip, #8]       // orig_ip (fault restart), callee-saved
+    // Store trace: same stash as the four above, and stxp needs it for a
+    // reason that is not obvious from this file. arm64_stxp does not
+    // resolve an address itself -- on a monitor hit it calls arm64_casp,
+    // which resolves through tlb_write_ptr_slow and therefore RECORDS. So
+    // an STXP lands in the ring like any other store, and without this it
+    // carries whatever ip the last ordinary store or atomic left behind.
+    str x19, [_tlb, #(-TLB_entries+TLB_watch_ip)]
     add _ip, _ip, #16
     and x20, x8, #0x1f       // rt (desired lo)
     ubfx x22, x8, #8, #5     // rn (31 = SP)
