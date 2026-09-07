@@ -67,7 +67,11 @@
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
-SRC=$PWD
+# -P, so this is the physical path. meson stores directories.source resolved,
+# and the reuse check below compares the two strings: with a symlink anywhere
+# in the checkout path a logical $PWD never matches, and the check would wipe
+# and fully reconfigure the cross build on every single run.
+SRC=$(pwd -P)
 WORK=${ISH_ARM64_WORK:-${TMPDIR:-/tmp}/ish-arm64-harness}
 BUILD=$WORK/build
 ROOTFS=$WORK/rootfs
