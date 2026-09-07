@@ -37,7 +37,10 @@ static int fakefs_host_path(const char *path, host_path_t host) {
 // this exists only to override readdir to fix the returned inode numbers
 static struct fd_ops fakefs_fdops;
 
-// Defined below; used by open, stat and readdir alike.
+// Defined below; used by open, stat and readdir alike. WRITES, via path_create
+// on mount->fakefs (the primary handle) -- so every caller must already hold a
+// write transaction on that handle. fakefs_stat opens one itself; open and
+// readdir call it inside their own.
 static ino_t fakefs_adopt_foreign(struct mount *mount, const char *path,
                                   struct ish_stat *ishstat_out);
 static struct fd_ops initctl_fdops;
@@ -683,7 +686,22 @@ static int fakefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev
 //   - owned by root, since the host owner is the app's uid and means nothing
 //     to the guest -- the same reasoning MOUNT_ISH_SHARED_ uses.
 //
-// Caller must hold the db write lock. Returns the new inode, or 0.
+// WRITES: path_create below targets mount->fakefs, the PRIMARY handle, not the
+// caller's `fs`. So the caller must hold a write transaction on the primary.
+// fakefs_stat opens one (db_begin_write) around its call for exactly that
+// reason.
+//
+// The other two callers -- fakefs_open and fakefs_readdir -- do NOT. They are
+// inside db_begin_read, a BEGIN DEFERRED, which serializes against writers only
+// because it takes the primary's mutex on the default build. Turn pooling on
+// (ISH_FAKEFS_PARALLEL_READS) and db_begin_locked's read path returns without
+// the mutex, so those two issue this write from inside a pooled reader's
+// snapshot on a different connection. Pre-existing on both sides of the merge
+// and left alone deliberately: they are hot paths (every open, every readdir)
+// and promoting them to write transactions is a change that wants measuring,
+// not a merge fix.
+//
+// Returns the new inode, or 0.
 static ino_t fakefs_adopt_foreign(struct mount *mount, const char *path,
                                   struct ish_stat *ishstat_out) {
     host_path_t host_path;
@@ -731,14 +749,36 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
         // No metadata. Either the path really does not exist, or it was put
         // into the data directory from outside iSH; adopt it if so.
         //
-        // Deliberately OUTSIDE the read region, which is why this is not the
-        // old body with the unlock macro swapped in. FAKEFS_LOCK_READ takes no
-        // mutex at all on a pooled connection -- it is a WAL read snapshot on a
-        // separate handle -- while adopting WRITES, via path_create on the
-        // PRIMARY handle. Issuing that write from inside a reader's snapshot is
-        // the bug this ordering avoids. ishstat and inode are already copies,
-        // so nothing here still needs the region.
+        // Outside the read region, and under a WRITE transaction on the
+        // PRIMARY handle -- both halves matter, and getting only the first is
+        // how this was wrong before.
+        //
+        // Outside, because FAKEFS_LOCK_READ takes no mutex at all on a pooled
+        // connection (it is a WAL read snapshot on a separate handle) while
+        // adopting WRITES, and a write issued from inside a reader's snapshot
+        // is its own bug. But merely dropping the read region is not enough:
+        // pooling is opt-in and OFF by default, so on the ordinary build
+        // FAKEFS_LOCK_READ *is* the full mutex, and releasing it left the
+        // adopt running with no serialization where the pre-merge code held
+        // that mutex across it.
+        //
+        // db_begin_write is the fix for both. It always takes the mutex --
+        // the pooled shortcut in db_begin_locked is read-only -- and it wraps
+        // path_create's two statements (stats, then paths) in one BEGIN
+        // IMMEDIATE, so a failure between them cannot leave a stats row with
+        // no paths row. It is taken on &mount->fakefs rather than on `fs`
+        // because that is the handle fakefs_adopt_foreign actually writes
+        // through; beginning on a pooled `fs` would put the transaction on a
+        // different connection from the write.
+        //
+        // Safe to acquire here precisely because the read region is already
+        // closed: transaction_enter parks at the quiesce gate and must be
+        // reached owning nothing, and a thread holds at most one fakefs
+        // transaction at a time. ishstat and inode are already copies.
+        struct fakefs_db *primary = &mount->fakefs;
+        db_begin_write(primary);
         inode = fakefs_adopt_foreign(mount, path, &ishstat);
+        db_commit(primary);
         if (inode == 0)
             return _ENOENT;
     }
